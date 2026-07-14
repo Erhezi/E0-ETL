@@ -1,0 +1,184 @@
+name: contract_line
+enabled: true
+tags: [daily, ContractLine]
+
+process:
+  name: Contract Line
+  frequency: Workdays
+
+source:
+  multiple_input_files: false
+  files:
+    - alias: main
+      path: 'C:\Users\dli2\OneDrive - Montefiore Medicine\Documents\INFOR_SC\temp export'
+      name: 'ContractLineSimple_full+-+Export+To+CSV.csv'
+      reader: csv
+      options:
+        dtype: str
+
+# Each destination's server/database/schema are defaults inherited by both the
+# staging and prod blocks. To land staging in a different database (or server or
+# schema) than prod, set server/database/schema inside that block to override.
+# prod.post_sql runs on the prod connection after the staging load succeeds, to
+# promote the just-loaded staging data into prod. Each step gets its own ETLHealth row.
+# enabled: false skips that destination entirely (no staging load, no prod
+# promotion, no ETLHealth rows) without deleting its block. Default is true.
+destinations:
+  - name: des1
+    enabled: true
+    server: MISCPrdAdhocDB
+    database: PRIME
+    schema: 'DM_MONTYNT\dli2'
+    staging:
+      table: contractline_stg
+    prod:
+      table: CONTRACTLINE
+      post_sql:
+        - EXEC [DM_MONTYNT\dli2].[UpdateContractLine]
+
+  # NOTE: verify the infor-side staging/prod object names. These mirror the des1
+  # naming (contractline_stg / CONTRACTLINE) and may need adjusting to the real
+  # objects on the infor schema.
+  - name: des2
+    enabled: true
+    server: YNBBSTVWP02\PROCDATASRVPROD
+    database: PLMPreprocessorShared
+    schema: infor
+    staging:
+      table: contractline_stg
+    prod:
+      table: CONTRACTLINE
+      post_sql:
+        - EXEC [infor].[sp_UpdateContractLine]
+
+health_table:
+  server: 'YNBBSTVWP02\PROCDATASRVPROD'
+  database: SCSFileIngestor
+  schema: InforLoader
+  table: ETLHealth
+
+logging:
+  # <loader name> is substituted with this loader's name (contract_line).
+  log_root: '\\montefiore.org\centralfiles\data\Procurement PMO\dli2\DailyLoader\<loader name>\logs'
+  level: INFO
+  console: true          # echo run logs to the console (stderr) for Task Scheduler output
+  capture_streams: true  # capture stdout/stderr (prints, warnings, tracebacks) into the log file
+
+# After a successful load the source file is copied here with a _YYYYMMDD stamp
+# appended (original extension kept), e.g. ContractLineSimple_full..._20260707.csv.
+# <loader name> is substituted with this loader's name. Set enabled: false to skip.
+archive:
+  path: '\\montefiore.org\centralfiles\data\Procurement PMO\dli2\DailyLoader\<loader name>\archived'
+
+stg_load:
+  strategy: truncate_insert   # how the staging table is loaded from the source file
+  batch_size: 50000
+
+# How the prod table is promoted from the just-loaded staging table.
+# Allowed: truncate_insert | pk_merge | pk_delete_insert | versioned_delete_insert | filter_active
+# filter_active: staging is loaded with the FULL file (stg_load truncate_insert above),
+#   but prod receives only the "active" subset of staging rows -- the ones matching the
+#   `where` predicates below (ANDed together). Filtered-out lines never land in prod.
+# DECLARATIVE ONLY for now: the real promotion still runs via each destination's
+# prod.post_sql (EXEC ...UpdateContractLine), so the `where` clauses here just document
+# the filter that UpdateContractLine applies. The strategy name is validated at load
+# time; `where` is not yet read by the loader -- it is the spec a later template-based
+# query generator will fill in. Keep it in sync with the proc.
+prd_load:
+  strategy: filter_active
+  # TODO(dli2): fill in the real active-row predicates from UpdateContractLine.
+  # Each entry is a SQL boolean expression over destination columns, ANDed together, e.g.:
+  #   - "[ActiveLine] = 'Yes'"
+  #   - "[Contract.ContractStatus] <> 'Closed'"
+  #   - "[OnHold] = 'No'"
+  where: []
+
+# Delta-overlap guard: when the source file is a rolling window (e.g. last -X days
+# keyed on an "update stamp"), it makes sure the incoming file overlaps what is
+# already in the DB so no rows fall through the gap between runs:
+#   pass  <=>  MIN(source[source_column])  <=  MAX(baseline_table[db_column])
+# mode: enforce = fail the destination on a gap | warn = log and continue | skip = do not run.
+# skip here: the ContractLineSimple_full export is a full point-in-time snapshot,
+# not a delta window, so there is no gap to guard against (source MIN would
+# trivially be <= DB MAX).
+validation:
+  overlap_check:
+    mode: skip
+    source_column: null
+    db_column: null
+    baseline: prod                  # which already-in-DB table to read MAX from: prod | staging
+    skip_if_db_empty: true          # first-ever load has nothing to overlap -> skip instead of fail
+
+use_db_column_order: false
+
+# Splits the pipe-delimited DerivedFirstAccount source field and lands its 4th part
+# (index 3) into FirstAccount, e.g. "|||620621||...|0|false" -> "620621".
+# Registered in infor_loader/transforms.py.
+transforms:
+  - contract_line_first_account
+
+field_config:
+  # strptime format for `date`-typed source columns, e.g. 12/12/2020.
+  date_format: '%m/%d/%Y'
+  # strptime format for `datetime`-typed source columns, e.g. 07/18/2023 08:41:55 AM.
+  # Set explicitly so pandas parses fast and unambiguously instead of guessing per row.
+  datetime_format: '%m/%d/%Y %I:%M:%S %p'
+
+  # PK check runs after mapping/data conversion, so these are destination column names.
+  pk_check: [Contract, ContractLine]
+
+  # Loaded columns, ordered like the destination table. Row format:
+  #   [source_or_computed, destination, type_to_convert_to_in_python, destination_datatype, origin]
+  # origin: source   = a required column read from the source file (hard-fail if missing)
+  #         computed = produced by a transform/loader, not present in the file
+  # type: string | date | datetime | float | int
+  mapping:
+    - [Contract.ContractStatus, Contract.ContractStatus, string, varchar(20), source]
+    - [Contract.OnHold, Contract.OnHold, string, varchar(10), source]
+    - [Contract.MMAHSOrganizationEID, Contract.MMAHSOrganizationEID, string, varchar(10), source]
+    - [Contract.WorkingContractID, WorkingContractID, string, varchar(100), source]
+    - [Contract, Contract, string, varchar(10), source]
+    - [DerivedContractName, ContractName, string, varchar(255), source]
+    - [Contract.ContractClassification, ContractClassification, string, varchar(40), source]
+    - [Contract.ContractSource, Contract.ContractSource, string, varchar(40), source]
+    - [Supplier, Supplier, string, varchar(10), source]
+    - [Vendor, Vendor, string, varchar(10), source]
+    - [Vendor.VendorName, VendorName, string, varchar(255), source]
+    - [ApPoPurchaseFrom.PurchaseFromLocation, PurchaseFromLocation, string, varchar(10), source]
+    - [Contract.ManufacturerCodeDivision, Contract.Manufacturer, string, varchar(10), source]
+    - [Manufacturer, Manufacturer, string, varchar(10), source]
+    - [ContractLine, ContractLine, string, varchar(20), source]
+    - [OnHold, OnHold, string, varchar(10), source]
+    - [ContractLineState, ContractLineState, string, varchar(20), source]
+    - [ActiveLine, ActiveLine, string, varchar(10), source]
+    - [ItemType, ItemType, string, varchar(20), source]
+    - [ItemNumber, ItemNumber, string, varchar(100), source]
+    - [VendorItem, VendorItem, string, varchar(100), source]
+    - [DerivedStrippedVendorItem, DerivedStrippedVendorItem, string, varchar(100), source]
+    - [ManufacturerNumber, ManufacturerNumber, string, varchar(100), source]
+    - [DerivedStrippedManufacturerNumber, DerivedStrippedManufacturerNumber, string, varchar(100), source]
+    - [ItemDescription, ItemDescription, string, varchar(max), source]
+    - [UOM, UOM, string, varchar(10), source]
+    - [BaseCost, BaseCost, float, money, source]
+    - [DerivedUOMConversion, DerivedUOMConversion, float, "numeric(19, 4)", source]
+    - [PerOrderMinimumQuantity, PerOrderMinimumQuantity, float, "numeric(18, 4)", source]
+    - [Priority, Priority, int, int, source]
+    - [ErrorsExist, ErrorsExist, string, varchar(10), source]
+    - [FromImport, FromImport, string, varchar(10), source]
+    - [EffectiveDate, EffectiveDate, date, date, source]
+    - [ExpirationDate, ExpirationDate, date, date, source]
+    - [Contract.EffectiveDate, Contract.EffectiveDate, date, date, source]
+    - [Contract.ExpirationDate, Contract.ExpirationDate, date, date, source]
+    - [CommodityCode, CommodityCode, string, varchar(20), source]
+    - [UNSPSCCode, UNSPSCCode, string, varchar(20), source]
+    - [PatientChargeable, PatientChargeable, string, varchar(10), source]
+    - [ChargeNumber, ChargeNumber, string, varchar(20), source]
+    - [MMAHSPrimaryDI, MMAHSPrimaryDI, string, varchar(50), source]
+    - [MMAHSCCDescription, MMAHSCCDescription, string, varchar(max), source]
+    - [GlobalTradeItemNumber, GTIN, string, varchar(40), source]
+    - [DerivedFirstAccount, DerivedFirstAccount, string, varchar(100), source]
+    - [FirstAccount, FirstAccount, string, varchar(20), computed]  # contract_line_first_account: DerivedFirstAccount split '|' [3]
+    - [create stamp.actor, create stamp.actor, string, varchar(100), source]
+    - [update stamp.actor, update stamp.actor, string, varchar(100), source]
+    - [create stamp, create stamp, datetime, datetime, source]
+    - [update stamp, update stamp, datetime, datetime, source]

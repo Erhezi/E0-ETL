@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.pyc.*
+logs/
+input_file_sample/
+mapping_templates/*.json

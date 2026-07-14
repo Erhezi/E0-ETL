@@ -1,0 +1,173 @@
+name: inventory_location
+enabled: true
+tags: [daily, ItemLocation]
+
+process:
+  name: Inventory Location
+  frequency: Workdays
+
+source:
+  multiple_input_files: false
+  files:
+    - alias: main
+      path: 'C:\Users\dli2\OneDrive - Montefiore Medicine\Documents\INFOR_SC\temp export'
+      name: Inventory_Location.csv
+      reader: csv
+      options:
+        dtype: str
+
+# Each destination's server/database/schema are defaults inherited by both the
+# staging and prod blocks. To land staging in a different database (or server or
+# schema) than prod, set server/database/schema inside that block to override.
+# prod.post_sql runs on the prod connection after the staging load succeeds, to
+# promote the just-loaded staging data into prod. Each step gets its own ETLHealth row.
+destinations:
+  - name: des1
+    enabled: true
+    server: MISCPrdAdhocDB
+    database: PRIME
+    schema: 'DM_MONTYNT\dli2'
+    staging:
+      table: inventory_location_stg
+    prod:
+      table: INVENTORY_LOCATION
+      post_sql:
+        - EXEC [DM_MONTYNT\dli2].[UpdateItemLocation]
+
+  - name: des2
+    enabled: true
+    server: YNBBSTVWP02\PROCDATASRVPROD
+    database: PLMPreprocessorShared
+    schema: infor
+    staging:
+      table: item_location_stg
+    prod:
+      table: ITEM_LOCATION
+      post_sql:
+        - EXEC [infor].[sp_UpdateItemLocation]
+
+health_table:
+  server: 'YNBBSTVWP02\PROCDATASRVPROD'
+  database: SCSFileIngestor
+  schema: InforLoader
+  table: ETLHealth
+
+logging:
+  # <loader name> is substituted with this loader's name (inventory_location).
+  log_root: '\\montefiore.org\centralfiles\data\Procurement PMO\dli2\DailyLoader\<loader name>\logs'
+  level: INFO
+  console: true          # echo run logs to the console (stderr) for Task Scheduler output
+  capture_streams: true  # capture stdout/stderr (prints, warnings, tracebacks) into the log file
+
+# After a successful load the source file is copied here with a _YYYYMMDD stamp
+# appended (original extension kept), e.g. Inventory_Location_20260707.csv.
+# <loader name> is substituted with this loader's name. Set enabled: false to skip.
+archive:
+  path: '\\montefiore.org\centralfiles\data\Procurement PMO\dli2\DailyLoader\<loader name>\archived'
+
+stg_load:
+  strategy: truncate_insert   # how the staging table is loaded from the source file
+  batch_size: 50000
+
+# How the prod table is promoted from the just-loaded staging table.
+# Allowed: truncate_insert | pk_merge | pk_delete_insert | versioned_delete_insert
+# versioned_delete_insert: DELETE prod rows matching staging on the PK + version stamps,
+#   then INSERT all staging. Unchanged rows are carried forward under the newest report
+#   stamp; changed rows accumulate as history (each stamped with the update stamp it was
+#   last true). Delete key = pk_check + ['create stamp', 'update stamp'].
+# DECLARATIVE ONLY for now: the real promotion still runs via each destination's
+# prod.post_sql (EXEC ...UpdateItemLocation). This records intent and is validated
+# at load time, but is not yet dispatched by the loader.
+prd_load:
+  strategy: versioned_delete_insert
+
+# Delta-overlap guard: when the source file is a rolling window (e.g. last -X days
+# keyed on an "update stamp"), it makes sure the incoming file overlaps what is
+# already in the DB so no rows fall through the gap between runs:
+#   pass  <=>  MIN(source[source_column])  <=  MAX(baseline_table[db_column])
+# mode: enforce = fail the destination on a gap | warn = log and continue | skip = do not run.
+# skip here: each export is a full point-in-time snapshot, not a delta window, so
+# there is no gap to guard against (source MIN would trivially be <= DB MAX).
+validation:
+  overlap_check:
+    mode: skip
+    source_column: null  
+    db_column: null
+    baseline: prod                  # which already-in-DB table to read MAX from: prod | staging
+    skip_if_db_empty: true          # first-ever load has nothing to overlap -> skip instead of fail
+
+use_db_column_order: false
+
+transforms:
+  - inventory_location_report_stamp
+
+field_config:
+  # strptime format for `datetime`-typed source columns, e.g. 07/20/2025 10:23:07 PM.
+  # Set explicitly so pandas parses fast and unambiguously instead of guessing per row.
+  datetime_format: '%m/%d/%Y %I:%M:%S %p'
+
+  # PK check runs after mapping/data conversion, so these are destination column names.
+  pk_check: [Company, Location, Item]
+
+  # Loaded columns, ordered like the destination table. Row format:
+  #   [source_or_computed, destination, type_to_convert_to_in_python, destination_datatype, origin]
+  # origin: source   = a required column read from the source file (hard-fail if missing)
+  #         computed = produced by a transform/loader, not present in the file
+  # type: string | date | datetime | float | int
+  mapping:
+    - [Company, Company, string, varchar(10), source]
+    - [InventoryLocation, Location, string, varchar(20), source]
+    - [InventoryLocation.Name, LocationText, string, varchar(255), source]
+    - [Item, Item, string, varchar(10), source]
+    - [Item.Description, ItemDescription, string, varchar(255), source]
+    - [InventoryTracked, InventoryTracked, string, varchar(5), source]
+    - [Active, Active, string, varchar(5), source]
+    - [Item.OnContractDisplay, OnContract, string, varchar(40), source]
+    - [Discontinued, Discontinued, string, varchar(5), source]
+    - [DerivedLocationTypeLabel, LocationType, string, varchar(40), source]
+    - [DefaultItemType, ItemType, string, varchar(40), source]
+    - [Vendor, Vendor, string, varchar(40), source]
+    - [Vendor.VendorName, VendorName, string, varchar(255), source]
+    - [VendorItem, VendorItem, string, varchar(100), source]
+    - [Manufacturer, Manufacturer, string, varchar(10), source]
+    - [ManufacturerDescription, ManufacturerName, string, varchar(255), source]
+    - [ManufacturerNumber, ManufacturerNumber, string, varchar(100), source]
+    - [ManufacturerNumberStripped, StrippedManufacturerNumber, string, varchar(100), source]
+    - [Item.StockUOM, StockUOM, string, varchar(20), source]
+    - [ReorderPolicy, ReorderPolicy, string, varchar(40), source]
+    - [ReorderQuantityCode, ReorderQuantityCode, string, varchar(40), source]
+    - [ReorderDocument, ReorderDocument, string, varchar(40), source]
+    - [ReorderPoint, ReorderPoint, int, int, source]
+    - [AutomaticPurchaseOrder, AutomaticPO, string, varchar(5), source]
+    - [MaximumOrderQuantity, MaxOrderQty, int, int, source]
+    - [MinimumOrderQuantity, MinOrderQty, int, int, source]
+    - [DefaultTransactionUOM, DefaultTransactionUOM, string, varchar(20), source]
+    - [Item.DefaultBuyUOM, DefaultBuyUOM, string, varchar(20), source]
+    - [Item.DefaultInventoryTransactionUOMMultiplier, InventoryTransactionUOMMultiplier, float, "numeric(18, 4)", source]
+    - [Item.DefaultBuyUOMMultiplier, BuyUOMMultiplier, float, "numeric(18, 4)", source]
+    - [LeadtimeControl, LeadtimeControl, string, varchar(40), source]
+    - [LeadtimeDays, LeadtimeDays, int, int, source]
+    - [LastLeadtime, LastLeadtime, int, int, source]
+    - [DefaultUnitCostInStockUOM, UnitCostInStockUOM, float, "numeric(18, 4)", source]
+    - [DerivedAverageCost, DerivedAverageCost, float, "numeric(18, 4)", source]
+    - [StockOnHandQuantity, OnHandQty, int, int, source]
+    - [AvailableQuantity, AvailableQty, int, int, source]
+    - [AllocatedQuantity, AllocatedQty, int, int, source]
+    - [DemandQuantity, DemandQty, int, int, source]
+    - [OnOrderQuantity, OnOrderQty, int, int, source]
+    - [Consignment, Consignment, string, varchar(5), source]
+    - [PatientChargeable, PatientChargeable, string, varchar(5), source]
+    - [ChargeNumber, ChargeNumber, string, varchar(40), source]
+    - [Item.Implantable, Implantable, string, varchar(5), source]
+    - [Item.CriticalItem, CriticalItem, string, varchar(5), source]
+    - [BinTracked, BinTracked, string, varchar(5), source]
+    - [PreferredBin, PreferredBin, string, varchar(40), source]
+    - [create stamp, create stamp, datetime, datetime, source]
+    - [update stamp, update stamp, datetime, datetime, source]
+    - [report stamp, report stamp, datetime, datetime, computed]  # inventory_location_report_stamp: latest update stamp
+
+  # Present in the source file but not integrated into the pipeline yet. Optional:
+  # a missing one only warns, since it cannot affect the output.
+  extra:
+    - OrderMultiple
+    - Item.ReplacementItem

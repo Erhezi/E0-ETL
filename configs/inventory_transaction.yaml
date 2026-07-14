@@ -1,0 +1,185 @@
+name: inventory_transaction
+enabled: true
+tags: [daily, InventoryTransactionLine]
+
+process:
+  name: Inventory Transaction
+  frequency: Workdays
+
+source:
+  multiple_input_files: false
+  files:
+    - alias: main
+      path: 'C:\Users\dli2\OneDrive - Montefiore Medicine\Documents\INFOR_SC\temp export'
+      # Verify the exact export filename in 'temp export'; this matches the sample
+      # (input_file_sample) and the original notebook's inventory_trx name.
+      name: 'Inventory_Trx_and_Balance+-+Export+To+CS.csv'
+      reader: csv
+      options:
+        dtype: str
+
+# Each destination's server/database/schema are defaults inherited by both the
+# staging and prod blocks. To land staging in a different database (or server or
+# schema) than prod, set server/database/schema inside that block to override.
+# prod.post_sql runs on the prod connection after the staging load succeeds, to
+# promote the just-loaded staging data into prod. Each step gets its own ETLHealth row.
+destinations:
+  - name: des1
+    enabled: true
+    server: MISCPrdAdhocDB
+    database: PRIME
+    schema: 'DM_MONTYNT\dli2'
+    staging:
+      table: inventory_transaction_stg
+    prod:
+      table: INVENTORY_TRANSACTION
+      post_sql:
+        - EXEC [DM_MONTYNT\dli2].[UpdateInventoryTransaction]
+
+  # NOTE: verify the infor-side staging/prod table names. inventory_location's infor
+  # destination used a different name scheme (item_location_stg / ITEM_LOCATION);
+  # these mirror the transaction naming and may need adjusting to the real objects.
+  - name: des2
+    enabled: true
+    server: YNBBSTVWP02\PROCDATASRVPROD
+    database: PLMPreprocessorShared
+    schema: infor
+    staging:
+      table: inventory_transaction_stg
+    prod:
+      table: INVENTORY_TRANSACTION
+      post_sql:
+        - EXEC [infor].[sp_UpdateInventoryTransaction]
+
+health_table:
+  server: 'YNBBSTVWP02\PROCDATASRVPROD'
+  database: SCSFileIngestor
+  schema: InforLoader
+  table: ETLHealth
+
+logging:
+  # <loader name> is substituted with this loader's name (inventory_transaction).
+  log_root: '\\montefiore.org\centralfiles\data\Procurement PMO\dli2\DailyLoader\<loader name>\logs'
+  level: INFO
+  console: true          # echo run logs to the console (stderr) for Task Scheduler output
+  capture_streams: true  # capture stdout/stderr (prints, warnings, tracebacks) into the log file
+
+# After a successful load the source file is copied here with a _YYYYMMDD stamp
+# appended (original extension kept), e.g. Inventory_Trx_and_Balance..._20260707.csv.
+# <loader name> is substituted with this loader's name. Set enabled: false to skip.
+archive:
+  path: '\\montefiore.org\centralfiles\data\Procurement PMO\dli2\DailyLoader\<loader name>\archived'
+
+stg_load:
+  strategy: truncate_insert   # how the staging table is loaded from the source file
+  batch_size: 50000
+
+# How the prod table is promoted from the just-loaded staging table.
+# Allowed: truncate_insert | pk_merge | pk_delete_insert | versioned_delete_insert
+# pk_delete_insert: DELETE prod rows whose PK matches an incoming staging row, then
+#   INSERT all staging rows -- an upsert keyed on the PK (SystemCode, Company,
+#   Location, Transaction, TransactionLine, Item). Prod rows absent from the file are
+#   left in place, so a rolling window of transactions accumulates in prod as history.
+# DECLARATIVE ONLY for now: the real promotion still runs via each destination's
+# prod.post_sql (EXEC ...UpdateInventoryTransaction). This records intent and is
+# validated at load time, but is not yet dispatched by the loader.
+prd_load:
+  strategy: pk_delete_insert
+
+# Delta-overlap guard: this export is a rolling window (the last -X days keyed on the
+# "update stamp"), so make sure the incoming file overlaps what is already in the DB
+# and no rows fall through the gap between runs:
+#   pass  <=>  MIN(source[update stamp])  <=  MAX(prod[update stamp])
+# mode: enforce = fail the destination on a gap | warn = log and continue | skip = do not run.
+# Runs before the staging truncate/insert, so a gap aborts the destination without
+# touching stored data.
+validation:
+  overlap_check:
+    mode: enforce
+    source_column: 'update stamp'   # column in the prepared source frame (post-rename, pre-mapping)
+    db_column: 'update stamp'       # same column, read from the baseline table below
+    baseline: prod                  # which already-in-DB table to read MAX from: prod | staging
+    skip_if_db_empty: true          # first-ever load has nothing to overlap -> skip instead of fail
+
+use_db_column_order: false
+
+# Splits the pipe-delimited OffsetAccount / InventoryAccount source fields into their
+# index + GL parts (OffsetIndex/OffsetGL/InventoryIndex/InventoryGL); the mapping below
+# lands those into DistributionIndex/DistributionGL/InventoryIndex/InventoryGL.
+# Registered in infor_loader/transforms.py.
+transforms:
+  - inventory_transaction_accounts
+
+field_config:
+  # strptime format for `datetime`-typed source columns, e.g. 05/29/2026 05:15:01 AM.
+  # Set explicitly so pandas parses fast and unambiguously instead of guessing per row.
+  datetime_format: '%m/%d/%Y %I:%M:%S %p'
+
+  # PK check runs after mapping/data conversion, so these are destination column names.
+  pk_check: [SystemCode, Company, Location, Transaction, TransactionLine, Item]
+
+  # Loaded columns, ordered like the destination table. Row format:
+  #   [source_or_computed, destination, type_to_convert_to_in_python, destination_datatype, origin]
+  # origin: source   = a required column read from the source file (hard-fail if missing)
+  #         computed = produced by a transform/loader, not present in the file
+  # type: string | date | datetime | float | int
+  mapping:
+    - [TransactionSystemCode, SystemCode, string, varchar(40), source]
+    - [InventoryTransaction.InventoryDocumentType, DocumentType, string, varchar(40), source]
+    - [ActualTime, ActualTime, datetime, datetime, source]
+    - [Company, Company, string, varchar(10), source]
+    - [InventoryLocation, Location, string, varchar(20), source]
+    - [Bin, Bin, string, varchar(40), source]
+    - [MultipleBins, MultipleBins, string, varchar(5), source]
+    - [FromToCompanyLocationBin.FromToCompany, ToCompany, string, varchar(10), source]
+    - [FromToCompanyLocationBin.FromToLocation, ToLocation, string, varchar(20), source]
+    - [FromToCompanyLocationBin.FromToBin, ToBin, string, varchar(40), source]
+    - [FromToCompanyLocationBin.RequestingLocation, ToRequestingLocation, string, varchar(20), source]
+    # OffsetAccount -> DistributionIndex/DistributionGL (the offset is the distribution/
+    # expense side of the entry); InventoryAccount -> InventoryIndex/InventoryGL. Both
+    # pairs are split from the transform_inputs below by inventory_transaction_accounts.
+    - [OffsetIndex, DistributionIndex, string, varchar(20), computed]
+    - [OffsetGL, DistributionGL, string, varchar(20), computed]
+    - [InventoryIndex, InventoryIndex, string, varchar(20), computed]
+    - [InventoryGL, InventoryGL, string, varchar(20), computed]
+    - [InventoryTransaction, Transaction, string, varchar(20), source]
+    - [InventoryTransactionLine.LineNumber, TransactionLine, string, varchar(5), source]
+    - [OriginatingTransactionDocument, OriginalDocument, string, varchar(20), source]
+    - [OriginatingTransactionLine, OriginalDocumentLine, string, varchar(5), source]
+    - [Item, Item, string, varchar(10), source]
+    - [Item.Description, ItemDescription, string, varchar(255), source]
+    - [InventoryDistributionAmount, DistriubutionAmount, float, money, source]  # dest name misspelled in table
+    - [StockOnHandQuantity, OnHandQty, int, int, source]
+    - [BaseCost, BaseCost, float, "numeric(18, 4)", source]
+    - [CurrentCost, CurrentCost, float, "numeric(18, 4)", source]
+    - [TransientUnitCostValueInStockUOM, UnitCostInStockUOM, float, "numeric(18, 4)", source]
+    - [DerivedQuantityInStockUOM, QtyInStockUOM, int, int, source]
+    - [StockUOM, StockUOM, string, varchar(10), source]
+    - [DerivedQuantity, QtyInTransactionUOM, int, int, source]
+    - [TransactionUOM, TransactionUOM, string, varchar(10), source]
+    - [TransactionUOMMultiplier, TransactionUOMMultiplier, float, "numeric(18, 4)", source]
+    - [ItemLocation.OrderMultiple, ItemLocation.OrderMultiple, int, int, source]
+    - [DerivedBeforeQuantity, BeforeQty, int, int, source]
+    - [DerivedAfterQuantityInStock, AfterQty, int, int, source]
+    - [ToUOM, ToUOM, string, varchar(10), source]
+    - [KitType, KitType, string, varchar(40), source]
+    - [Status, Status, string, varchar(40), source]
+    - [CreatedBy, CreateBy, string, varchar(100), source]
+    - [LastUpdateBy, LastUpdateBy, string, varchar(100), source]
+    - [create stamp, create stamp, datetime, datetime, source]
+    - [update stamp, update stamp, datetime, datetime, source]
+
+  # Required source columns the inventory_transaction_accounts transform consumes but
+  # that are not loaded directly (they feed the computed Distribution*/Inventory*
+  # columns above). A missing one is a hard failure, same as a loaded column.
+  transform_inputs:
+    - OffsetAccount
+    - InventoryAccount
+
+  # Present in the source file but not integrated into the pipeline yet. Optional:
+  # a missing one only warns, since it cannot affect the output.
+  extra:
+    - ItemLocation.PreferredBin
+    - InventoryTransaction.DefaultDistributionAccount
+    - ItemLocation.AvailableQuantity
+    - ItemLocation.AllocatedQuantity

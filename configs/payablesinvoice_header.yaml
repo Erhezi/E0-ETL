@@ -1,0 +1,191 @@
+name: payablesinvoice_header
+enabled: true
+tags: [daily, PayablesInvoiceHeader]
+
+process:
+  name: Payables Invoice Header
+  frequency: Workdays
+
+source:
+  multiple_input_files: false
+  files:
+    - alias: main
+      path: 'C:\Users\dli2\OneDrive - Montefiore Medicine\Documents\INFOR_SC\temp export'
+      name: 'AP_invoices_backbone_DL+-+Export+To+CSV.csv'
+      reader: csv
+      options:
+        dtype: str
+
+# Each destination's server/database/schema are defaults inherited by both the
+# staging and prod blocks. To land staging in a different database (or server or
+# schema) than prod, set server/database/schema inside that block to override.
+# prod.post_sql runs on the prod connection after the staging load succeeds, to
+# promote the just-loaded staging data into prod. Each step gets its own ETLHealth row.
+destinations:
+  - name: des1
+    enabled: true
+    server: MISCPrdAdhocDB
+    database: PRIME
+    schema: 'DM_MONTYNT\dli2'
+    staging:
+      table: payablesinvoice_header_stg
+    prod:
+      table: PAYABLESINVOICE_HEADER
+      # PK-level replace (see prd_load below): both statements run on one
+      # connection with a single commit, so the DELETE+INSERT pair is atomic.
+      post_sql:
+        - EXEC [DM_MONTYNT\dli2].[UpdatePayablesInvoiceHeader]
+
+  # NOTE: verify the infor-side staging/prod object names. These mirror the des1
+  # naming and may need adjusting to the real objects on the infor schema.
+  - name: des2
+    enabled: true
+    server: YNBBSTVWP02\PROCDATASRVPROD
+    database: PLMPreprocessorShared
+    schema: infor
+    staging:
+      table: payablesinvoice_header_stg
+    prod:
+      table: PAYABLESINVOICE_HEADER
+      post_sql:
+        - EXEC [infor].[sp_UpdatePayablesInvoiceHeader]
+
+health_table:
+  server: 'YNBBSTVWP02\PROCDATASRVPROD'
+  database: SCSFileIngestor
+  schema: InforLoader
+  table: ETLHealth
+
+logging:
+  # <loader name> is substituted with this loader's name (payablesinvoice_header).
+  log_root: '\\montefiore.org\centralfiles\data\Procurement PMO\dli2\DailyLoader\<loader name>\logs'
+  level: INFO
+  console: true          # echo run logs to the console (stderr) for Task Scheduler output
+  capture_streams: true  # capture stdout/stderr (prints, warnings, tracebacks) into the log file
+
+# After a successful load the source file is copied here with a _YYYYMMDD stamp
+# appended (original extension kept), e.g. AP_invoices_backbone_DL+-+Export+To+CSV_20260713.csv.
+# <loader name> is substituted with this loader's name. Set enabled: false to skip.
+archive:
+  path: '\\montefiore.org\centralfiles\data\Procurement PMO\dli2\DailyLoader\<loader name>\archived'
+
+stg_load:
+  strategy: truncate_insert   # how the staging table is loaded from the source file
+  batch_size: 50000
+
+# How the prod table is promoted from the just-loaded staging table.
+# Allowed: truncate_insert | pk_merge | pk_delete_insert | pk_delete_insert_on_header
+#          | versioned_delete_insert | filter_active
+# pk_delete_insert: DELETE prod rows matching staging on the full PK
+#   (Company, PayablesInvoice), then INSERT all staging rows. This is the header
+#   table itself, so the full PK IS the header key -- replacing on it is the same
+#   whole-invoice replace the child loaders (distribution/payment) do with
+#   pk_delete_insert_on_header. Invoices absent from the file are left in place,
+#   so a rolling window of invoices accumulates in prod as history.
+# DECLARATIVE ONLY for now: the real promotion runs via each destination's
+# prod.post_sql (the PK-join DELETE + INSERT..SELECT in the Update procs). This
+# records intent and is validated at load time, but is not yet dispatched by the
+# loader; it is the spec a later template-based query generator will fill in.
+prd_load:
+  strategy: pk_delete_insert
+
+# Delta-overlap guard: unlike payablesinvoice_distribution/payment (which must skip
+# because their window is keyed on the PARENT invoice's stamp, not landed in their
+# tables), this IS the invoice table: the export window is keyed on the invoice's
+# own "update stamp", which lands in the destination. Enforce that the incoming
+# rolling window overlaps what is already stored so no invoices fall through the
+# gap between runs:
+#   pass  <=>  MIN(source[update stamp])  <=  MAX(prod[update stamp])
+# mode: enforce = fail the destination on a gap | warn = log and continue | skip = do not run.
+# Runs before the staging truncate/insert, so a gap aborts the destination without
+# touching stored data.
+validation:
+  overlap_check:
+    mode: enforce
+    source_column: 'update stamp'   # column in the prepared source frame (post-rename, pre-mapping)
+    db_column: 'update stamp'       # same column, read from the baseline table below
+    baseline: prod                  # which already-in-DB table to read MAX from: prod | staging
+    skip_if_db_empty: true          # first-ever load has nothing to overlap -> skip instead of fail
+
+use_db_column_order: false
+
+# No transforms: every destination column maps directly from an export column.
+transforms: []
+
+field_config:
+  # strptime format for `date`-typed source columns, e.g. 09/30/2023.
+  date_format: '%m/%d/%Y'
+  # strptime format for `datetime`-typed source columns, e.g. 02/03/2025 03:30:02 PM.
+  # Set explicitly so pandas parses fast and unambiguously instead of guessing per row.
+  datetime_format: '%m/%d/%Y %I:%M:%S %p'
+
+  # PK check runs after mapping/data conversion, so these are destination column names
+  # (matches PK_PayablesInvoice on the destination table). The backbone export is one
+  # row per invoice, so a failure here means the export shipped a duplicate header.
+  pk_check: [Company, PayablesInvoice]
+
+  # Loaded columns, ordered like the destination table. Row format:
+  #   [source_or_computed, destination, type_to_convert_to_in_python, destination_datatype, origin]
+  # origin: source   = a required column read from the source file (hard-fail if missing)
+  #         computed = produced by a transform/loader, not present in the file
+  # type: string | date | datetime | float | int
+  mapping:
+    - [Company, Company, string, varchar(10), source]
+    - [DerivedCompanyRepresentativeText, CompanyRepText, string, varchar(255), source]
+    - [PayablesInvoice, PayablesInvoice, string, varchar(40), source]
+    - [Vendor, Vendor, string, varchar(40), source]
+    - [Vendor.VendorClass, VendorClass, string, varchar(10), source]
+    - [Vendor.VendorName, VendorName, string, varchar(255), source]
+    - [Invoice, Invoice, string, varchar(255), source]
+    - [InvoiceDate, InvoiceDate, date, date, source]
+    - [InvoiceAmount.CurrencyAmount, InvoiceAmount, float, money, source]
+    # The export's plain "Status" field is the IDM/backbone status; the table names
+    # it IDMStatus to distinguish it from InvoiceStatus/DerivedStatus below.
+    - [Status, IDMStatus, string, varchar(40), source]
+    - [InvoiceStatus, InvoiceStatus, string, varchar(40), source]
+    - [DerivedStatus, DerivedStatus, string, varchar(40), source]
+    # CreateDate ships with a time component (e.g. 02/03/2025 03:30:02 PM), so it must
+    # parse as datetime (a strict date_format parse would coerce every value to the
+    # 1900-01-01 fallback). The destination column is date, so the loader truncates
+    # the time after parsing (the fast_executemany insert cannot rely on SQL Server
+    # to truncate: the ODBC driver rejects a non-midnight timestamp -> date cast
+    # with a 22008 datetime field overflow).
+    - [CreateDate, CreateDate, datetime, date, source]
+    - [ReceiptOfInvoiceDate, ReceiptOfInvoiceDate, date, date, source]
+    - [DistributionDate, DistributionDate, date, date, source]
+    - [DueDate, DueDate, date, date, source]
+    - [PayVendor, PayVendor, string, varchar(40), source]
+    # Terms codes at the three levels: the invoice's own, the vendor default, and
+    # the pay-vendor default.
+    - [TermsCode, TermCodeInvoice, string, varchar(40), source]
+    - [Vendor.TermsCode, TermCodeVendor, string, varchar(40), source]
+    - [PayVendor.TermsCode, TermCodePayVendor, string, varchar(40), source]
+    - [CashCode, CashCodeInvoice, string, varchar(20), source]
+    - [Company.DerivedICBVendorCashCode, CashCodeCompanyDefault, string, varchar(20), source]
+    - [TransientPaymentNumber, TransientPaymentNumber, string, varchar(20), source]
+    - [TransientPaymentDate, TransientPaymentDate, date, date, source]
+    - [FirstPurchaseOrder, FirstPurchaseOrder, string, varchar(20), source]
+    - [ExternalPurchaseOrder, ExternalPurchaseOrder, string, varchar(40), source]
+    - [InvoiceRequiresMatch, InvoiceRequiresMatch, string, varchar(10), source]
+    - [InvoiceMatched, InvoiceMatched, string, varchar(10), source]
+    - [MatchInvoice, MatchInvoice, string, varchar(40), source]
+    - [MatchProcessType, MatchProcessType, string, varchar(40), source]
+    - [MatchStatus, MatchStatus, string, varchar(100), source]
+    - [MatchDate, MatchDate, date, date, source]
+    - [HasOpenReceipt, HasOpenReceipt, string, varchar(10), source]
+    - [MatchErrorType, MatchErrorType, string, varchar(40), source]
+    - [DerivedErrorIndicator, DerivedErrorIndicator, string, varchar(10), source]
+    # Destination keeps the table's existing "Frist" spelling (PK-adjacent rename
+    # would ripple into the Update procs / downstream consumers).
+    - [DerivedFirstErrorMessage, DerivedFristErrorMessage, string, varchar(255), source]
+    - [ShowUnmatchedNoReceiptsInPoolAlert, ShowUnmatchedNoReceiptsInPoolAlert, string, varchar(10), source]
+    - [ProcessingTeam, ProcessingTeam, string, varchar(100), source]
+    - [APClerk, APClerk, string, varchar(40), source]
+    - [DerivedAPClerkName, DerivedAPClerkName, string, varchar(100), source]
+    - [DerivedAutoAssignedAPClerkName, DerivedAutoAssignedAPClerkName, string, varchar(100), source]
+    - [RecurringFrequency, RecurringFrequency, string, varchar(40), source]
+    - [DisplayRemainingRecurrences, RemainingRecurrences, string, varchar(5), source]
+    - [InvoiceSource, InvoiceSource, string, varchar(100), source]
+    - [VoucherNumberDisplay, VoucherNumber, string, varchar(40), source]
+    - [create stamp, create stamp, datetime, datetime, source]
+    - [update stamp, update stamp, datetime, datetime, source]

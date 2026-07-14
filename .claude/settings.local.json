@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -)",
+      "Bash(python -B run_daily_loaders.py run --loader inventory_location)"
+    ]
+  }
+}

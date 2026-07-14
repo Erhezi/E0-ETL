@@ -1,0 +1,193 @@
+name: payablesinvoice_distribution
+enabled: true
+tags: [daily, PayablesInvoiceDistribution]
+
+process:
+  name: Payables Invoice Distribution
+  frequency: Workdays
+
+source:
+  multiple_input_files: false
+  files:
+    - alias: main
+      path: 'C:\Users\dli2\OneDrive - Montefiore Medicine\Documents\INFOR_SC\temp export'
+      name: 'GL+distribution+-+Export+To+CSV.csv'
+      reader: csv
+      options:
+        dtype: str
+
+# Each destination's server/database/schema are defaults inherited by both the
+# staging and prod blocks. To land staging in a different database (or server or
+# schema) than prod, set server/database/schema inside that block to override.
+# prod.post_sql runs on the prod connection after the staging load succeeds, to
+# promote the just-loaded staging data into prod. Each step gets its own ETLHealth row.
+destinations:
+  - name: des1
+    enabled: true
+    server: MISCPrdAdhocDB
+    database: PRIME
+    schema: 'DM_MONTYNT\dli2'
+    staging:
+      table: payablesinvoice_distribution_stg
+    prod:
+      table: PAYABLESINVOICE_DISTRIBUTION
+      # Header-level replace (see prd_load below): both statements run on one
+      # connection with a single commit, so the DELETE+INSERT pair is atomic.
+      post_sql:
+        - EXEC [DM_MONTYNT\dli2].[UpdatePayablesInvoiceDistribution]
+
+  # NOTE: verify the infor-side staging/prod object names. These mirror the des1
+  # naming and may need adjusting to the real objects on the infor schema.
+  - name: des2
+    enabled: true
+    server: YNBBSTVWP02\PROCDATASRVPROD
+    database: PLMPreprocessorShared
+    schema: infor
+    staging:
+      table: payablesinvoice_distribution_stg
+    prod:
+      table: PAYABLESINVOICE_DISTRIBUTION
+      post_sql:
+        - EXEC [infor].[sp_UpdatePayablesInvoiceDistribution]
+
+health_table:
+  server: 'YNBBSTVWP02\PROCDATASRVPROD'
+  database: SCSFileIngestor
+  schema: InforLoader
+  table: ETLHealth
+
+logging:
+  # <loader name> is substituted with this loader's name (payablesinvoice_distribution).
+  log_root: '\\montefiore.org\centralfiles\data\Procurement PMO\dli2\DailyLoader\<loader name>\logs'
+  level: INFO
+  console: true          # echo run logs to the console (stderr) for Task Scheduler output
+  capture_streams: true  # capture stdout/stderr (prints, warnings, tracebacks) into the log file
+
+# After a successful load the source file is copied here with a _YYYYMMDD stamp
+# appended (original extension kept), e.g. GL+distribution+-+Export+To+CSV_20260713.csv.
+# <loader name> is substituted with this loader's name. Set enabled: false to skip.
+archive:
+  path: '\\montefiore.org\centralfiles\data\Procurement PMO\dli2\DailyLoader\<loader name>\archived'
+
+stg_load:
+  strategy: truncate_insert   # how the staging table is loaded from the source file
+  batch_size: 50000
+
+# How the prod table is promoted from the just-loaded staging table.
+# Allowed: truncate_insert | pk_merge | pk_delete_insert | pk_delete_insert_on_header
+#          | versioned_delete_insert
+# pk_delete_insert_on_header: DELETE prod rows matching staging on the HEADER-level
+#   key (Company, PayablesInvoice) -- a prefix of the PK, not the full PK -- then
+#   INSERT all staging rows. Whole invoices are replaced rather than upserted line
+#   by line, because the export window is keyed on the header-level update stamp
+#   (PayablesInvoice.update stamp) and Infor FSM omits deleted lines from the
+#   export: a distribution line deleted in FSM simply stops appearing, so a plain
+#   pk_delete_insert would leave the stale line in prod forever. Replacing the
+#   whole header makes deletions land too. Invoices absent from the file are left
+#   in place, so a rolling window of invoices accumulates in prod as history.
+# DECLARATIVE ONLY for now: the real promotion runs via each destination's
+# prod.post_sql (the header-join DELETE + INSERT..SELECT above). This records
+# intent and is validated at load time, but is not yet dispatched by the loader;
+# header_key is the spec a later template-based query generator will fill in.
+prd_load:
+  strategy: pk_delete_insert_on_header
+  header_key: [Company, PayablesInvoice]
+
+# Delta-overlap guard: skip here because it cannot be expressed for this export.
+# The window is keyed on the PARENT invoice's stamp (PayablesInvoice.update stamp),
+# not on the distribution's own "update stamp" (which stays at its original value,
+# e.g. 2023 "Historical" conversion rows, even when the invoice is touched). Since
+# PayablesInvoice.update stamp is not landed in the destination table, there is no
+# DB column to compare MIN(source) against, and checking the distribution-level
+# "update stamp" would false-fail on old-but-refreshed distributions.
+# If PayablesInvoice.update stamp is ever added to the table, switch this to
+# mode: enforce on that column.
+validation:
+  overlap_check:
+    mode: skip
+    source_column: null
+    db_column: null
+    baseline: prod                  # which already-in-DB table to read MAX from: prod | staging
+    skip_if_db_empty: true          # first-ever load has nothing to overlap -> skip instead of fail
+
+use_db_column_order: false
+
+# No transforms: the CostCenter/BusinessArea/Index/GL parts arrive as separate
+# FinanceDimension columns in the export, so everything maps directly.
+transforms: []
+
+field_config:
+  # strptime format for `date`-typed source columns, e.g. 10/01/2023.
+  date_format: '%m/%d/%Y'
+  # strptime format for `datetime`-typed source columns, e.g. 10/01/2023 01:05:27 PM.
+  # Set explicitly so pandas parses fast and unambiguously instead of guessing per row.
+  datetime_format: '%m/%d/%Y %I:%M:%S %p'
+
+  # PK check runs after mapping/data conversion, so these are destination column names
+  # (matches PK_InvoiceDistribution on the destination table).
+  pk_check: [Company, PayablesInvoice, PayablesInvoiceDistribution]
+
+  # Loaded columns, ordered like the destination table. Row format:
+  #   [source_or_computed, destination, type_to_convert_to_in_python, destination_datatype, origin]
+  # origin: source   = a required column read from the source file (hard-fail if missing)
+  #         computed = produced by a transform/loader, not present in the file
+  # type: string | date | datetime | float | int
+  mapping:
+    - [Company, Company, string, varchar(10), source]
+    - [PayablesInvoice, PayablesInvoice, string, varchar(40), source]
+    - [PayablesInvoiceDistribution, PayablesInvoiceDistribution, string, varchar(10), source]
+    - [AccountingEntity, AccountingEntity, string, varchar(10), source]
+    - [AdjustedDistribution, AdjustedDistribution, string, varchar(10), source]
+    - [AssetFlag, AssetFlag, string, varchar(40), source]
+    - [DerivedFundDistributionOpenAmount, DerivedFundDistributionOpenAmount, float, money, source]
+    - [DerivedGLTransactionAmount, DerivedGLTransactionAmount, float, money, source]
+    - [DistributionDate, DistributionDate, date, date, source]
+    - [CreatedBy, CreatedBy, string, varchar(100), source]
+    - [Description, Description, string, varchar(255), source]
+    - [DistributionType, DistributionType, string, varchar(80), source]
+    # The distribution account's finance dimensions arrive pre-split:
+    # FinanceDimension1 = cost center, FinanceDimension3 = business area,
+    # FinanceDimension5 = index, GeneralLedgerChartAccount = GL account.
+    - [DistributionAccount.FinanceDimension1, CostCenter, string, varchar(20), source]
+    - [DistributionAccount.FinanceDimension1.Description, CostCenterText, string, varchar(255), source]
+    - [DistributionAccount.FinanceDimension3, BusinessArea, string, varchar(10), source]
+    - [DistributionAccount.FinanceDimension3.Description, BusinessAreaText, string, varchar(255), source]
+    - [DistributionAccount.FinanceDimension5, Index, string, varchar(40), source]
+    - [DistributionAccount.FinanceDimension5.Description, IndexText, string, varchar(255), source]
+    - [DistributionAccount.GeneralLedgerChartAccount.Account, GL, string, varchar(40), source]
+    - [DistributionAccount.GeneralLedgerChartAccount.AccountDescription, GLText, string, varchar(255), source]
+    - [DistributionAccount, DistributionAccount, string, varchar(255), source]
+    - [GLJournalizeGroup, GLJournalizeGroup, string, varchar(20), source]
+    - [Invoice, Invoice, string, varchar(255), source]
+    - [PayablesInvoice.InvoiceDate, InvoiceDate, date, date, source]
+    - [DerivedStatus, DerivedStatus, string, varchar(40), source]
+    - [DerivedInvoiceType, DerivedInvoiceType, string, varchar(40), source]
+    - [Vendor, Vendor, string, varchar(40), source]
+    - [PayablesInvoice.DerivedVendorName, VendorName, string, varchar(255), source]
+    - [PayablesInvoice.MatchInvoice, MatchInvoice, string, varchar(40), source]
+    - [DerivedPlainTextComment, DerivedPlainTextComment, string, varchar(510), source]
+    - [PurchaseOrder, PurchaseOrder, string, varchar(40), source]
+    - [PurchaseOrderLine, PurchaseOrderLine, string, varchar(10), source]
+    - [PurchaseOrderLine.MMAHSGeneralLedgerCategoryInventoryAccountGeneralLedgerChartAccount, PurchaseOrderLineGL, string, varchar(40), source]
+    - [PurchaseOrderLine.MMAHSGeneralLedgerCategoryGeneralLedgerChartAccountDescription, PurchaseOrderLineGLText, string, varchar(255), source]
+    - [DerivedQuantity, DerivedQuantity, float, "numeric(19, 4)", source]
+    - [DerivedUOM, DerivedUOM, string, varchar(20), source]
+    - [DerivedUnitCost, DerivedUnitCost, float, "numeric(19, 4)", source]
+    - [DerivedItemDescription, DerivedItemDescription, string, varchar(255), source]
+    - [PurchasingContract, PurchasingContract, string, varchar(50), source]
+    - [ContractLine, ContractLine, string, varchar(10), source]
+    - [create stamp, create stamp, datetime, datetime, source]
+    - [update stamp, update stamp, datetime, datetime, source]
+
+  # Present in the source file but not integrated into the pipeline yet. Optional:
+  # a missing one only warns, since it cannot affect the output.
+  extra:
+    - CommentText
+    - ContextPayablesInvoicePayment
+    - DerivedAmountCurrency          # display string like "282.160 USD" (negatives get a leading apostrophe); the numeric amounts are loaded instead
+    - DerivedCompanyWithinGLCompanyGroup
+    - DistributionCode
+    - PayablesInvoice.ReceiptOfInvoiceDate
+    - IsService
+    - PurchaseOrderLine.LineNumber   # PurchaseOrderLine itself is loaded; this display twin is not
+    - PayablesInvoice.update stamp   # parent invoice's stamp (the export window key); not in the destination table
