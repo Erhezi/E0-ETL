@@ -14,6 +14,10 @@ from .file_loader import FileLoader, LoaderResult
 from .utilities import build_column_mapping_template, inspect_table, write_mapping_template
 
 
+# Upper bound on concurrent loaders so a full run cannot swamp the SQL Server.
+MAX_WORKERS_CAP = 4
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run configurable Infor file loaders.")
     parser.add_argument("--config", default="configs", help="Config directory, .yaml file, Python module, or .py path.")
@@ -22,8 +26,14 @@ def main(argv: list[str] | None = None) -> int:
     # summary and asks for confirmation before running; `--auto` skips the prompt.
     parser.add_argument("--loader", action="append", default=[], help="Loader name to run. Can be repeated.")
     parser.add_argument("--tag", action="append", default=[], help="Select loaders by tag. Can be repeated.")
+    parser.add_argument("--all", action="store_true", help="Run every configured loader.")
     parser.add_argument("--auto", action="store_true", help="Skip the confirmation prompt and run immediately.")
-    parser.add_argument("--max-workers", type=int, default=1, help="Parallel worker count. Use 1 for sequential.")
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=None,
+        help=f"Parallel worker count, capped at {MAX_WORKERS_CAP}. Defaults to {MAX_WORKERS_CAP} with --all, else 1.",
+    )
     parser.add_argument("--log-root", default=None, help="Override each loader's YAML logging.log_root.")
     _add_phase_flags(parser)
 
@@ -35,7 +45,13 @@ def main(argv: list[str] | None = None) -> int:
     run_parser = subparsers.add_parser("run", help="Run configured loaders.")
     run_parser.add_argument("--loader", action="append", default=[], help="Loader name to run. Can be repeated.")
     run_parser.add_argument("--tag", action="append", default=[], help="Run loaders with tag. Can be repeated.")
-    run_parser.add_argument("--max-workers", type=int, default=1, help="Parallel worker count. Use 1 for sequential.")
+    run_parser.add_argument("--all", action="store_true", help="Run every configured loader.")
+    run_parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=None,
+        help=f"Parallel worker count, capped at {MAX_WORKERS_CAP}. Defaults to {MAX_WORKERS_CAP} with --all, else 1.",
+    )
     run_parser.add_argument("--log-root", default=None, help="Override each loader's YAML logging.log_root.")
     _add_phase_flags(run_parser)
 
@@ -51,14 +67,18 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
 
+    if getattr(args, "all", False) and (args.loader or args.tag):
+        parser.error("--all cannot be combined with --loader/--tag.")
+
     if args.command is None:
-        if args.loader or args.tag:
+        if args.loader or args.tag or args.all:
             return run_interactive(
                 args.config,
                 names=args.loader,
                 tags=args.tag,
+                select_all=args.all,
                 auto=args.auto,
-                max_workers=args.max_workers,
+                max_workers=_resolve_max_workers(args),
                 log_root=args.log_root,
                 phase=_resolve_phase(args),
             )
@@ -88,14 +108,14 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "run":
-        selected = select_loaders(loaders, names=args.loader, tags=args.tag)
+        selected = loaders if args.all else select_loaders(loaders, names=args.loader, tags=args.tag)
         selected = [loader for loader in selected if loader.enabled]
         if not selected:
             print("No enabled loaders selected.", file=sys.stderr)
             return 2
         results = run_loaders(
             selected,
-            max_workers=args.max_workers,
+            max_workers=_resolve_max_workers(args),
             log_root=args.log_root,
             phase=_resolve_phase(args),
         )
@@ -372,6 +392,16 @@ def _add_phase_flags(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _resolve_max_workers(args: argparse.Namespace) -> int:
+    requested = args.max_workers
+    if requested is None:
+        return MAX_WORKERS_CAP if getattr(args, "all", False) else 1
+    if requested > MAX_WORKERS_CAP:
+        print(f"--max-workers {requested} exceeds the cap; using {MAX_WORKERS_CAP}.", file=sys.stderr)
+        return MAX_WORKERS_CAP
+    return max(1, requested)
+
+
 def _resolve_phase(args: argparse.Namespace) -> str:
     if getattr(args, "prd_only", False):
         return "prd"
@@ -389,12 +419,13 @@ def run_interactive(
     max_workers: int,
     log_root: str | None,
     phase: str = "both",
+    select_all: bool = False,
 ) -> int:
     """Print a summary of the selected loaders and run them after confirmation."""
     loaders = load_loader_configs(config_ref)
-    selected = select_loaders(loaders, names=names, tags=tags)
+    selected = loaders if select_all else select_loaders(loaders, names=names, tags=tags)
     if not selected:
-        wanted = ", ".join([*names, *tags]) or "(none)"
+        wanted = "--all" if select_all else (", ".join([*names, *tags]) or "(none)")
         print(f"No loaders matched: {wanted}", file=sys.stderr)
         return 2
 

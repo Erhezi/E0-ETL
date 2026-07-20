@@ -82,17 +82,21 @@ def apply_type_changes(
 
 
 def normalize_for_db(df: pd.DataFrame, type_changes: dict[str, list[str]]) -> pd.DataFrame:
-    date_cols = set(type_changes.get("date", []))
     int_cols = set(type_changes.get("int", []))
-    numeric_or_datetime = set(type_changes.get("float", [])) | set(type_changes.get("datetime", []))
-    numeric_or_datetime.add("report stamp")
+    # date/datetime blanks were already filled with 1900-01-01 by apply_type_changes
+    # (the single blank-date sentinel; prod was backfilled 0001-01-01 -> 1900-01-01
+    # on 2026-07-15), so they pass through untouched here along with floats.
+    passthrough = (
+        set(type_changes.get("date", []))
+        | set(type_changes.get("datetime", []))
+        | set(type_changes.get("float", []))
+    )
+    passthrough.add("report stamp")
 
     for col in df.columns:
-        if col in date_cols:
-            df[col] = df[col].fillna("0001-01-01")
-        elif col in int_cols:
+        if col in int_cols:
             df[col] = df[col].astype(object).where(df[col].notna(), None)
-        elif col in numeric_or_datetime:
+        elif col in passthrough:
             continue
         else:
             df[col] = df[col].fillna("")
@@ -221,10 +225,22 @@ def purchase_order_line(
     dataframes: dict[str, pd.DataFrame],
     logger: logging.Logger,
 ) -> pd.DataFrame:
-    options = loader_config.transform_options
-    map_dir = Path(options["map_dir"])
+    """Enrich the PO line export and derive its computed/reporting columns.
 
-    company_map = pd.read_csv(map_dir / "company_map.csv", dtype=str)
+    The mapping inputs come from the loader's extra source files, by alias:
+      company_map -> company hierarchy (Name, AP pay lv3, AP pay lv1)
+      fd3         -> FinanceDimension3 descriptions (FD3Text)
+      fd5         -> FinanceDimension5 descriptions (FD5Text)
+    """
+    options = loader_config.transform_options
+    missing_aliases = [alias for alias in ("company_map", "fd3", "fd5") if alias not in dataframes]
+    if missing_aliases:
+        raise ValueError(
+            f"purchase_order_line requires source files with aliases {missing_aliases}; "
+            f"got {sorted(dataframes)}"
+        )
+
+    company_map = dataframes["company_map"]
     cmap = (
         df[["Company"]]
         .drop_duplicates()
@@ -243,11 +259,9 @@ def purchase_order_line(
             raise ValueError("Company map has unmapped companies; see loader log.")
     df = df.merge(cmap, on=["Company"], how="left")
 
-    fd3 = pd.read_csv(map_dir / "FD3.csv", dtype=str)
-    fd5 = pd.read_csv(map_dir / "FD5.csv", dtype=str)
-    fd3_m = fd3[["FinanceDimension3", "Description"]].copy()
+    fd3_m = dataframes["fd3"][["FinanceDimension3", "Description"]].copy()
     fd3_m.columns = ["FD3", "FD3Text"]
-    fd5_m = fd5[["FinanceDimension5", "Description"]].copy()
+    fd5_m = dataframes["fd5"][["FinanceDimension5", "Description"]].copy()
     fd5_m.columns = ["FD5", "FD5Text"]
     df = df.merge(fd3_m, on=["FD3"], how="left").merge(fd5_m, on=["FD5"], how="left")
 
@@ -257,12 +271,17 @@ def purchase_order_line(
     df["FD5Text"] = df["FD5Text"].fillna(df["FD1Text"])
 
     df["PurchaseOrder.Reference1"] = df["PurchaseOrder.Reference1"].apply(lambda x: _remove_leading_zeros(str(x).strip()))
-    df["Helper"] = df["PurchaseOrder.Reference1"].apply(_reference_checker)
 
-    still_need_list = set(options.get("still_need_list", []))
-    df.loc[df["PurchaseOrder"].isin(still_need_list), "Helper"] = False
-
-    legacy_ind = df[df["Helper"] == False].index
+    # A PO transferred from the legacy ERP carries the old order number in
+    # Reference1, so any non-empty reference marks the line as transferred. The
+    # 10-character company-prefixed form is a subset of "non-empty" and is spelled
+    # out only to document the known shape of transferred numbers. This replaces
+    # the old reference_check/'Helper' column + manual still_need_list machinery,
+    # which had converged to exactly this rule.
+    reference = df["PurchaseOrder.Reference1"]
+    legacy_mask = (reference != "") | (
+        (reference.str.len() == 10) & (reference.str[:4] == df["Company"])
+    )
     unreleased_ind = df[
         (df["PurchaseOrder.IsReleased"] == "No")
         & (df["PurchaseOrder.DerivedPurchaseOrderStatus"] != "Closed")
@@ -273,19 +292,18 @@ def purchase_order_line(
     ].index
 
     df["EXC_FLAG"] = "Default"
-    df.loc[legacy_ind, "EXC_FLAG"] = "Remove - legacy PO transferred"
+    df.loc[legacy_mask, "EXC_FLAG"] = "Remove - legacy PO transferred"
     df.loc[unreleased_ind, "EXC_FLAG"] = "Remove - unreleased"
     df.loc[canceled_after_ind, "EXC_FLAG"] = "Remove - released but canceled"
 
     df["System"] = "INFOR"
-    df["Year"] = df["PurchaseOrder.MMAHSPOReleaseDate"].apply(lambda x: str(x)[:4] if not pd.isnull(x) else np.nan)
-    df["YearMonth"] = df["PurchaseOrder.MMAHSPOReleaseDate"].apply(lambda x: str(x)[:7] if not pd.isnull(x) else np.nan)
+    # POReleaseDate blanks are already the 1900-01-01 sentinel (apply_type_changes
+    # runs before transforms), so a PO without a release date deliberately reports
+    # Year 1900 / YearMonth 1900-01 / Quarter Q1 -- the old notebook fallback to
+    # the PO date was retired on purpose.
+    df["Year"] = df["PurchaseOrder.MMAHSPOReleaseDate"].apply(lambda x: str(x)[:4])
+    df["YearMonth"] = df["PurchaseOrder.MMAHSPOReleaseDate"].apply(lambda x: str(x)[:7])
     df["Quarter"] = df["YearMonth"].apply(add_quarter)
-
-    year_month_approx_ind = df[(df["YearMonth"].isnull()) & (df["EXC_FLAG"] == "Default")].index
-    df.loc[year_month_approx_ind, "Year"] = df.loc[year_month_approx_ind, "MMAHSPurchaseOrderDate"].apply(lambda x: str(x)[:4])
-    df.loc[year_month_approx_ind, "YearMonth"] = df.loc[year_month_approx_ind, "MMAHSPurchaseOrderDate"].apply(lambda x: str(x)[:7])
-    df.loc[year_month_approx_ind, "Quarter"] = df.loc[year_month_approx_ind, "YearMonth"].apply(add_quarter)
     return df
 
 
@@ -550,16 +568,3 @@ def _remove_leading_zeros(value: str) -> str:
     while index < len(value) and value[index] == "0":
         index += 1
     return value[index:]
-
-
-def _reference_checker(value: str) -> bool:
-    if value in ["4502656845 & 4502389074", "4502702803 - 4502536259", "4502689964 & 4502179112"]:
-        return False
-    if value == "":
-        return True
-
-    non_digit_count = sum(1 for char in value if not char.isdigit())
-    allowed_prefixes = ("SV", "SA", "RJ", "KH", "DSA", "EB", "ST", "OK", "LS", "PO")
-    if non_digit_count >= 2 and not value.startswith(allowed_prefixes):
-        return True
-    return False

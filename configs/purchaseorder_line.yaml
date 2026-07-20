@@ -1,0 +1,316 @@
+name: purchaseorder_line
+enabled: true
+tags: [daily, PurchaseOrderLine]
+
+process:
+  name: Purchase Order Line
+  frequency: Workdays
+
+# The main export plus three mapping inputs. The first file (alias `main`) is the
+# frame the pipeline processes; the other aliases are handed to the
+# purchase_order_line transform, which merges them in:
+#   company_map -> CompanyText/EntityLv1/EntityLv2 (Name, AP pay lv1, AP pay lv3)
+#   fd3         -> BusinessAreaText (FinanceDimension3 -> Description)
+#   fd5         -> IndexText (FinanceDimension5 -> Description)
+# fd5 is read from 'misc mdm' (where the fresh download lands) instead of the
+# 'APPO compilation' copy the notebook refreshed with a manual copy step; the
+# side-copies to APPO compilation / I:\...\BaxterReport are NOT part of this
+# loader and still belong to whatever refreshes those reports.
+source:
+  multiple_input_files: true
+  files:
+    - alias: main
+      path: 'C:\Users\dli2\OneDrive - Montefiore Medicine\Documents\INFOR_SC\temp export'
+      name: 'DataTeamPRD_POline_DL.csv'
+      reader: csv
+      options:
+        dtype: str
+    - alias: company_map
+      path: 'C:\Users\dli2\OneDrive - Montefiore Medicine\Documents\INFOR_SC\misc mdm'
+      name: 'company_map.csv'
+      reader: csv
+      options:
+        dtype: str
+    - alias: fd3
+      path: 'C:\Users\dli2\OneDrive - Montefiore Medicine\Documents\INFOR_SC\misc mdm'
+      name: 'FD3.csv'
+      reader: csv
+      options:
+        dtype: str
+    - alias: fd5
+      path: 'C:\Users\dli2\OneDrive - Montefiore Medicine\Documents\INFOR_SC\misc mdm'
+      name: 'FD5.csv'
+      reader: csv
+      options:
+        dtype: str
+
+# Each destination's server/database/schema are defaults inherited by both the
+# staging and prod blocks. To land staging in a different database (or server or
+# schema) than prod, set server/database/schema inside that block to override.
+# prod.post_sql runs on the prod connection after the staging load succeeds, to
+# promote the just-loaded staging data into prod. Each step gets its own ETLHealth row.
+destinations:
+  - name: des1
+    enabled: true
+    server: MISCPrdAdhocDB
+    database: PRIME
+    schema: 'DM_MONTYNT\dli2'
+    staging:
+      table: purchaseorder_line_stg
+    prod:
+      table: PURCHASEORDER_LINE
+      post_sql:
+        - EXEC [DM_MONTYNT\dli2].[UpdatePurchaseOrderLine]
+
+  # Disabled placeholder for the infor-side landing the other loaders have.
+  # Enable only after confirming the objects (purchaseorder_line_stg /
+  # PURCHASEORDER_LINE / sp_UpdatePurchaseOrderLine) actually exist on that schema.
+  - name: des2
+    enabled: true
+    server: YNBBSTVWP02\PROCDATASRVPROD
+    database: PLMPreprocessorShared
+    schema: infor
+    staging:
+      table: purchaseorder_line_stg
+    prod:
+      table: PURCHASEORDER_LINE
+      post_sql:
+        - EXEC [infor].[sp_UpdatePurchaseOrderLine]
+
+health_table:
+  server: 'YNBBSTVWP02\PROCDATASRVPROD'
+  database: SCSFileIngestor
+  schema: InforLoader
+  table: ETLHealth
+
+logging:
+  # <loader name> is substituted with this loader's name (purchaseorder_line).
+  log_root: '\\montefiore.org\centralfiles\data\Procurement PMO\dli2\DailyLoader\<loader name>\logs'
+  level: INFO
+  console: true          # echo run logs to the console (stderr) for Task Scheduler output
+  capture_streams: true  # capture stdout/stderr (prints, warnings, tracebacks) into the log file
+
+# After a successful load every consumed source file (the export AND the three
+# mapping files) is copied here with a _YYYYMMDD stamp appended (original
+# extension kept), e.g. DataTeamPRD_POline_DL_20260714.csv, so each day's run
+# records the mapping versions it used. <loader name> is substituted with this
+# loader's name. Set enabled: false to skip.
+archive:
+  path: '\\montefiore.org\centralfiles\data\Procurement PMO\dli2\DailyLoader\<loader name>\archived'
+
+stg_load:
+  strategy: truncate_insert   # how the staging table is loaded from the source file
+  batch_size: 50000
+
+# How the prod table is promoted from the just-loaded staging table.
+# Allowed: truncate_insert | pk_merge | pk_delete_insert | pk_delete_insert_on_header
+#          | versioned_delete_insert | filter_active
+# pk_delete_insert_on_header: DELETE prod rows matching staging on the HEADER-level
+#   key (PO) -- a prefix of the PK (PO, POLine) -- then INSERT all staging rows.
+#   Whole POs' line sets are replaced rather than upserted row by row, because the
+#   export window is keyed on the parent PO's stamp (PurchaseOrder.update stamp)
+#   and each export carries the full line set for every PO it includes: replacing
+#   the header makes lines that stop appearing disappear from prod too. POs absent
+#   from the file are left in place, so a rolling window of POs accumulates in
+#   prod as history.
+# NOTE(dli2): written from the export-window design; could not read
+# UpdatePurchaseOrderLine from here -- verify the proc really replaces on PO
+# before relying on this description.
+# DECLARATIVE ONLY for now: the real promotion runs via each destination's
+# prod.post_sql (EXEC ...UpdatePurchaseOrderLine). This records intent and is
+# validated at load time, but is not yet dispatched by the loader; header_key is
+# the spec a later template-based query generator will fill in.
+prd_load:
+  strategy: pk_delete_insert_on_header
+  header_key: [PO]
+
+# Delta-overlap guard: skip, same reasoning as payablesinvoice_distribution/payment.
+# The export window is keyed on the PARENT PO's stamp (PurchaseOrder.update stamp),
+# which is not landed in the destination table, so there is no DB column to compare
+# MIN(source) against. The line's own "update stamp" cannot stand in for it: a
+# just-exported PO can carry lines whose own stamps are years old, so the check
+# would be a trivial always-pass, not a guard. If PurchaseOrder.update stamp is
+# ever added to the table, switch this to mode: enforce on that column.
+validation:
+  overlap_check:
+    mode: skip
+    source_column: null
+    db_column: null
+    baseline: prod                  # which already-in-DB table to read MAX from: prod | staging
+    skip_if_db_empty: true          # first-ever load has nothing to overlap -> skip instead of fail
+
+use_db_column_order: false
+
+# Merges the company/FD3/FD5 mapping files in (see source.files above), rewrites
+# Index/IndexText for inventory lines, strips leading zeros from
+# PurchaseOrder.Reference1, derives System/Year/YearMonth/Quarter, and sets
+# EXC_FLAG:
+#   'Remove - legacy PO transferred'   -- PurchaseOrder.Reference1 is non-empty
+#     (a transferred PO carries the legacy ERP order number in Reference1) or is
+#     a 10-character reference whose first 4 digits equal the Company. The old
+#     reference_check/'Helper' column + manual still_need_list machinery is
+#     retired: it had converged to exactly "non-empty reference => transferred".
+#   'Remove - unreleased'              -- PO.IsReleased = No and status <> Closed
+#   'Remove - released but canceled'   -- line released but PO status = Canceled
+# Registered in infor_loader/transforms.py.
+transforms:
+  - purchase_order_line
+
+transform_options:
+  # Unmapped companies only warn by default; flip to true to fail the run instead
+  # (the company merge leaves CompanyText/EntityLv1/EntityLv2 empty for them).
+  fail_on_unmapped_company: false
+
+field_config:
+  # No date_format: this export MIXES date shapes -- MMAHSPurchaseOrderDate ships
+  # as YYYYMMDD (e.g. 20250402) while the release/contract/delivery dates ship as
+  # MM/DD/YYYY (e.g. 04/02/2025) -- so `date`-typed columns are parsed per-value
+  # ("mixed") instead of with one strict format (which would coerce the other
+  # shape to the 1900-01-01 fallback).
+  # strptime format for `datetime`-typed source columns, e.g. 05/29/2026 02:36:28 PM.
+  # Set explicitly so pandas parses fast and unambiguously instead of guessing per row.
+  datetime_format: '%m/%d/%Y %I:%M:%S %p'
+
+  # Source columns are renamed BEFORE type conversion, transforms, and the mapping
+  # below, so mapping/transform code sees these short names (same names the
+  # original notebook used).
+  rename_columns:
+    MMAHSPurchaseOrderLineDistributionFinanceDimension1: FD1
+    MMAHSPurchaseOrderLineDistributionFinanceDimension1Description: FD1Text
+    MMAHSPurchaseOrderLineDistributionFinanceDimension3: FD3
+    MMAHSPurchaseOrderLineDistributionFinanceDimension4: FD4
+    MMAHSPurchaseOrderLineDistributionFinanceDimension5: FD5
+    MMAHSPurchaseOrderLineDistributionProject: Project
+    # The export header really does spell "Ldeger" -- keep it, do not "fix" it.
+    MMAHSPurchaseOrderLineDistributionGeneralLdegerChartAccount: GL
+    MMAHSPurchaseOrderLineDistributionGeneralLedgerChartAccountDescription: GLText
+    MMAHSGeneralLedgerCategoryInventoryAccountFinanceDimension1: InventoryFD1
+    last PurchaseOrderLineSourcesRel.PurchaseOrderLineSource.SourceDocumentOrigin: SourceDocumentOrigin
+    last LineSourcesFromOrderEntryAndRequisitionRel.PurchaseOrderLineSource.SourceDocumentNumeric: Requisition
+    last LineSourcesFromOrderEntryAndRequisitionRel.PurchaseOrderLineSource.SourceDocumentLineNumber: RequisitionLine
+    last LineSourcesFromOrderEntryAndRequisitionRel.RequisitionLineRel.ApprovedRejectedDate: RequisitionApprovedRejectedDate
+    last LineSourcesFromOrderEntryAndRequisitionRel.RequisitionLineRel.Approved: RequisitionApproved
+    last LineSourcesFromOrderEntryAndRequisitionRel.RequisitionLineRel.ApprovingRejectingOperatorID: RequisitionApprovingRejectingOperatorID
+    last LineSourcesFromOrderEntryAndRequisitionRel.RequestingLocation: RequisitionRequestingLocation
+    last PurchaseOrderLineSourcesRel.RequestingLocation.RequisitionApprovalType: RequisitionApprovalType
+
+  # PK check runs after mapping/data conversion, so these are destination column
+  # names (matches PK_PO_POLine on the destination table). The export is one row
+  # per PO line, so a failure here means the export shipped a duplicate line.
+  pk_check: [PO, POLine]
+
+  # Loaded columns, ordered like the destination table. Row format:
+  #   [source_or_computed, destination, type_to_convert_to_in_python, destination_datatype, origin]
+  # origin: source   = a required column read from the source file (hard-fail if missing)
+  #         computed = produced by a transform/loader, not present in the file
+  # type: string | date | datetime | float | int
+  mapping:
+    - [System, System, string, varchar(10), computed]                  # purchase_order_line: constant 'INFOR'
+    - [AP pay lv1, EntityLv1, string, varchar(10), computed]           # purchase_order_line: company_map merge
+    - [AP pay lv3, EntityLv2, string, varchar(40), computed]           # purchase_order_line: company_map merge
+    - [Company, Company, string, varchar(10), source]
+    - [Name, CompanyText, string, varchar(100), computed]              # purchase_order_line: company_map merge
+    - [PurchaseOrder, PO, string, varchar(20), source]
+    # Leading zeros are stripped by the transform before this lands.
+    - [PurchaseOrder.Reference1, PO.Reference1, string, varchar(255), source]
+    - [MMAHSPOCode, POCode, string, varchar(10), source]
+    - [ServiceCode, ServiceCode, string, varchar(40), source]
+    - [MMAHSPurchaseOrderDate, PODate, date, date, source]             # ships as YYYYMMDD; see date_format note
+    - [PurchaseOrder.DerivedPurchaseOrderStatus, PO.DerivedPOStatus, string, varchar(100), source]
+    - [PurchaseOrder.IsReleased, PO.IsReleased, string, varchar(10), source]
+    - [PurchaseOrder.MMAHSPOReleaseDate, POReleaseDate, date, date, source]
+    - [Year, Year, string, varchar(4), computed]                       # purchase_order_line: from POReleaseDate (1900 when unreleased)
+    - [YearMonth, YearMonth, string, varchar(7), computed]             # purchase_order_line: from POReleaseDate (1900-01 when unreleased)
+    - [Quarter, Quarter, string, varchar(2), computed]                 # purchase_order_line: from YearMonth
+    - [PurchaseOrder.BuyerName, PO.BuyerName, string, varchar(255), source]
+    - [PurchaseOrder.DerivedRequesterName, PO.RequesterName, string, varchar(255), source]
+    - [PurchaseOrder.ShipToLocation, PO.ShipToLocation, string, varchar(40), source]
+    - [PurchaseOrder.ShipToLocationName, PO.ShipToLocationName, string, varchar(255), source]
+    - [Vendor, Vendor, string, varchar(40), source]
+    - [Vendor.VendorName, VendorName, string, varchar(255), source]
+    - [PurchaseOrder.TotalOrderAmount, PO.TotalOrderAmount, float, money, source]
+    - [LineNumber, POLine, string, varchar(10), source]
+    - [PurchaseOrderLine, PurchaseOrderLine, string, varchar(10), source]
+    - [EarlyDeliveryDate, EarlyDeliveryDate, date, date, source]
+    - [PurchaseOrderLineLifeCycleState, POLineStatus, string, varchar(40), source]
+    - [LineReleased, POLineReleased, string, varchar(10), source]
+    # FD5 is read from the file but the transform overwrites it for inventory
+    # lines ('INVENTORY - <TransientInventoryLocation>').
+    - [FD5, Index, string, varchar(40), source]
+    - [FD5Text, IndexText, string, varchar(255), computed]             # purchase_order_line: FD5.csv merge, FD1Text fallback
+    - [Project, Project, string, varchar(40), source]
+    - [InventoryFD1, InventoryFD1, string, varchar(40), source]
+    # Destination keeps the table's existing "Trasient" spelling.
+    - [TransientInventoryLocation, TrasientInventoryLocation, string, varchar(40), source]
+    - [FD1, CostCenter, string, varchar(20), source]
+    - [FD1Text, CostCenterText, string, varchar(255), source]
+    - [FD3, BusinessArea, string, varchar(10), source]
+    - [FD3Text, BusinessAreaText, string, varchar(255), computed]      # purchase_order_line: FD3.csv merge
+    - [GL, GL, string, varchar(20), source]
+    - [GLText, GLText, string, varchar(255), source]
+    - [FD4, AccountCategory, string, varchar(50), source]
+    - [Item, Item, string, varchar(100), source]
+    - [ItemType, ItemType, string, varchar(40), source]
+    - [VendorItem, VendorItem, string, varchar(100), source]
+    - [Description, Description, string, varchar(255), source]
+    - [Manufacturer, Manufacturer, string, varchar(10), source]
+    - [ManufacturerNumber, ManufacturerNumber, string, varchar(100), source]
+    - [EnteredBuyUOM, EnteredBuyUOM, string, varchar(20), source]
+    - [Quantity, Quantity, float, "numeric(18, 4)", source]
+    - [VendorBuyUnitCost, VendorBuyUnitCost, float, money, source]
+    - [CalculateExtendedAmount, CalculateExtendedAmount, float, money, source]
+    - [Item.Manufacturer, Item.Manufacturer, string, varchar(10), source]
+    - [Item.ManufacturerDescription, Item.ManufacturerDescription, string, varchar(255), source]
+    - [Item.DerivedStrippedManufacturerNumber, Item.DerivedStrippedManufacturerNumber, string, varchar(100), source]
+    - [Item.StockUOM, Item.StockUOM, string, varchar(20), source]
+    - [EnteredBuyUOMMultiplier, EnteredBuyUOMMultiplier, float, "numeric(10, 4)", source]
+    - [Item.OnContractDisplay, Item.OnContractDisplay, string, varchar(40), source]
+    - [Contract, Contract, string, varchar(20), source]
+    - [ContractLine, ContractLine, string, varchar(10), source]
+    - [Contract.WorkingContractID, Contract.WorkingContractID, string, varchar(40), source]
+    - [Contract.ContractAndName, Contract.ContractAndName, string, varchar(255), source]
+    - [Contract.ContractClassification, Contract.ContractClassification, string, varchar(100), source]
+    - [Contract.EffectiveDate, Contract.EffectiveDate, date, date, source]
+    - [Contract.ExpirationDate, Contract.ExpirationDate, date, date, source]
+    - [IsOpenForReceivingIncludingUnreleased, IsOpenForReceivingIncludingUnreleased, string, varchar(10), source]
+    - [DerivedOpenToReceiveTotalAmount, DerivedOpenToReceiveTotalAmount, float, money, source]
+    - [DerivedOpenQty, DerivedOpenQty, float, "numeric(18, 4)", source]
+    - [ReceivedNotInvoicedQuantityExists, ReceivedNotInvoicedQuantityExists, string, varchar(10), source]
+    - [DerivedReceivedNotInvoicedTotalAmount, DerivedReceivedNotInvoicedTotalAmount, float, money, source]
+    - [DerivedReceivedNotInvoicedQuantity, DerivedReceivedNotInvoicedQty, float, "numeric(18, 4)", source]
+    - [ReceivedQuantity, ReceivedQuantity, float, "numeric(18, 4)", source]
+    - [CancelQuantity, CancelQuantity, float, "numeric(18, 4)", source]
+    - [ItemIsBackordered, ItemIsBackordered, string, varchar(10), source]
+    - [CostCode, CostCode, string, varchar(20), source]
+    - [CostOption, CostOption, string, varchar(40), source]
+    - [PurchaseOrder.IssueMethod, PurchaseOrder.IssueMethod, string, varchar(20), source]
+    - [PurchaseOrder.PurchaseOrderLineCommentsRel.CommentText, PurchaseOrderLine.CommentText, string, varchar(max), source]
+    - [SourceDocumentOrigin, SourceDocumentOrigin, string, varchar(20), source]
+    - [Requisition, Requisition, string, varchar(20), source]
+    - [RequisitionLine, RequisitionLine, string, varchar(10), source]
+    # Ships with a time component (e.g. 04/01/2025 12:26:25 PM), so it must parse
+    # as datetime (a strict date parse would coerce every value to the 1900-01-01
+    # fallback). The destination column is date, so the loader truncates the time
+    # after parsing (the fast_executemany insert cannot rely on SQL Server to
+    # truncate: the ODBC driver rejects a non-midnight timestamp -> date cast
+    # with a 22008 datetime field overflow).
+    - [RequisitionApprovedRejectedDate, RequisitionApprovedRejectedDate, datetime, date, source]
+    - [RequisitionApproved, RequisitionApproved, string, varchar(5), source]
+    - [RequisitionApprovingRejectingOperatorID, RequisitionApprovingRejectingOperatorID, string, varchar(40), source]
+    - [RequisitionRequestingLocation, RequisitionRequestingLocation, string, varchar(20), source]
+    - [RequisitionApprovalType, RequisitionApprovalType, string, varchar(50), source]
+    - [EXC_FLAG, EXC_FLAG, string, varchar(255), computed]             # purchase_order_line: see transforms comment
+    - [create stamp, create stamp, datetime, datetime, source]
+    - [update stamp, update stamp, datetime, datetime, source]
+
+  # Present in the source file but not integrated into the pipeline yet. Optional:
+  # a missing one only warns, since it cannot affect the output.
+  extra:
+    - Item.ContextManufacturerNumber
+    - Item.DefaultBuyUOMMultiplier
+    - MatchedQuantity
+    - DerivedNonServiceMatchedAmount
+    - DerivedPurchaseOrderReceiptStatus
+    - ShipToLocation   # line-level location; the loaded one is PurchaseOrder.ShipToLocation
+    - last LineSourcesFromOrderEntryAndRequisitionRel.RequisitionToPurchaseOrderDays
+    - PurchaseOrder.update stamp   # parent PO's stamp (the export window key); not in the destination table

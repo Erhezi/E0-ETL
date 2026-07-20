@@ -1,0 +1,168 @@
+name: purchaseorder_receipt_line
+enabled: true
+tags: [daily, PurchaseOrderReceiptLine]
+
+process:
+  name: Purchase Order Receipt Line
+  frequency: Workdays
+
+source:
+  multiple_input_files: false
+  files:
+    - alias: main
+      path: 'C:\Users\dli2\OneDrive - Montefiore Medicine\Documents\INFOR_SC\temp export'
+      name: 'PurchaseOrderReceiptLine_DL+-+Export+To.csv'
+      reader: csv
+      options:
+        dtype: str
+
+# Each destination's server/database/schema are defaults inherited by both the
+# staging and prod blocks. To land staging in a different database (or server or
+# schema) than prod, set server/database/schema inside that block to override.
+# prod.post_sql runs on the prod connection after the staging load succeeds, to
+# promote the just-loaded staging data into prod. Each step gets its own ETLHealth row.
+destinations:
+  - name: des1
+    enabled: true
+    server: MISCPrdAdhocDB
+    database: PRIME
+    schema: 'DM_MONTYNT\dli2'
+    staging:
+      table: purchaseorderreceipt_line_stg
+    prod:
+      table: PURCHASEORDERRECEIPT_LINE
+      post_sql:
+        - EXEC [DM_MONTYNT\dli2].[UpdatePurchaseOrderReceiptLine]
+
+  - name: des2
+    enabled: true
+    server: YNBBSTVWP02\PROCDATASRVPROD
+    database: PLMPreprocessorShared
+    schema: infor
+    staging:
+      table: purchaseorderreceipt_line_stg
+    prod:
+      table: PURCHASEORDERRECEIPT_LINE
+      post_sql:
+        - EXEC [infor].[sp_UpdatePurchaseOrderReceiptLine]
+
+health_table:
+  server: 'YNBBSTVWP02\PROCDATASRVPROD'
+  database: SCSFileIngestor
+  schema: InforLoader
+  table: ETLHealth
+
+logging:
+  # <loader name> is substituted with this loader's name (purchaseorder_receipt_line).
+  log_root: '\\montefiore.org\centralfiles\data\Procurement PMO\dli2\DailyLoader\<loader name>\logs'
+  level: INFO
+  console: true          # echo run logs to the console (stderr) for Task Scheduler output
+  capture_streams: true  # capture stdout/stderr (prints, warnings, tracebacks) into the log file
+
+# After a successful load the source file is copied here with a _YYYYMMDD stamp
+# appended (original extension kept), e.g.
+# PurchaseOrderReceiptLine_DL+-+Export+To_20260715.csv. <loader name> is
+# substituted with this loader's name. Set enabled: false to skip.
+archive:
+  path: '\\montefiore.org\centralfiles\data\Procurement PMO\dli2\DailyLoader\<loader name>\archived'
+
+stg_load:
+  strategy: truncate_insert   # how the staging table is loaded from the source file
+  batch_size: 50000
+
+# How the prod table is promoted from the just-loaded staging table.
+# Allowed: truncate_insert | pk_merge | pk_delete_insert | pk_delete_insert_on_header
+#          | versioned_delete_insert | filter_active
+# pk_delete_insert: DELETE prod rows matching staging on the full PK
+#   (Company, PO, Receipt, POLine), then INSERT all staging rows. Receipt lines
+#   absent from the file are left in place, so a rolling window of receipts
+#   accumulates in prod as history.
+# VERIFIED against both procs (read 2026-07-15): UpdatePurchaseOrderReceiptLine
+# and [infor].sp_UpdatePurchaseOrderReceiptLine delete prod joining staging on
+# company+po+receipt+poline, then run
+#   INSERT INTO PURCHASEORDERRECEIPT_LINE SELECT * FROM purchaseorderreceipt_line_stg
+# The insert is POSITIONAL (SELECT *): staging and prod column order were verified
+# identical on both destinations, and the mapping below is kept in that same table
+# order -- do not reorder it without also altering both tables and the procs.
+# DECLARATIVE ONLY for now: the real promotion runs via each destination's
+# prod.post_sql (EXEC ...UpdatePurchaseOrderReceiptLine). This records intent and
+# is validated at load time, but is not yet dispatched by the loader.
+prd_load:
+  strategy: pk_delete_insert
+
+# Delta-overlap guard: enforce. Unlike purchaseorder_line (windowed on the PARENT
+# PO's stamp, not landed), this export is a rolling window keyed on the receipt
+# line's OWN "update stamp", which lands in the destination: the 2026-07-15 file
+# spanned exactly 2026-07-08 00:00:15 -> 2026-07-14 23:53:05 (20,541 rows), a
+# clean ~7-day window, while PurchaseOrder.update stamp (also shipped, not
+# landed) was ragged. Make sure the incoming window overlaps what is already
+# stored so no receipt lines fall through the gap between runs:
+#   pass  <=>  MIN(source[update stamp])  <=  MAX(prod[update stamp])
+# mode: enforce = fail the destination on a gap | warn = log and continue | skip = do not run.
+# Runs before the staging truncate/insert, so a gap aborts the destination without
+# touching stored data.
+validation:
+  overlap_check:
+    mode: enforce
+    source_column: 'update stamp'   # column in the prepared source frame (post-rename, pre-mapping)
+    db_column: 'update stamp'       # same column, read from the baseline table below
+    baseline: prod                  # which already-in-DB table to read MAX from: prod | staging
+    skip_if_db_empty: true          # first-ever load has nothing to overlap -> skip instead of fail
+
+use_db_column_order: false
+
+# No transforms: the export loads as-is (renames and type conversion are handled
+# by the mapping below; the notebook's POReceipt section had no other logic).
+
+field_config:
+  # strptime format for `date`-typed source columns, e.g. 07/14/2026.
+  date_format: '%m/%d/%Y'
+  # strptime format for `datetime`-typed source columns, e.g. 07/14/2026 09:53:49 PM.
+  # Set explicitly so pandas parses fast and unambiguously instead of guessing per row.
+  datetime_format: '%m/%d/%Y %I:%M:%S %p'
+
+  # PK check runs after mapping/data conversion, so these are destination column
+  # names (matches PK_PORLine on the destination table). The export is one row per
+  # receipt of a PO line, so a failure here means the export shipped a duplicate.
+  pk_check: [Company, PO, Receipt, POLine]
+
+  # Loaded columns, ordered like the destination table. Row format:
+  #   [source_or_computed, destination, type_to_convert_to_in_python, destination_datatype, origin]
+  # origin: source   = a required column read from the source file (hard-fail if missing)
+  #         computed = produced by a transform/loader, not present in the file
+  # type: string | date | datetime | float | int
+  # KEEP THIS IN TABLE ORDER: the promotion procs' INSERT ... SELECT * is
+  # positional (see prd_load note above).
+  mapping:
+    - [Company, Company, string, varchar(10), source]
+    - [Company.Name, CompanyText, string, varchar(255), source]
+    - [PurchaseOrder, PO, string, varchar(20), source]
+    - [PurchaseOrderReceipt, Receipt, string, varchar(20), source]
+    - [PurchaseOrderLine.LineNumber, POLine, string, varchar(10), source]
+    - [Item, Item, string, varchar(100), source]
+    - [PurchaseOrderLine.Description, Description, string, varchar(255), source]
+    - [PurchaseOrder.MMAHSPOReleaseDate, POReleaseDate, date, date, source]
+    - [ReceivedDate, ReceivedDate, date, date, source]
+    # The export really ships this computed column under its formula name, as a
+    # decimal string (e.g. "0.000000000000000"); the int conversion handles it.
+    - ['(ReceivedDate - PurchaseOrder.MMAHSPOReleaseDate)', ReceivedToReleasedDay, int, int, source]
+    - [PurchaseOrderReceipt.Buyer, BuyerID, string, varchar(40), source]
+    - [PurchaseOrderReceipt.Buyer.Employee.PresentationNameSnapshot, BuyerName, string, varchar(100), source]
+    - [Vendor, Vendor, string, varchar(20), source]
+    - [Vendor.VendorName, VendorName, string, varchar(255), source]
+    - [Status, Status, string, varchar(40), source]
+    - [CreatedBy, CreatedBy, string, varchar(100), source]
+    # Quantities/costs ship with thousands separators (e.g. "1,296.00"); the
+    # float conversion strips them.
+    - [OriginalReceivedQuantity, OriginalReceivedQuantity, float, "numeric(19, 4)", source]
+    - [OriginalUnitCost, OriginalUnitCost, float, "numeric(19, 4)", source]
+    - [ReceivedUOM, ReceivedUOM, string, varchar(10), source]
+    - [EnteredReceivedQuantity, EnteredReceivedQuantity, float, "numeric(19, 4)", source]
+    - [MatchUnitCost, MatchUnitCost, float, "numeric(19, 4)", source]
+    - [create stamp, create stamp, datetime, datetime, source]
+    - [update stamp, update stamp, datetime, datetime, source]
+
+  # Present in the source file but not integrated into the pipeline yet. Optional:
+  # a missing one only warns, since it cannot affect the output.
+  extra:
+    - PurchaseOrder.update stamp   # parent PO's stamp; not the window key here, not in the destination table

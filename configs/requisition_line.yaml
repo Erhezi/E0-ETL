@@ -1,0 +1,208 @@
+name: requisition_line
+enabled: true
+tags: [daily, RequisitionLine]
+
+process:
+  name: Requisition Line
+  frequency: Workdays
+
+source:
+  multiple_input_files: false
+  files:
+    - alias: main
+      path: 'C:\Users\dli2\OneDrive - Montefiore Medicine\Documents\INFOR_SC\temp export'
+      name: 'ReqLine.csv'
+      reader: csv
+      options:
+        dtype: str
+
+# Each destination's server/database/schema are defaults inherited by both the
+# staging and prod blocks. To land staging in a different database (or server or
+# schema) than prod, set server/database/schema inside that block to override.
+# prod.post_sql runs on the prod connection after the staging load succeeds, to
+# promote the just-loaded staging data into prod. Each step gets its own ETLHealth row.
+destinations:
+  - name: des1
+    enabled: true
+    server: MISCPrdAdhocDB
+    database: PRIME
+    schema: 'DM_MONTYNT\dli2'
+    staging:
+      table: requisition_line_stg
+    prod:
+      table: REQUISITION_LINE
+      post_sql:
+        - EXEC [DM_MONTYNT\dli2].[UpdateRequisitionLine]
+
+  # Disabled placeholder for the infor-side landing the other loaders have.
+  # Enable only after creating the objects (requisition_line_stg /
+  # REQUISITION_LINE / sp_UpdateRequisitionLine) on that schema.
+  - name: des2
+    enabled: true
+    server: YNBBSTVWP02\PROCDATASRVPROD
+    database: PLMPreprocessorShared
+    schema: infor
+    staging:
+      table: requisition_line_stg
+    prod:
+      table: REQUISITION_LINE
+      post_sql:
+        - EXEC [infor].[sp_UpdateRequisitionLine]
+
+health_table:
+  server: 'YNBBSTVWP02\PROCDATASRVPROD'
+  database: SCSFileIngestor
+  schema: InforLoader
+  table: ETLHealth
+
+logging:
+  # <loader name> is substituted with this loader's name (requisition_line).
+  log_root: '\\montefiore.org\centralfiles\data\Procurement PMO\dli2\DailyLoader\<loader name>\logs'
+  level: INFO
+  console: true          # echo run logs to the console (stderr) for Task Scheduler output
+  capture_streams: true  # capture stdout/stderr (prints, warnings, tracebacks) into the log file
+
+# After a successful load the source file is copied here with a _YYYYMMDD stamp
+# appended (original extension kept), e.g. ReqLine_20260714.csv. <loader name>
+# is substituted with this loader's name. Set enabled: false to skip.
+archive:
+  path: '\\montefiore.org\centralfiles\data\Procurement PMO\dli2\DailyLoader\<loader name>\archived'
+
+stg_load:
+  strategy: truncate_insert   # how the staging table is loaded from the source file
+  batch_size: 50000
+
+# How the prod table is promoted from the just-loaded staging table.
+# Allowed: truncate_insert | pk_merge | pk_delete_insert | pk_delete_insert_on_header
+#          | versioned_delete_insert | filter_active
+# pk_delete_insert_on_header: DELETE prod rows matching staging on the HEADER-level
+#   key (Company, Requisition) -- a prefix of the PK (Company, Requisition,
+#   RequisitionLine) -- then INSERT all staging rows. Whole requisitions' line sets
+#   are replaced, so lines deleted at the source disappear from prod too;
+#   requisitions absent from the file are left in place.
+# VERIFIED against the proc (read 2026-07-14): UpdateRequisitionLine deletes prod
+# joining staging on company+requisition, then runs
+#   INSERT INTO REQUISITION_LINE SELECT * FROM requisition_line_stg
+# The insert is POSITIONAL (SELECT *): staging and prod column order were verified
+# identical, and the mapping below is kept in that same table order -- do not
+# reorder it without also altering both tables and the proc.
+# DECLARATIVE ONLY for now: the real promotion runs via each destination's
+# prod.post_sql (EXEC ...UpdateRequisitionLine). This records intent and is
+# validated at load time, but is not yet dispatched by the loader; header_key is
+# the spec a later template-based query generator will fill in.
+prd_load:
+  strategy: pk_delete_insert_on_header
+  header_key: [Company, Requisition]
+
+# Delta-overlap guard: skip. The ReqLine export is a full point-in-time snapshot,
+# not a delta window: the 2026-07-14 file carried every requisition line back to
+# the Nov 2023 go-live (70,766 rows, all statuses, lines with and without POs),
+# so there is no gap between runs to guard against (source MIN would trivially be
+# <= DB MAX). The file DOES ship 'Requisition.update stamp' (not landed) -- if the
+# export is ever narrowed to a window keyed on it, land that column and switch
+# this to mode: enforce on it.
+validation:
+  overlap_check:
+    mode: skip
+    source_column: null
+    db_column: null
+    baseline: prod                  # which already-in-DB table to read MAX from: prod | staging
+    skip_if_db_empty: true          # first-ever load has nothing to overlap -> skip instead of fail
+
+use_db_column_order: false
+
+# Normalizes ContractLine.BaseCostUOM: the export ships '<base cost> <UOM>'
+# (e.g. '9.6700 BX'), the transform keeps only the last space-separated token
+# ('BX') so it fits the varchar(5) destination; null -> ''.
+# Registered in infor_loader/transforms.py.
+transforms:
+  - requisition_line_basecost_uom
+
+field_config:
+  # strptime format for `date`-typed source columns, e.g. 01/23/2024.
+  date_format: '%m/%d/%Y'
+  # strptime format for `datetime`-typed source columns, e.g. 01/23/2024 03:32:03 PM.
+  # Set explicitly so pandas parses fast and unambiguously instead of guessing per row.
+  datetime_format: '%m/%d/%Y %I:%M:%S %p'
+
+  # PK check runs after mapping/data conversion, so these are destination column
+  # names (matches PK_ReqLine on the destination table). The export is one row per
+  # requisition line, so a failure here means the export shipped a duplicate line.
+  pk_check: [Company, Requisition, RequisitionLine]
+
+  # Loaded columns, ordered like the destination table. Row format:
+  #   [source_or_computed, destination, type_to_convert_to_in_python, destination_datatype, origin]
+  # origin: source   = a required column read from the source file (hard-fail if missing)
+  #         computed = produced by a transform/loader, not present in the file
+  # type: string | date | datetime | float | int
+  # KEEP THIS IN TABLE ORDER: the promotion proc's INSERT ... SELECT * is
+  # positional (see prd_load note above).
+  mapping:
+    - [Company, Company, string, varchar(10), source]
+    - [Requisition, Requisition, string, varchar(20), source]
+    - [RequisitionLine, RequisitionLine, string, varchar(10), source]
+    - [Requisition.RequisitionApprovalType, RequisitionApprovalType, string, varchar(50), source]
+    # Ships with thousands separators (e.g. "75,000.00"); the float conversion strips them.
+    - [ApprovalValue, ApprovalValue, float, money, source]
+    - [Approved, Approved, string, varchar(5), source]
+    # Ships with a time component (e.g. 01/23/2024 03:32:03 PM), so it must parse
+    # as datetime (a strict date parse would coerce every value to the 1900-01-01
+    # fallback). The destination column is date, so the loader truncates the time
+    # after parsing (the fast_executemany insert cannot rely on SQL Server to
+    # truncate: the ODBC driver rejects a non-midnight timestamp -> date cast
+    # with a 22008 datetime field overflow).
+    - [ApprovedRejectedDate, ApprovedRejectedDate, datetime, date, source]
+    - [ApprovingRejectingOperatorID, ApprovingRejectingOperatorID, string, varchar(20), source]
+    - [RequisitionSource, RequisitionSource, string, varchar(40), source]
+    - [POCode, POCode, string, varchar(10), source]
+    - [last PurchaseOrderLineSourcesRel.PurchaseOrder, PO, string, varchar(20), source]
+    - [last PurchaseOrderLineSourcesRel.PurchaseOrderLine, PurchaseOrderLine, string, varchar(5), source]
+    - [last PurchaseOrderLineSourcesRel.PurchaseOrderLine.PurchaseOrder.PurchaseOrderDate, PODate, date, date, source]
+    - [RequestingLocation, RequestingLocation, string, varchar(40), source]
+    - [DerivedFromLocation, DerivedFromLocation, string, varchar(150), source]
+    - [Requisition.RequestingLocation.Active, RequestingLocation.Active, string, varchar(5), source]
+    - [Requisition.DerivedFinanceDimension1, Requisition.FD1, string, varchar(150), source]
+    - [Requisition.DerivedFinanceDimension3, Requisition.FD3, string, varchar(150), source]
+    - [Requisition.DerivedFinanceDimension5, Requisition.FD5, string, varchar(150), source]
+    - [Requisition.Requester, Requester, string, varchar(20), source]
+    - [Requisition.DerivedRequesterName, RequesterName, string, varchar(100), source]
+    - [Requisition.DerivedApproverDisplay, DerivedApproverDisplay, string, varchar(100), source]
+    - [ItemType, ItemType, string, varchar(20), source]
+    - [Item, Item, string, varchar(100), source]
+    - [VendorItem, VendorItem, string, varchar(100), source]
+    - [Description, Description, string, varchar(255), source]
+    - [VendorItemExists, VendorItemExists, string, varchar(5), source]
+    - [Vendor, Vendor, string, varchar(40), source]
+    - [Vendor.VendorName, VendorName, string, varchar(255), source]
+    - [BaseUOM, BaseUOM, string, varchar(10), source]
+    - [DisplayQuantity, DisplayQuantity, float, "numeric(19, 4)", source]
+    - [DisplayEnteredUOM, DisplayEnteredUOM, string, varchar(10), source]
+    - [DerivedTotalStockQuantity, DerivedTotalStockQuantity, float, "numeric(19, 4)", source]
+    - [KilledQuantityInStockUOM, KilledQuantityInStockUOM, float, "numeric(19, 4)", source]
+    - [DerivedVoidedQuantity, DerivedVoidedQuantity, float, "numeric(19, 4)", source]
+    - [AcceptedQuantity, AcceptedQuantity, float, "numeric(19, 4)", source]
+    - [UnitCost, UnitCost, float, "numeric(19, 4)", source]
+    - [TransactionUnitCost, TransactionUnitCost, float, "numeric(19, 4)", source]
+    - [LandedUnitCost, LandedUnitCost, float, "numeric(19, 4)", source]
+    - [OverrideCost, OverrideCost, string, varchar(5), source]
+    - [IsUnreleasedStatus, IsUnreleasedStatus, string, varchar(5), source]
+    - [Status, Status, string, varchar(20), source]
+    - [DerivedStatusMessage, DerivedStatusMessage, string, varchar(50), source]
+    - [Requisition.DerivedStatusMessage, Requisition.DerivedStatusMessage, string, varchar(50), source]
+    - [CostCode, CostCode, string, varchar(40), source]
+    - [Contract, Contract, string, varchar(10), source]
+    - [Contract.WorkingContractID, WorkingContractID, string, varchar(100), source]
+    - [ContractLine, ContractLine, string, varchar(20), source]
+    - [ContractLine.BaseCost, ContractLine.BaseCost, float, "numeric(19, 4)", source]
+    # Reshaped by the requisition_line_basecost_uom transform ('9.6700 BX' -> 'BX').
+    - [ContractLine.BaseCostUOM, ContractLine.BaseCostUOM, string, varchar(5), source]
+    - [ItemFoundForSpecial, ItemFoundForSpecial, string, varchar(5), source]
+    - [create stamp, create stamp, datetime, datetime, source]
+    - [update stamp, update stamp, datetime, datetime, source]
+
+  # Present in the source file but not integrated into the pipeline yet. Optional:
+  # a missing one only warns, since it cannot affect the output.
+  extra:
+    - ManufacturerNumber
+    - Requisition.update stamp   # requisition header's stamp; not in the destination table
+    - PurchaseOrderLineSourcesRel.PurchaseOrder.update stamp   # sourced PO's stamp; not in the destination table
