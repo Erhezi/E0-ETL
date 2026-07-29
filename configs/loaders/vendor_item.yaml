@@ -1,0 +1,177 @@
+name: vendor_item
+enabled: true
+# 'daily' opts this loader into the scheduled workday run; 'mdm' additionally
+# lets it be rerun on demand (--tag mdm) after a fresh Infor export lands in the
+# misc mdm folder.
+tags: [daily, mdm, VendorItem]
+
+process:
+  name: MDM Vendor Item
+  frequency: Workdays
+
+source:
+  multiple_input_files: false
+  files:
+    - alias: main
+      input: vendor_item   # path + filename: see configs\file_folder_loader_config.yaml
+      reader: csv
+      options:
+        dtype: str
+
+# DIRECT LOAD: master data has no staging table. A destination with only
+# `table:` (no staging/prod split) truncate+inserts the final table in place
+# using stg_load.strategy, and has no promotion step / prod post_sql. Each
+# destination's single ETLHealth row is typed PRD (the loaded table IS the
+# production table) with STGTableName 'Not Applicable'. This replaces the manual
+# notebook flow (INFOR table update.ipynb "Vendor Item"): read VendorItems.csv
+# -> truncate [DM_MONTYNT\dli2].MDM_VENDORITEM -> positional insert.
+destinations:
+  - name: des1
+    enabled: true
+    server: MISCPrdAdhocDB
+    database: PRIME
+    schema: 'DM_MONTYNT\dli2'
+    table: MDM_VENDORITEM
+
+  # Same direct load into the infor-side copy the transactional loaders land in.
+  # [infor].MDM_VENDORITEM VERIFIED to exist there with the identical 29 columns
+  # (table-info on 2026-07-21).
+  - name: des2
+    enabled: true
+    server: YNBBSTVWP02\PROCDATASRVPROD
+    database: PLMPreprocessorShared
+    schema: infor
+    table: MDM_VENDORITEM
+
+health_table:
+  server: 'YNBBSTVWP02\PROCDATASRVPROD'
+  database: SCSFileIngestor
+  schema: InforLoader
+  table: ETLHealth
+
+logging:
+  # <loader name> is substituted with this loader's name (mdm_vendor_item).
+  log_root: '\\montefiore.org\centralfiles\data\Procurement PMO\dli2\DailyLoader\<loader name>\logs'
+  level: INFO
+  console: true          # echo run logs to the console (stderr) for Task Scheduler output
+  capture_streams: true  # capture stdout/stderr (prints, warnings, tracebacks) into the log file
+
+# After a successful load the source file is copied here with a _YYYYMMDD stamp
+# appended (original extension kept), e.g. VendorItems_20260720.csv. <loader
+# name> is substituted with this loader's name. Set enabled: false to skip.
+archive:
+  path: '\\montefiore.org\centralfiles\data\Procurement PMO\dli2\DailyLoader\<loader name>\archived'
+
+# direct_load: the final table is loaded in place (no staging step). Column
+# validation and pk_check run first, then TRUNCATE, then the batched insert --
+# a hard failure (e.g. missing column, duplicate PK keys) aborts before the
+# table is touched. `direct_load` is the direct-loader spelling of stg_load
+# (same strategy/batch_size fields); the CLI rejects it on a loader whose
+# destinations have a staging/prod split.
+direct_load:
+  strategy: truncate_insert
+  batch_size: 50000
+
+# No prd_load block: a direct loader has no staging->prod promotion. (--stg-only
+# still loads the table; --prd-only has nothing to do and only warns.)
+
+# Delta-overlap guard: skip. The export is a full point-in-time snapshot of all
+# vendor items (22,746 rows in the 2026-07-20 sample), not a delta window, so
+# there is no gap between runs to guard against.
+validation:
+  overlap_check:
+    mode: skip
+    source_column: null
+    db_column: null
+    baseline: prod                  # which already-in-DB table to read MAX from: prod | staging
+    skip_if_db_empty: true          # first-ever load has nothing to overlap -> skip instead of fail
+
+# Registered in infor_loader/transforms.py. Stamps LastUpdate with today's date
+# (-> LastUpdateDate, the load-date marker). The two UOM factors are handled by
+# the standard float conversion: thousands separators stripped, blanks kept as
+# NULL (the notebook's forcing of blanks to 0.0 is retired -- see
+# general_rules.md); string blanks are filled with '' by normalize_for_db.
+transforms:
+  - vendor_item
+
+# SPECIAL CASE -- do NOT whitespace-trim the PK columns for this loader.
+# Both destination tables have a real primary key (PK_VendorItem on Item,
+# Vendor, VendorItem; discovered when the 2026-07-21/22 runs died with 2627
+# duplicate-key errors). The export ships 19 vendor items twice: a clean row
+# plus a leading-space VendorItem variant (' SQU411102CSZ' vs 'SQU411102CSZ',
+# usually a stale Active=No record). SQL Server ignores TRAILING spaces in
+# varchar key comparisons but treats a LEADING space as a distinct key, so the
+# untrimmed pairs coexist under the PK -- which is why the manual notebook
+# loads (raw positional insert, no trim) always succeeded. The pipeline's
+# default trim collapsed each pair into a genuine duplicate and the insert
+# failed AFTER the truncate, leaving the table empty. Per decision 2026-07-22:
+# load the whitespace variants exactly as shipped, matching the notebook.
+# These are source column names, applied in normalize_for_db (values are still
+# ''-filled when blank, just not trimmed).
+preserve_whitespace_columns: [Item, Vendor, VendorItem]
+
+# With whitespace preserved the 19 padded variants stay distinct keys (in
+# pandas and in SQL Server), so the pre-load pk_check passes. An exact
+# duplicate key would be a new kind of export defect that PK_VendorItem would
+# reject mid-insert AFTER the truncate -- so fail fast here instead, before
+# the table is touched.
+fail_on_pk_duplicates: true
+
+field_config:
+  # No date-typed source columns ship in this export (LastUpdate is computed by
+  # the transform, already ISO-formatted), so no date_format is needed.
+  # strptime format for `datetime`-typed source columns, e.g. 09/29/2023 01:49:02 PM.
+  # Set explicitly so pandas parses fast and unambiguously instead of guessing per row.
+  datetime_format: '%m/%d/%Y %I:%M:%S %p'
+
+  # PK check runs after mapping/data conversion, so these are destination column
+  # names (matches PK_VendorItem on both destination tables). The export's 19
+  # leading-space VendorItem variants stay distinct keys here because
+  # preserve_whitespace_columns (see above) skips trimming them.
+  pk_check: [Item, Vendor, VendorItem]
+
+  # Loaded columns, ordered like the destination table. Row format:
+  #   [source_or_computed, destination, type_to_convert_to_in_python, destination_datatype, origin]
+  # origin: source   = a required column read from the source file (hard-fail if missing)
+  #         computed = produced by a transform/loader, not present in the file
+  # type: string | date | datetime | float | int
+  # Destination names/types VERIFIED against PRIME.[DM_MONTYNT\dli2].MDM_VENDORITEM
+  # via table-info on 2026-07-20; the insert is by column name, so order is
+  # cosmetic here (kept in table order for readability).
+  mapping:
+    - [Item, Item, string, varchar(20), source]
+    - [VendorItemDescription, ItemDescription, string, varchar(255), source]
+    - [Vendor, Vendor, string, varchar(20), source]
+    - [Vendor.VendorName, VendorName, string, varchar(100), source]
+    - [VendorItem, VendorItem, string, varchar(100), source]
+    - [Manufacturer, Manufacturer, string, varchar(10), source]
+    - [ManufacturerNumber, ManufacturerNumber, string, varchar(100), source]
+    - [VendorBuyUOM, VendorBuyUOM, string, varchar(10), source]
+    # Ships with thousands separators (e.g. "1,000.0000000"); the standard float
+    # conversion strips them, and blanks land as NULL (both destinations'
+    # numeric columns are nullable -- verified 2026-07-21).
+    - [VendorBuyUOM.UOMConversion, VendorBuyUOM.UOMConversion, float, "numeric(10, 4)", source]
+    - [Item.DefaultBuyUOM, DefaultBuyUOM, string, varchar(10), source]
+    - [Item.DefaultBuyUOMMultiplier, DefaultBuyUOMMultiplier, float, "numeric(10, 4)", source]
+    - [Item.UNSPSCCode, UNSPSCCode, string, varchar(20), source]
+    - [Item.UNSPSCCode.ItemGroup.Description, UNSPSCCodeDescription, string, varchar(255), source]
+    - [Item.CommodityCode, CommodityCode, string, varchar(20), source]
+    - [Item.MMAHSCCDescription, CommodityCodeDescription, string, varchar(255), source]
+    - [Item.MajorPurchasingClass, MajorPurchasingClass, string, varchar(10), source]
+    - [Item.MajorPurchasingClass.MajorClassDescription, MajorPurchasingClassDescription, string, varchar(255), source]
+    - [Item.MinorPurchasingClass, MinorPurchasingClass, string, varchar(10), source]
+    - [Item.MinorPurchasingClass.Description, MinorPurchasingClassDescription, string, varchar(255), source]
+    - [UseAsDefault, UseAsDefault, string, varchar(10), source]
+    - [Active, Active, string, varchar(10), source]
+    - [Item.MajorPPEClass, MajorPPEClass, string, varchar(20), source]
+    - [Item.MajorInventoryClass, MajorInventoryClass, string, varchar(20), source]
+    - [Item.OnContractDisplay, OnContractDisplay, string, varchar(20), source]
+    - [first ContractLineVenItemRel.Contract, ContractRef1, string, varchar(10), source]
+    - [last ContractLineVenItemRel.Contract, ContractRef2, string, varchar(10), source]
+    - [create stamp, create stamp, datetime, datetime, source]
+    - [update stamp, update stamp, datetime, datetime, source]
+    # Load-date marker produced by the vendor_item transform (today's date as
+    # 'YYYY-MM-DD'); tells consumers when this snapshot was last reloaded.
+    - [LastUpdate, LastUpdateDate, date, date, computed]
+
+  # Every source column is loaded; nothing extra ships in this export.

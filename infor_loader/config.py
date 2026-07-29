@@ -160,10 +160,18 @@ class LoadDestination:
             enabled=bool(data.get("enabled", True)),
         )
 
+    @property
+    def is_direct(self) -> bool:
+        """No prod table configured: the single configured table IS the final
+        (production) table, loaded directly with the staging strategy (typically
+        truncate_insert) and no promotion step. Used by master-data (mdm)
+        loaders that have no staging table."""
+        return self.prod is None
+
     def display_name(self, include_server: bool = False) -> str:
         staging_name = self.staging.display_name(include_server=include_server)
         if self.prod is None:
-            return f"{self.name}: staging={staging_name}"
+            return f"{self.name}: direct={staging_name}"
         prod_name = self.prod.display_name(include_server=include_server)
         return f"{self.name}: staging={staging_name}, prod={prod_name}"
 
@@ -188,6 +196,11 @@ class SourceFile:
     reader: str = "csv"
     options: dict[str, Any] = field(default_factory=dict)
     pick_latest: bool = False
+    # The file-folder registry key this file was expanded from (`input: <key>` in
+    # the loader YAML), or None for a file given by explicit path/name. Lets the
+    # run path look this file's download rule back up in the registry to gate the
+    # loader on a fresh download. Just a string -- no coupling to file_folder.
+    input_key: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "SourceFile":
@@ -198,6 +211,7 @@ class SourceFile:
             reader=data.get("reader", "csv"),
             options=dict(data.get("options", {})),
             pick_latest=bool(data.get("pick_latest", False)),
+            input_key=data.get("input_key"),
         )
 
     def resolve(self) -> Path:
@@ -291,6 +305,12 @@ class LoaderConfig:
     use_db_column_order: bool = True
     allow_missing_destination_columns: bool = False
     fail_on_pk_duplicates: bool = True
+    # Source column names normalize_for_db must NOT whitespace-trim before the
+    # insert. For destinations whose primary key relies on significant LEADING
+    # whitespace (SQL Server ignores trailing spaces in varchar key comparisons
+    # but a leading space is a distinct key), trimming would collapse such rows
+    # into duplicate keys. See mdm_vendor_item.
+    preserve_whitespace_columns: list[str] = field(default_factory=list)
     overlap_check: OverlapCheck | None = None
     enabled: bool = True
     tags: list[str] = field(default_factory=list)
@@ -348,6 +368,7 @@ class LoaderConfig:
             use_db_column_order=bool(data.get("use_db_column_order", True)),
             allow_missing_destination_columns=bool(data.get("allow_missing_destination_columns", False)),
             fail_on_pk_duplicates=bool(data.get("fail_on_pk_duplicates", True)),
+            preserve_whitespace_columns=[str(column) for column in (data.get("preserve_whitespace_columns") or [])],
             overlap_check=overlap_check,
             enabled=bool(data.get("enabled", True)),
             tags=list(data.get("tags", [])),

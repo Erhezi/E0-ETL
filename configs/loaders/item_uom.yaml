@@ -1,0 +1,132 @@
+name: item_uom
+enabled: true
+# 'daily' opts this loader into the scheduled workday run; 'mdm' additionally
+# lets it be rerun on demand (--tag mdm) after a fresh Infor export lands in
+# the misc mdm folder (ItemUOM.csv refreshes alongside the other mdm exports).
+tags: [daily, mdm, ItemUOM]
+
+process:
+  name: MDM Item UOM
+  frequency: Workdays
+
+source:
+  multiple_input_files: false
+  files:
+    - alias: main
+      input: item_uom   # path + filename: see configs\file_folder_loader_config.yaml
+      reader: csv
+      options:
+        dtype: str
+
+# DIRECT LOAD: master data has no staging table -- each destination's single
+# table is truncate+inserted in place (see mdm_vendor_item.yaml for the full
+# pattern description). Replaces the manual notebook flow (INFOR table
+# update.ipynb "Item UOM"): read ItemUOM.csv -> truncate MDM_ITEMUOM ->
+# positional insert.
+destinations:
+  - name: des1
+    enabled: true
+    server: MISCPrdAdhocDB
+    database: PRIME
+    schema: 'DM_MONTYNT\dli2'
+    table: MDM_ITEMUOM
+
+  # infor-side copy. VERIFIED to exist with the identical 18 columns and the
+  # same PK_ItemUOM (sys.columns/sys.indexes on 2026-07-23).
+  - name: des2
+    enabled: true
+    server: YNBBSTVWP02\PROCDATASRVPROD
+    database: PLMPreprocessorShared
+    schema: infor
+    table: MDM_ITEMUOM
+
+health_table:
+  server: 'YNBBSTVWP02\PROCDATASRVPROD'
+  database: SCSFileIngestor
+  schema: InforLoader
+  table: ETLHealth
+
+logging:
+  # <loader name> is substituted with this loader's name (item_uom).
+  log_root: '\\montefiore.org\centralfiles\data\Procurement PMO\dli2\DailyLoader\<loader name>\logs'
+  level: INFO
+  console: true          # echo run logs to the console (stderr) for Task Scheduler output
+  capture_streams: true  # capture stdout/stderr (prints, warnings, tracebacks) into the log file
+
+# After a successful load the source file is copied here with a _YYYYMMDD stamp
+# appended (original extension kept), e.g. ItemUOM_20260723.csv. <loader name>
+# is substituted with this loader's name. Set enabled: false to skip.
+archive:
+  path: '\\montefiore.org\centralfiles\data\Procurement PMO\dli2\DailyLoader\<loader name>\archived'
+
+# direct_load: the final table is loaded in place (no staging step). Column
+# validation and pk_check run first, then TRUNCATE, then the batched insert --
+# a hard failure aborts before the table is touched.
+direct_load:
+  strategy: truncate_insert
+  batch_size: 50000
+
+# Delta-overlap guard: skip. The export is a full point-in-time snapshot of all
+# item/UOM combinations (25,133 rows in the 2026-07-23 sample), not a delta
+# window, so there is no gap between runs to guard against.
+validation:
+  overlap_check:
+    mode: skip
+    source_column: null
+    db_column: null
+    baseline: prod                  # which already-in-DB table to read MAX from: prod | staging
+    skip_if_db_empty: true          # first-ever load has nothing to overlap -> skip instead of fail
+
+# No transforms: nothing is computed. Float/datetime typing comes from the
+# mapping, string blanks are filled by normalize_for_db, numeric blanks stay
+# NULL (general_rules.md).
+
+# Both destination tables have PK_ItemUOM on (Item, UOM) and the export is one
+# row per (Item, UnitOfMeasure) (0 duplicate keys, no whitespace padding in the
+# 2026-07-23 sample). A duplicate would be an export defect -- fail here,
+# BEFORE the truncate+insert touches the table.
+fail_on_pk_duplicates: true
+
+field_config:
+  # strptime format for `datetime`-typed source columns, e.g. 07/14/2023 07:17:20 PM.
+  # Set explicitly so pandas parses fast and unambiguously instead of guessing per row.
+  datetime_format: '%m/%d/%Y %I:%M:%S %p'
+
+  # PK check runs after mapping/data conversion, so these are destination column
+  # names (matches PK_ItemUOM on both destination tables).
+  pk_check: [Item, UOM]
+
+  # Loaded columns, ordered like the destination table. Row format:
+  #   [source_or_computed, destination, type_to_convert_to_in_python, destination_datatype, origin]
+  # origin: source   = a required column read from the source file (hard-fail if missing)
+  #         computed = produced by a transform/loader, not present in the file
+  # type: string | date | datetime | float | int
+  # Destination names/types VERIFIED against PRIME.[DM_MONTYNT\dli2].MDM_ITEMUOM
+  # and PLMPreprocessorShared.[infor].MDM_ITEMUOM on 2026-07-23. Every source
+  # column is loaded; note the four renames (UnitOfMeasure -> UOM etc.), which
+  # the manual notebook loads handled positionally.
+  mapping:
+    - [Item, Item, string, varchar(20), source]
+    - [ItemGroup, ItemGroup, string, varchar(5), source]
+    - [UnitOfMeasure, UOM, string, varchar(10), source]
+    - [TrackedIn, TrackedIn, string, varchar(5), source]
+    # Ships with thousands separators (e.g. "1,000.0000000"); the standard
+    # float conversion strips them. NOT NULL in both destinations, so a blank
+    # (none in the 2026-07-23 sample) would fail the insert loudly -- that is
+    # intentional, see general_rules.md.
+    - [UOMConversion, UOMConversion, float, "numeric(10, 4)", source]
+    - [ValidForBuying, ValidForBuying, string, varchar(20), source]
+    - [ValidForInventoryTransactions, ValidForInventoryTransaction, string, varchar(20), source]
+    - [ValidForSellPrice, ValidForSellPrice, string, varchar(20), source]
+    - [ValidForSelling, ValidForSelling, string, varchar(20), source]
+    - [PackingWeight, PackingWeight, float, "numeric(18, 4)", source]
+    - [PackingVolume, PackingVolume, float, "numeric(18, 4)", source]
+    - [Item.Active, Item.Active, string, varchar(5), source]
+    - [Item.DerivedItemDescription, ItemDescription, string, varchar(255), source]
+    - [Item.OnContractDisplay, Item.OnContract, string, varchar(20), source]
+    - [Item.UNSPSCCode, Item.UNSPSCCode, string, varchar(20), source]
+    - [Item.IssueAccount, Item.IssueAccount, string, varchar(10), source]
+    - [create stamp, create stamp, datetime, datetime, source]
+    - [update stamp, update stamp, datetime, datetime, source]
+
+  # Every source column is loaded; nothing extra ships in this export.

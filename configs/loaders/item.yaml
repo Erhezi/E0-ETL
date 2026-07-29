@@ -1,0 +1,160 @@
+name: item
+enabled: true
+# 'daily' opts this loader into the scheduled workday run; 'mdm' additionally
+# lets it be rerun on demand (--tag mdm) after a fresh Infor export lands in
+# the misc mdm folder (Item.csv refreshes alongside the other mdm exports).
+tags: [daily, mdm, Item]
+
+process:
+  name: MDM Item
+  frequency: Workdays
+
+source:
+  multiple_input_files: false
+  files:
+    - alias: main
+      input: item   # path + filename: see configs\file_folder_loader_config.yaml
+      reader: csv
+      options:
+        dtype: str
+
+# DIRECT LOAD: master data has no staging table -- each destination's single
+# table is truncate+inserted in place (see mdm_vendor_item.yaml for the full
+# pattern description). Replaces the manual notebook flow (INFOR table
+# update.ipynb "Item"): read Item.csv -> truncate MDM_ITEM -> positional insert.
+destinations:
+  - name: des1
+    enabled: true
+    server: MISCPrdAdhocDB
+    database: PRIME
+    schema: 'DM_MONTYNT\dli2'
+    table: MDM_ITEM
+
+  # infor-side copy. VERIFIED to exist with the identical 35 columns and the
+  # same PK_item (sys.columns/sys.indexes on 2026-07-23).
+  - name: des2
+    enabled: true
+    server: YNBBSTVWP02\PROCDATASRVPROD
+    database: PLMPreprocessorShared
+    schema: infor
+    table: MDM_ITEM
+
+health_table:
+  server: 'YNBBSTVWP02\PROCDATASRVPROD'
+  database: SCSFileIngestor
+  schema: InforLoader
+  table: ETLHealth
+
+logging:
+  # <loader name> is substituted with this loader's name (item).
+  log_root: '\\montefiore.org\centralfiles\data\Procurement PMO\dli2\DailyLoader\<loader name>\logs'
+  level: INFO
+  console: true          # echo run logs to the console (stderr) for Task Scheduler output
+  capture_streams: true  # capture stdout/stderr (prints, warnings, tracebacks) into the log file
+
+# After a successful load the source file is copied here with a _YYYYMMDD stamp
+# appended (original extension kept), e.g. Item_20260723.csv. <loader name> is
+# substituted with this loader's name. Set enabled: false to skip.
+archive:
+  path: '\\montefiore.org\centralfiles\data\Procurement PMO\dli2\DailyLoader\<loader name>\archived'
+
+# direct_load: the final table is loaded in place (no staging step). Column
+# validation and pk_check run first, then TRUNCATE, then the batched insert --
+# a hard failure aborts before the table is touched.
+direct_load:
+  strategy: truncate_insert
+  batch_size: 50000
+
+# Delta-overlap guard: skip. The export is a full point-in-time snapshot of the
+# item master (13,212 rows in the 2026-07-23 sample), not a delta window, so
+# there is no gap between runs to guard against.
+validation:
+  overlap_check:
+    mode: skip
+    source_column: null
+    db_column: null
+    baseline: prod                  # which already-in-DB table to read MAX from: prod | staging
+    skip_if_db_empty: true          # first-ever load has nothing to overlap -> skip instead of fail
+
+# Registered in infor_loader/transforms.py. Stamps ReportDate with today's date
+# (the load-date marker); column selection, int typing, and blank-filling are
+# handled by the mapping below.
+transforms:
+  - item
+
+# Both destination tables have PK_item on (Item) and the export is one row per
+# Item (0 duplicate keys, no whitespace padding in the 2026-07-23 sample). A
+# duplicate would be an export defect -- fail here, BEFORE the truncate+insert
+# touches the table.
+fail_on_pk_duplicates: true
+
+field_config:
+  # No date/datetime-typed source columns ship in this export (ReportDate is
+  # computed by the transform, already ISO-formatted), so no formats are needed.
+
+  # PK check runs after mapping/data conversion, so these are destination column
+  # names (matches PK_item on both destination tables).
+  pk_check: [Item]
+
+  # Loaded columns, ordered like the destination table. Row format:
+  #   [source_or_computed, destination, type_to_convert_to_in_python, destination_datatype, origin]
+  # origin: source   = a required column read from the source file (hard-fail if missing)
+  #         computed = produced by a transform/loader, not present in the file
+  # type: string | date | datetime | float | int
+  # Destination names/types VERIFIED against PRIME.[DM_MONTYNT\dli2].MDM_ITEM
+  # and PLMPreprocessorShared.[infor].MDM_ITEM on 2026-07-23.
+  mapping:
+    - [Item, Item, string, varchar(10), source]
+    - [Active, Active, string, varchar(5), source]
+    - [ConsignCode, ConsignCode, string, varchar(20), source]
+    - [Consignment, Consignment, string, varchar(5), source]
+    - [CriticalItem, CriticalItem, string, varchar(5), source]
+    - [DefaultBuyUOM, DefaultBuyUOM, string, varchar(10), source]
+    # Ships as e.g. "1.0000000"; the standard int conversion (int(float(x)))
+    # lands it as int, blanks as NULL (none in the 2026-07-23 sample).
+    - [DefaultBuyUOMMultiplier, DefaultBuyUOMMultiplier, int, int, source]
+    - [DefaultInventoryTransactionUOM, DefaultInventoryTransactionUOM, string, varchar(10), source]
+    - [DefaultInventoryTransactionUOMMultiplier, DefaultInventoryTransactionUOMMultiplier, int, int, source]
+    - [StockUOM, StockUOM, string, varchar(10), source]
+    - [Description, Description, string, varchar(500), source]
+    - [Description3, Description3, string, varchar(1000), source]
+    - [Discontinued, Discontinued, string, varchar(5), source]
+    - [GenericName, GenericName, string, varchar(500), source]
+    - [Implantable, Implantable, string, varchar(5), source]
+    - [Reusable, Reusable, string, varchar(5), source]
+    - [Sterile, Sterile, string, varchar(5), source]
+    - [GTINForStockUOM, GTINForStockUOM, string, varchar(20), source]
+    - [ItemGTINsRel.Active, ItemGTINsRel.Active, string, varchar(5), source]
+    - [HCPCSCode, HCPCSCode, string, varchar(80), source]
+    - [ItemDescriptionAbbreviation, ItemDescriptionAbbreviation, string, varchar(20), source]
+    - [CommodityCode, CommodityCode, string, varchar(40), source]
+    - [CommodityCode.CcDescription, CommodityCode.CcDescription, string, varchar(500), source]
+    - [MMAHSPrimaryDI, MMAHSPrimaryDI, string, varchar(40), source]
+    - [MajorInventoryClass, MajorInventoryClass, string, varchar(40), source]
+    - [MajorPPEClass, MajorPPEClass, string, varchar(40), source]
+    - [MajorPurchasingClass, MajorPurchasingClass, string, varchar(40), source]
+    - [MajorPurchasingClass.Description, MajorPurchasingClass.Description, string, varchar(500), source]
+    - [MinorInventoryClass, MinorInventoryClass, string, varchar(40), source]
+    - [MinorPPEClass, MinorPPEClass, string, varchar(40), source]
+    - [MinorPurchasingClass, MinorPurchasingClass, string, varchar(40), source]
+    - [Manufacturer, Manufacturer, string, varchar(40), source]
+    - [ManufacturerDescription, ManufacturerDescription, string, varchar(500), source]
+    - [ManufacturerNumber, ManufacturerNumber, string, varchar(255), source]
+    # Load-date marker produced by the item transform (today's date as
+    # 'YYYY-MM-DD'); tells consumers when this snapshot was last reloaded.
+    - [ReportDate, ReportDate, date, date, computed]
+
+  # Present in the source file but not loaded (the manual notebook loads
+  # dropped these too). Optional: a missing one only warns, since it cannot
+  # affect the output.
+  extra:
+    - ItemGroup
+    - ActiveCardViewDisplay
+    - AddedDate
+    - ContextContract
+    - ContextManufacturer
+    - ContextManufacturerNumber
+    - CopiedFromItem
+    - CreatedBy
+    - MajorSalesClass
+    - MinorSalesClass

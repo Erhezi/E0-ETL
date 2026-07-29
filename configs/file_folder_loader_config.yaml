@@ -1,0 +1,270 @@
+# Central registry for every loader's INPUT files (the source side).
+#
+# Single source of truth for where each input file lives and how it arrives.
+# Two consumers resolve from it, so they cannot drift:
+#   * the loaders -- each `source.files` entry references an input by key
+#     (`input: poline`) instead of restating its path/name; and
+#   * `run_daily_loaders.py move-files` -- relocates each downloaded export to
+#     its input's folder + canonical name before the loaders run.
+# Filesystem only: nothing here reads file contents or touches a database.
+#
+# This file lives at the configs\ root (one level above the loader YAMLs in
+# configs\loaders\) and is NOT a loader config -- `list`/`run` find it by
+# looking in the configs directory and its parents (see infor_loader/cli.py).
+#
+#   python -B run_daily_loaders.py move-files --list       # show the download rules
+#   python -B run_daily_loaders.py move-files --dry-run     # preview, touches nothing
+#   python -B run_daily_loaders.py move-files               # dispatch every download
+#   python -B run_daily_loaders.py move-files --tag mdm     # just the mdm exports
+#   python -B run_daily_loaders.py move-files --check        # ...then verify every enabled
+#                                                            # loader's source files resolve
+
+# ---------------------------------------------------------------------------
+# Named locations. THE batch-change knob: relocate a folder here and every
+# loader + download rule that references it by name follows. Absolute paths
+# live ONLY in this block.
+# ---------------------------------------------------------------------------
+folders:
+  downloads:   'C:\Users\dli2\Downloads'
+  temp_export: 'C:\Users\dli2\OneDrive - Montefiore Medicine\Documents\INFOR_SC\temp export'
+  misc_mdm:    'C:\Users\dli2\OneDrive - Montefiore Medicine\Documents\INFOR_SC\misc mdm'
+
+# Fallbacks every input's `download` block inherits unless it overrides them.
+download_defaults:
+  from: downloads      # where the browser drops the exports
+  action: move         # Downloads is a chute, not a store -- the per-loader
+                       # `archive` step keeps the consumed-input history.
+  pick_latest: true    # newest match by mtime wins across re-download variants
+  required: false      # nothing in Downloads only warns; the file already in
+                       # the designated folder is still valid (guard: --check)
+  on_exists: replace   # a fresh download replaces the file already in place
+
+# ---------------------------------------------------------------------------
+# One entry per physical input file: which folder it lives in, its canonical
+# name, and -- for manual downloads -- the glob patterns to match. `patterns`
+# lists the exact download name plus the browser's 're-download (N)' variant;
+# whichever matches is renamed to `name`. Do NOT shorten a pair to a prefix
+# glob like 'Item*.csv' -- it would also swallow ItemGTIN/ItemUOM/ItemReplenish.
+#
+# The two groups below are ORGANIZATIONAL only (a human troubleshooting aid):
+# a direct-load problem -> go straight to the raw file; a staging->prod problem
+# -> check the _stg table first, then the raw file. No behavior hangs on it.
+# ---------------------------------------------------------------------------
+inputs:
+
+  # ==== transactional loaders (staging -> prod) : temp_export ==============
+  contract_line:
+    folder: temp_export
+    name: 'ContractLineSimple_full+-+Export+To+CSV.csv'
+    tags: [daily]
+    download:
+      patterns:
+        - 'ContractLineSimple_full+-+Export+To+CSV.csv'
+        - 'ContractLineSimple_full+-+Export+To+CSV (*).csv'
+
+  inventory_location:
+    folder: temp_export
+    name: 'Inventory_Location.csv'
+    tags: [daily]
+    download:
+      patterns:
+        - 'Inventory_Location.csv'
+        - 'Inventory_Location (*).csv'
+
+  inventory_transaction:
+    folder: temp_export
+    name: 'Inventory_Trx_and_Balance+-+Export+To+CS.csv'
+    tags: [daily]
+    download:
+      patterns:
+        - 'Inventory_Trx_and_Balance+-+Export+To+CS.csv'
+        - 'Inventory_Trx_and_Balance+-+Export+To+CS (*).csv'
+
+  payablesinvoice_distribution:
+    folder: temp_export
+    name: 'GL+distribution+-+Export+To+CSV.csv'
+    tags: [daily]
+    download:
+      patterns:
+        - 'GL+distribution+-+Export+To+CSV.csv'
+        - 'GL+distribution+-+Export+To+CSV (*).csv'
+
+  payablesinvoice_header:
+    folder: temp_export
+    name: 'AP_invoices_backbone_DL+-+Export+To+CSV.csv'
+    tags: [daily]
+    download:
+      patterns:
+        - 'AP_invoices_backbone_DL+-+Export+To+CSV.csv'
+        - 'AP_invoices_backbone_DL+-+Export+To+CSV (*).csv'
+
+  payablesinvoice_payment:
+    folder: temp_export
+    name: 'PRD_DataTeam_PayablesInvoicePayment_ZFCH.csv'
+    tags: [daily]
+    download:
+      patterns:
+        - 'PRD_DataTeam_PayablesInvoicePayment_ZFCH.csv'
+        - 'PRD_DataTeam_PayablesInvoicePayment_ZFCH (*).csv'
+
+  # purchaseorder_line reads four files: this main export plus company_map/fd3/fd5.
+  poline:
+    folder: temp_export
+    name: 'DataTeamPRD_POline_DL.csv'
+    tags: [daily]
+    download:
+      patterns:
+        - 'DataTeamPRD_POline_DL.csv'
+        - 'DataTeamPRD_POline_DL (*).csv'
+
+  purchaseorder_receipt_line:
+    folder: temp_export
+    name: 'PurchaseOrderReceiptLine_DL+-+Export+To.csv'
+    tags: [daily]
+    download:
+      patterns:
+        - 'PurchaseOrderReceiptLine_DL+-+Export+To.csv'
+        - 'PurchaseOrderReceiptLine_DL+-+Export+To (*).csv'
+
+  purchaseorder_revision_issue_method:
+    folder: temp_export
+    name: 'PRD_DataTeam_PurchaseOrder_RevisionRel.csv'
+    tags: [daily]
+    download:
+      patterns:
+        - 'PRD_DataTeam_PurchaseOrder_RevisionRel.csv'
+        - 'PRD_DataTeam_PurchaseOrder_RevisionRel (*).csv'
+
+  requisition_line:
+    folder: temp_export
+    name: 'ReqLine.csv'
+    tags: [daily]
+    download:
+      patterns:
+        - 'ReqLine.csv'
+        - 'ReqLine (*).csv'
+
+  # ---- purchaseorder_line mapping side files : misc_mdm -------------------
+  # company_map is a FIXTURE (maintained in place, no download) -- it still
+  # lives here so its folder is centralized with everything else.
+  company_map:
+    folder: misc_mdm
+    name: 'company_map.csv'
+
+  fd3:
+    folder: misc_mdm
+    name: 'FD3.csv'
+    tags: [daily]
+    download:
+      patterns:
+        - 'FD3.csv'
+        - 'FD3 (*).csv'
+
+  fd5:
+    folder: misc_mdm
+    name: 'FD5.csv'
+    tags: [daily]
+    download:
+      patterns:
+        - 'FD5.csv'
+        - 'FD5 (*).csv'
+
+  # ==== direct-load loaders (mdm, no staging) : misc_mdm ===================
+  edi_sub_uom:
+    folder: misc_mdm
+    name: 'EDI+sub.csv'
+    tags: [daily, mdm]
+    download:
+      patterns:
+        - 'EDI+sub.csv'
+        - 'EDI+sub (*).csv'
+
+  item:
+    folder: misc_mdm
+    name: 'Item.csv'
+    tags: [daily, mdm]
+    download:
+      patterns:
+        - 'Item.csv'
+        - 'Item (*).csv'
+
+  item_gtin:
+    folder: misc_mdm
+    name: 'ItemGTIN.csv'
+    tags: [daily, mdm]
+    download:
+      patterns:
+        - 'ItemGTIN.csv'
+        - 'ItemGTIN (*).csv'
+
+  item_replenish_from:
+    folder: misc_mdm
+    name: 'ItemReplenishFrom.csv'
+    tags: [daily, mdm]
+    download:
+      patterns:
+        - 'ItemReplenishFrom.csv'
+        - 'ItemReplenishFrom (*).csv'
+
+  item_uom:
+    folder: misc_mdm
+    name: 'ItemUOM.csv'
+    tags: [daily, mdm]
+    download:
+      patterns:
+        - 'ItemUOM.csv'
+        - 'ItemUOM (*).csv'
+
+  par_item_bin:
+    folder: misc_mdm
+    name: 'Par+Items+DL.csv'
+    tags: [daily, mdm]
+    download:
+      patterns:
+        - 'Par+Items+DL.csv'
+        - 'Par+Items+DL (*).csv'
+
+  manufacturer:
+    folder: misc_mdm
+    name: 'Manufacturers.csv'
+    tags: [daily, mdm]
+    download:
+      patterns:
+        - 'Manufacturers.csv'
+        - 'Manufacturers (*).csv'
+
+  requesting_location:
+    folder: misc_mdm
+    name: 'requesting+location.csv'
+    tags: [daily, mdm]
+    download:
+      patterns:
+        - 'requesting+location.csv'
+        - 'requesting+location (*).csv'
+
+  supplier:
+    folder: misc_mdm
+    name: 'Suppliers.csv'
+    tags: [daily, mdm]
+    download:
+      patterns:
+        - 'Suppliers.csv'
+        - 'Suppliers (*).csv'
+
+  vendor_item:
+    folder: misc_mdm
+    name: 'VendorItems.csv'
+    tags: [daily, mdm]
+    download:
+      patterns:
+        - 'VendorItems.csv'
+        - 'VendorItems (*).csv'
+
+  vendor_location:
+    folder: misc_mdm
+    name: 'VendorLocation_Preprocessor.csv'
+    tags: [daily, mdm]
+    download:
+      patterns:
+        - 'VendorLocation_Preprocessor.csv'
+        - 'VendorLocation_Preprocessor (*).csv'

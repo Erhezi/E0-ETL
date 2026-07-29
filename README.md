@@ -1,12 +1,21 @@
 # Infor File Loaders
 
-The loader package is driven by one YAML file per data source under `configs\`.
-
-The first configured loader is:
+The loader package is driven by one YAML file per data source under
+`configs\loaders\`. The `configs\` root holds the shared
+`file_folder_loader_config.yaml` registry (see "Input files" below); everything
+else in `configs\loaders\` is a loader:
 
 ```text
-configs\inventory_location.yaml
+configs\
+  file_folder_loader_config.yaml   # input-file registry (not a loader)
+  loaders\
+    inventory_location.yaml        # one YAML per data source
+    ...
 ```
+
+Commands still take `--config configs` (the default): the loaders are read from
+`configs\loaders\` automatically, and the registry is found at the `configs\`
+root.
 
 ## Run Commands
 
@@ -61,12 +70,93 @@ python -B run_daily_loaders.py --loader inventory_location --prd-only
 destination's `prod.post_sql`. `--stg-only` does not run `post_file_moves`, so the
 source file stays in place for a later `--prd-only` or a re-run.
 
+## Input files: the central registry + `move-files`
+
+`configs\file_folder_loader_config.yaml` is the **single source of truth** for
+where each input file lives and how it arrives. Two consumers resolve from it,
+so they cannot drift:
+
+- **The loaders** — each `source.files` entry references an input by key
+  (`input: poline`) instead of restating its `path`/`name`. The loader keeps
+  only its read-time concerns (`alias`, `reader`, `options`).
+- **`move-files`** — relocates each downloaded export to its input's folder +
+  canonical name, **before** the loaders run. Filesystem only: no database, no
+  confirmation prompt, and `--dry-run` previews everything.
+
+The registry has two blocks:
+
+```yaml
+folders:                         # named locations — THE batch-change knob.
+  downloads:   'C:\Users\dli2\Downloads'
+  temp_export: 'C:\...\INFOR_SC\temp export'
+  misc_mdm:    'C:\...\INFOR_SC\misc mdm'
+
+inputs:                          # one entry per physical input file
+  item:
+    folder: misc_mdm             # where the loader reads it (a folders key)
+    name:  'Item.csv'            # the canonical file name
+    tags:  [daily, mdm]
+    download:                    # omit for a fixture maintained in place
+      patterns: ['Item.csv', 'Item (*).csv']
+```
+
+Relocating a folder is a **one-line edit** to `folders:` — every loader and
+download rule that references it by name follows, with no per-loader change.
+That is the point of the registry: change folders in batch, not one loader at a
+time.
+
+```powershell
+python -B run_daily_loaders.py move-files --list        # show the download inputs
+python -B run_daily_loaders.py move-files --dry-run      # preview, touches nothing
+python -B run_daily_loaders.py move-files                # dispatch every download
+python -B run_daily_loaders.py move-files --tag mdm      # just the mdm exports
+python -B run_daily_loaders.py move-files --input item   # a single input by key
+python -B run_daily_loaders.py move-files --check        # ...then verify every enabled
+                                                         # loader's source files resolve
+```
+
+Semantics (see the registry's comments for the full story):
+
+- `folders`: the only place absolute paths live. `download_defaults` supplies
+  the fallback download source folder + move behavior every `download` block
+  inherits.
+- `inputs[].download.patterns`: exact download name plus the browser's
+  `name (N).csv` re-download variant. Never a prefix glob like `Item*.csv`,
+  which would also swallow `ItemGTIN.csv` / `ItemUOM.csv` / `ItemReplenishFrom.csv`.
+  Whichever variant matches is renamed to the input's `name`.
+- An input with **no `download` block** is a fixture (maintained in place, e.g.
+  `company_map.csv`) — the loaders still read it, but `move-files` never
+  dispatches it and selecting it explicitly is an error.
+- `pick_latest` (default true): newest match by mtime wins. `action: move`
+  (default): Downloads is a chute, not a store — the per-loader `archive` step
+  keeps the consumed-input history. `required: false` (default): an input with
+  nothing in Downloads only warns, since the file already in the designated
+  folder is still valid. `on_exists: replace` (default): a fresh download
+  replaces the file already there (`skip` / `fail` also available).
+- `--check` resolves **every enabled loader's** source files and exits non-zero
+  on a `MISSING` line — the real presence guard, since a missing download only
+  warns.
+
+The two groups in the registry (transactional `staging→prod`, and direct-load
+`mdm`) are **organizational only** — a human troubleshooting aid (direct-load
+problem → go to the raw file; staging→prod problem → check `_stg` first, then
+the raw file). No behavior hangs on the grouping.
+
+One input's failure never blocks the rest; the exit code is non-zero if any
+input errored (or `--check` found a missing source). The registry lives at the
+`configs\` root (one level above the loader YAMLs in `configs\loaders\`); the
+loader loader finds it by looking in the configs directory and its parents, so
+`--config configs` and a single `configs\loaders\<name>.yaml` both resolve it. A
+loader may still use an explicit `path`/`name` instead of `input:` (the
+reference is optional), but prefer the registry so the location stays defined in
+one place.
+
 ## YAML Shape
 
 Each YAML specifies:
 
 - `connection`: default SQL Server and database.
-- `source.files`: one or more input files, each independently configurable.
+- `source.files`: one or more input files, each independently configurable. Prefer `input: <key>` to reference the file's location from the central registry (see "Input files" above); `alias`/`reader`/`options` stay here. An explicit `path`/`name` still works.
 - `destinations`: one or more SQL Server targets. Each target has a staging table loaded by the ETL and an optional prod table used as the target table in health logging/post-load workflows.
 - `health_table`: `[InforLoader].[ETLHealth]` target.
 - `logging.log_root`: where per-run log files go (a `YYYYMMDD` subfolder is created under it). The `<loader name>` placeholder is replaced with the loader's name, so a shared template like `\\host\share\DailyLoader\<loader name>\logs` works across loaders. If `log_root` can't be created/written (e.g. an unreachable share), the loader does **not** crash: it warns, falls back to a local `logs\<loader>\<date>` folder, still runs, and records the fallback note in the successful run's ETLHealth `Error` column so the degraded logging is visible.

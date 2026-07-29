@@ -1,6 +1,6 @@
 name: inventory_transaction
 enabled: true
-tags: [daily, InventoryTransactionLine]
+tags: [daily, transactional, InventoryTransactionLine]
 
 process:
   name: Inventory Transaction
@@ -10,10 +10,10 @@ source:
   multiple_input_files: false
   files:
     - alias: main
-      path: 'C:\Users\dli2\OneDrive - Montefiore Medicine\Documents\INFOR_SC\temp export'
-      # Verify the exact export filename in 'temp export'; this matches the sample
+      # Path + filename now live in the central registry input 'inventory_transaction'
+      # (configs\file_folder_loader_config.yaml); the filename matches the sample
       # (input_file_sample) and the original notebook's inventory_trx name.
-      name: 'Inventory_Trx_and_Balance+-+Export+To+CS.csv'
+      input: inventory_transaction
       reader: csv
       options:
         dtype: str

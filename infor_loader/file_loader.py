@@ -15,6 +15,7 @@ from typing import Any
 import pandas as pd
 
 from .config import LoadDestination, LoaderConfig, OverlapCheck, TableRef
+from .file_folder import InputFile, run_moves
 from .db import (
     connect_sql_server,
     count_rows,
@@ -50,6 +51,11 @@ class StepResult:
     row_count: int | None
     error: str | None = None
     duration: int | None = None
+    # ETLHealth TargetTableType for this step's table. A normal staging step is
+    # "STG"; a prod-promotion step is "PRD". A direct-load destination (no prod
+    # table configured) types its single load step "PRD" too, because the table
+    # it truncates/loads IS the final production table.
+    table_type: str = "STG"
 
 
 @dataclass
@@ -72,6 +78,8 @@ class FileLoader:
         log_root: str | Path | None = None,
         capture_streams: bool | None = None,
         phase: str = "both",
+        download_inputs: list[InputFile] | None = None,
+        ignore_download: bool = False,
     ) -> None:
         if phase not in self.PHASES:
             raise ValueError(f"phase must be one of {sorted(self.PHASES)}; got {phase!r}.")
@@ -80,6 +88,11 @@ class FileLoader:
         # "both" = file->staging then staging->prod; "stg" = staging load only
         # (skip prod promotion); "prd" = promotion only (skip the file/staging load).
         self.phase = phase
+        # The loader's downloadable inputs (from the file-folder registry). Unless
+        # ignore_download is set, the run gates on a fresh download for every one
+        # of these before touching the DB; an empty list disables the gate.
+        self.download_inputs = list(download_inputs or [])
+        self.ignore_download = ignore_download
         # Stream capture redirects the process-global stdout/stderr, so callers
         # running loaders in parallel can force it off to avoid cross-talk.
         self.capture_streams = (
@@ -107,38 +120,57 @@ class FileLoader:
                 # --prd-only promotes the already-loaded staging table, so the source
                 # file is neither moved nor read.
                 df: pd.DataFrame | None = None
-                if self.phase != "prd":
-                    if self.config.pre_file_moves:
-                        move_files(self.config.pre_file_moves, logger)
-                    dataframes, source_paths = self._read_sources(logger)
-                    df, source_warning = self._prepare_dataframe(dataframes, logger)
 
-                for destination in self.config.destinations:
-                    if not destination.enabled:
-                        logger.info("Skipping destination %s (disabled in config)", destination.name)
-                        continue
-                    destination_results.append(self._load_destination(destination, df, logger))
+                # Download gate: unless --ignore-download, require a fresh export in
+                # Downloads for EVERY downloadable input before touching the DB. If any
+                # is missing, record FILE_NOT_FOUND and skip the load entirely -- never
+                # re-truncate prod with the stale copy already sitting in place. Skipped
+                # for --prd-only, which reads no source file.
+                missing_downloads: list[str] = []
+                if self.phase != "prd" and not self.ignore_download and self.download_inputs:
+                    missing_downloads = self._check_and_stage_downloads(logger)
 
-                failures = [result for result in destination_results if result.status != "SUCCESS"]
-                if failures:
-                    status = "FAILED"
-                    error = "\n\n".join(result.error or f"{result.destination.name} failed." for result in failures)
+                if missing_downloads:
+                    status = "FILE_NOT_FOUND"
+                    error = "no files matched in Downloads for input(s): " + ", ".join(missing_downloads)
+                    logger.warning(
+                        "%s; skipping loader %s (no fresh download; prod left untouched).",
+                        error,
+                        self.config.name,
+                    )
                 else:
-                    row_count = sum(result.row_count or 0 for result in destination_results)
+                    if self.phase != "prd":
+                        if self.config.pre_file_moves:
+                            move_files(self.config.pre_file_moves, logger)
+                        dataframes, source_paths = self._read_sources(logger)
+                        df, source_warning = self._prepare_dataframe(dataframes, logger)
 
-                # Copy the consumed source file into the archive folder (stamped
-                # with the run date) once it has been successfully loaded. Skipped
-                # for --prd-only, which reads no file.
-                if status == "SUCCESS" and self.phase != "prd" and self.config.archive_dir:
-                    self._archive_sources(source_paths, start_wall, logger)
+                    for destination in self.config.destinations:
+                        if not destination.enabled:
+                            logger.info("Skipping destination %s (disabled in config)", destination.name)
+                            continue
+                        destination_results.append(self._load_destination(destination, df, logger))
 
-                # Archive/move the consumed source only after the full pipeline
-                # (staging + prod) succeeds; a partial --stg-only run leaves the file
-                # in place so it can still be promoted or re-run.
-                if status == "SUCCESS" and self.phase == "both" and self.config.post_file_moves:
-                    move_files(self.config.post_file_moves, logger)
+                    failures = [result for result in destination_results if result.status != "SUCCESS"]
+                    if failures:
+                        status = "FAILED"
+                        error = "\n\n".join(result.error or f"{result.destination.name} failed." for result in failures)
+                    else:
+                        row_count = sum(result.row_count or 0 for result in destination_results)
 
-                logger.info("Completed loader %s; rows=%s", self.config.name, row_count)
+                    # Copy the consumed source file into the archive folder (stamped
+                    # with the run date) once it has been successfully loaded. Skipped
+                    # for --prd-only, which reads no file.
+                    if status == "SUCCESS" and self.phase != "prd" and self.config.archive_dir:
+                        self._archive_sources(source_paths, start_wall, logger)
+
+                    # Archive/move the consumed source only after the full pipeline
+                    # (staging + prod) succeeds; a partial --stg-only run leaves the file
+                    # in place so it can still be promoted or re-run.
+                    if status == "SUCCESS" and self.phase == "both" and self.config.post_file_moves:
+                        move_files(self.config.post_file_moves, logger)
+
+                    logger.info("Completed loader %s; rows=%s", self.config.name, row_count)
             except Exception as exc:  # noqa: BLE001 - the loader must log every daily-job failure.
                 status = "FAILED"
                 error = f"{exc}\n{traceback.format_exc()}"
@@ -171,6 +203,26 @@ class FileLoader:
             log_file_path=str(log_file_path),
             error=error,
         )
+
+    def _check_and_stage_downloads(self, logger: logging.Logger) -> list[str]:
+        """Gate the loader on a fresh download for EVERY downloadable input, then
+        stage the ones that are present.
+
+        Two phases, so nothing is consumed unless the loader will actually run:
+          1. probe Downloads with ``run_moves(dry_run=True)`` -- touches no file;
+             any input reporting NO_MATCH/ERROR has no fresh download.
+          2. only if none are missing, ``run_moves(dry_run=False)`` relocates each
+             fresh export into its designated folder (the loader's source location),
+             so ``_read_sources`` then picks up today's file.
+
+        Returns the input keys with no fresh file (empty list = all present, staged).
+        """
+        probe = run_moves(self.download_inputs, dry_run=True, logger=logger)
+        missing = [result.key for result in probe if result.status in {"NO_MATCH", "ERROR"}]
+        if missing:
+            return missing
+        run_moves(self.download_inputs, dry_run=False, logger=logger)
+        return []
 
     def _read_sources(self, logger: logging.Logger) -> tuple[dict[str, pd.DataFrame], list[str]]:
         dataframes: dict[str, pd.DataFrame] = {}
@@ -254,7 +306,11 @@ class FileLoader:
                 raise ValueError(f"{self.config.name} is missing destination columns after transform: {missing}")
             df = df[destination_columns].copy()
 
-        df = normalize_for_db(df, self.config.type_changes)
+        df = normalize_for_db(
+            df,
+            self.config.type_changes,
+            preserve_whitespace=self.config.preserve_whitespace_columns,
+        )
         return df, source_warning
 
     def _load_destination(
@@ -266,6 +322,8 @@ class FileLoader:
         logger.info("Loading destination %s", destination.display_name(include_server=True))
         steps: list[StepResult] = []
         row_count: int | None = None
+        # A direct destination's load step targets the final table, not a staging table.
+        load_table_type = "PRD" if destination.is_direct else "STG"
 
         # Step 1: load the staging table (skipped for --prd-only, which promotes
         # the staging data already loaded by a prior run).
@@ -285,6 +343,7 @@ class FileLoader:
                         row_count=None,
                         error=error,
                         duration=int(perf_counter() - staging_start),
+                        table_type=load_table_type,
                     )
                 )
                 # In a full run (phase "both"), the prod promotion that would have
@@ -303,6 +362,7 @@ class FileLoader:
                             row_count=None,
                             error="STAGING LOAD FAILED",
                             duration=0,
+                            table_type="PRD",
                         )
                     )
                 return DestinationLoadResult(destination, "FAILED", None, error, steps)
@@ -316,6 +376,7 @@ class FileLoader:
                     status="SUCCESS",
                     row_count=row_count,
                     duration=int(perf_counter() - staging_start),
+                    table_type=load_table_type,
                 )
             )
 
@@ -347,6 +408,7 @@ class FileLoader:
                         row_count=None,
                         error=error,
                         duration=int(perf_counter() - prod_start),
+                        table_type="PRD",
                     )
                 )
                 return DestinationLoadResult(destination, "FAILED", row_count, error, steps)
@@ -360,6 +422,7 @@ class FileLoader:
                     status="SUCCESS",
                     row_count=row_count,
                     duration=int(perf_counter() - prod_start),
+                    table_type="PRD",
                 )
             )
 
@@ -728,9 +791,12 @@ class FileLoader:
                         "Duration": step.duration if step.duration is not None else duration,
                         # Server the step actually writes to (staging vs prod may differ).
                         "DBConnection": step.target.server,
-                        # 'STG' or 'PRD' depending on which table this row is for.
-                        "TargetTableType": "PRD" if is_prod else "STG",
-                        # The load strategy for that table type.
+                        # 'STG' or 'PRD' depending on which table this row is for. A
+                        # direct-load destination (no prod block) types its single
+                        # load step 'PRD': the loaded table IS the final table.
+                        "TargetTableType": step.table_type,
+                        # The load strategy for that step (a direct load runs the
+                        # staging strategy even though its row is typed PRD).
                         "ProcessType": (
                             self.config.prd_load_strategy if is_prod else self.config.stg_load_strategy
                         ),
@@ -783,6 +849,7 @@ class FileLoader:
                             row_count=result.row_count,
                             error=result.error,
                             duration=duration,
+                            table_type="PRD" if result.destination.is_direct else "STG",
                         )
                     )
             return step_rows
@@ -798,6 +865,7 @@ class FileLoader:
                 row_count=row_count,
                 error=error,
                 duration=duration,
+                table_type="PRD" if destination.is_direct else "STG",
             )
             for destination in self.config.destinations
             if destination.enabled

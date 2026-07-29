@@ -81,7 +81,12 @@ def apply_type_changes(
     return df
 
 
-def normalize_for_db(df: pd.DataFrame, type_changes: dict[str, list[str]]) -> pd.DataFrame:
+def normalize_for_db(
+    df: pd.DataFrame,
+    type_changes: dict[str, list[str]],
+    *,
+    preserve_whitespace: list[str] | None = None,
+) -> pd.DataFrame:
     int_cols = set(type_changes.get("int", []))
     # date/datetime blanks were already filled with 1900-01-01 by apply_type_changes
     # (the single blank-date sentinel; prod was backfilled 0001-01-01 -> 1900-01-01
@@ -92,15 +97,37 @@ def normalize_for_db(df: pd.DataFrame, type_changes: dict[str, list[str]]) -> pd
         | set(type_changes.get("float", []))
     )
     passthrough.add("report stamp")
+    # Columns whose whitespace is significant to the destination (e.g. a PK that
+    # relies on leading spaces to keep near-duplicate rows distinct -- see
+    # LoaderConfig.preserve_whitespace_columns): blanks are still filled with ''
+    # but the values are NOT trimmed.
+    keep_whitespace = set(preserve_whitespace or [])
 
     for col in df.columns:
         if col in int_cols:
             df[col] = df[col].astype(object).where(df[col].notna(), None)
         elif col in passthrough:
             continue
+        elif col in keep_whitespace:
+            df[col] = df[col].fillna("")
+            df[col] = df[col].apply(str)
         else:
             df[col] = df[col].fillna("")
             df[col] = df[col].apply(lambda x: str(x).strip())
+    return df
+
+
+def _fill_string_blanks(df: pd.DataFrame) -> pd.DataFrame:
+    """Fill blanks with '' in string (object-dtype) columns only.
+
+    Numeric and datetime columns keep NaN/NaT so blanks land as SQL NULL --
+    a blanket ``df.fillna("")`` would stuff '' into float columns, which the
+    numeric destination column rejects at insert time. (Date/datetime columns
+    typed in the mapping already carry the 1900-01-01 sentinel by the time a
+    transform runs, so they pass through unchanged either way.)
+    """
+    string_columns = [column for column in df.columns if df[column].dtype == object]
+    df[string_columns] = df[string_columns].fillna("")
     return df
 
 
@@ -331,60 +358,32 @@ def contract_line_first_account(
     return df
 
 
-@register("par_item")
-def par_item(df: pd.DataFrame, loader_config: Any, dataframes: dict[str, pd.DataFrame], logger: logging.Logger) -> pd.DataFrame:
-    for col in ["create stamp", "update stamp"]:
-        df[col] = pd.to_datetime(df[col])
-    df["BinSequence"] = df["BinSequence"].astype(int)
-    df["DefaultTransactionUOM.UOMConversion"] = df["DefaultTransactionUOM.UOMConversion"].apply(lambda x: float(str(x).replace(",", "")))
-    return df
-
-
 @register("vendor_item")
 def vendor_item(df: pd.DataFrame, loader_config: Any, dataframes: dict[str, pd.DataFrame], logger: logging.Logger) -> pd.DataFrame:
+    # The UOM factors and the stamps are typed in the mapping, so
+    # apply_type_changes already converted them (thousands separators stripped,
+    # numeric blanks kept as NaN -> SQL NULL; the old notebook behavior of
+    # forcing 0.0 is retired). String blanks are filled by normalize_for_db.
     df["LastUpdate"] = datetime.today().strftime("%Y-%m-%d")
-    for col in ["Item.DefaultBuyUOMMultiplier", "VendorBuyUOM.UOMConversion"]:
-        if col in df.columns:
-            df[col] = df[col].apply(lambda x: float(str(x).replace(",", "")) if not pd.isnull(x) else 0.0)
-    df = df.fillna("")
-    for col in ["create stamp", "update stamp"]:
-        df[col] = pd.to_datetime(df[col])
     return df
-
-
-@register("item_uom")
-def item_uom(df: pd.DataFrame, loader_config: Any, dataframes: dict[str, pd.DataFrame], logger: logging.Logger) -> pd.DataFrame:
-    for col in ["UOMConversion", "PackingWeight", "PackingVolume"]:
-        if col in df.columns:
-            df[col] = df[col].apply(lambda x: float(str(x).replace(",", "")))
-    for col in ["create stamp", "update stamp"]:
-        df[col] = pd.to_datetime(df[col])
-    return df.fillna("")
 
 
 @register("manufacturer")
 def manufacturer(df: pd.DataFrame, loader_config: Any, dataframes: dict[str, pd.DataFrame], logger: logging.Logger) -> pd.DataFrame:
-    df = df[["Manufacturer", "MMAHSManufacturerEID", "Description", "Active"]].copy()
+    # Column selection, source->destination renaming, and blank-filling are all
+    # handled by the mapping pipeline (see manufacturer.yaml); the transform only
+    # stamps the load-date marker (mapped to the LastUpdated date column).
     df["ReportDate"] = datetime.now().strftime("%Y-%m-%d")
     return df
 
 
 @register("supplier")
 def supplier(df: pd.DataFrame, loader_config: Any, dataframes: dict[str, pd.DataFrame], logger: logging.Logger) -> pd.DataFrame:
+    # Column selection, source->destination renaming, and blank-filling are
+    # handled by the mapping pipeline (see supplier.yaml); the transform derives
+    # the Supplier code from the representative string (e.g. '1 - PREMIER, INC'
+    # -> '1') and stamps the load-date marker.
     df["Supplier"] = df["RepresentativeText"].apply(lambda x: str(x).split(" - ")[0].strip())
-    df = df[
-        [
-            "Supplier",
-            "RepresentativeText",
-            "SupplierName",
-            "Vendor",
-            "Vendor.VendorName",
-            "Vendor.VendorClass",
-            "Active",
-            "HasBeenValidated",
-        ]
-    ].copy()
-    df = df.fillna("")
     df["ReportDate"] = datetime.now().strftime("%Y-%m-%d")
     return df
 
@@ -400,52 +399,16 @@ def edi_sub(df: pd.DataFrame, loader_config: Any, dataframes: dict[str, pd.DataF
 
 @register("item")
 def item(df: pd.DataFrame, loader_config: Any, dataframes: dict[str, pd.DataFrame], logger: logging.Logger) -> pd.DataFrame:
-    cols_to_take = [
-        "Item",
-        "Active",
-        "ConsignCode",
-        "Consignment",
-        "CriticalItem",
-        "DefaultBuyUOM",
-        "DefaultBuyUOMMultiplier",
-        "DefaultInventoryTransactionUOM",
-        "DefaultInventoryTransactionUOMMultiplier",
-        "StockUOM",
-        "Description",
-        "Description3",
-        "Discontinued",
-        "GenericName",
-        "Implantable",
-        "Reusable",
-        "Sterile",
-        "GTINForStockUOM",
-        "ItemGTINsRel.Active",
-        "HCPCSCode",
-        "ItemDescriptionAbbreviation",
-        "CommodityCode",
-        "CommodityCode.CcDescription",
-        "MMAHSPrimaryDI",
-        "MajorInventoryClass",
-        "MajorPPEClass",
-        "MajorPurchasingClass",
-        "MajorPurchasingClass.Description",
-        "MinorInventoryClass",
-        "MinorPPEClass",
-        "MinorPurchasingClass",
-        "Manufacturer",
-        "ManufacturerDescription",
-        "ManufacturerNumber",
-    ]
-    df = df[cols_to_take].copy()
+    # Column selection, int typing of the two multipliers, and blank-filling are
+    # all handled by the mapping pipeline (see item.yaml); the transform only
+    # stamps the load-date marker.
     df["ReportDate"] = datetime.now().strftime("%Y-%m-%d")
-    for col in ["DefaultBuyUOMMultiplier", "DefaultInventoryTransactionUOMMultiplier"]:
-        df[col] = df[col].apply(lambda x: int(float(str(x).replace(",", ""))))
-    return df.fillna("")
+    return df
 
 
 @register("ccx_sync_contract")
 def ccx_sync_contract(df: pd.DataFrame, loader_config: Any, dataframes: dict[str, pd.DataFrame], logger: logging.Logger) -> pd.DataFrame:
-    df = df.fillna("")
+    df = _fill_string_blanks(df)
     df["report stamp"] = datetime.today().strftime("%Y-%m-%d %H:%M:%S")
     df["Synced"] = df["Synced"].apply(lambda x: 1 if x == "True" else 0)
     df["Organization"] = df["Organization"].apply(lambda x: str(x).strip())
@@ -460,61 +423,24 @@ def contract_line_error(df: pd.DataFrame, loader_config: Any, dataframes: dict[s
     df["ContractLine.UOMConversion"] = df["ContractLine.UOMConversion"].apply(lambda x: int(float(str(x).replace(",", ""))))
     df["create stamp"] = pd.to_datetime(df["create stamp"])
     df["update stamp"] = pd.to_datetime(df["update stamp"])
-    return df.fillna("")
+    return _fill_string_blanks(df)
 
 
 @register("vendor_location")
 def vendor_location(df: pd.DataFrame, loader_config: Any, dataframes: dict[str, pd.DataFrame], logger: logging.Logger) -> pd.DataFrame:
+    # Column selection, datetime typing, and blank-filling are handled by the
+    # mapping pipeline (see vendor_location.yaml); the transform only
+    # derives the location text from the representative string, e.g.
+    # 'B001 - THE NEW ENGLAND JOURNAL OF MEDICINE' -> the part after ' - '.
     df["VendorLocationText"] = df["RepresentativeText"].apply(lambda x: str(x).split(" - ")[-1])
-    cols = ["Vendor", "VendorName", "VendorLocation", "VendorLocationText", "Status", "LocationType", "create stamp", "update stamp"]
-    df = df[cols].copy()
-    for col in ["create stamp", "update stamp"]:
-        df[col] = pd.to_datetime(df[col])
-    return df.fillna("")
-
-
-@register("item_replenish_from")
-def item_replenish_from(df: pd.DataFrame, loader_config: Any, dataframes: dict[str, pd.DataFrame], logger: logging.Logger) -> pd.DataFrame:
-    df["ItemReplenishmentSource.ReplenishmentPriority"] = df["ItemReplenishmentSource.ReplenishmentPriority"].astype(int)
-    for col in ["create stamp", "update stamp"]:
-        df[col] = pd.to_datetime(df[col])
-    return df.fillna("")
-
-
-@register("item_gtin")
-def item_gtin(df: pd.DataFrame, loader_config: Any, dataframes: dict[str, pd.DataFrame], logger: logging.Logger) -> pd.DataFrame:
-    df["UnitOfMeasure.UOMConversion"] = df["UnitOfMeasure.UOMConversion"].apply(lambda x: float(str(x).replace(",", "")))
-    for col in ["create stamp", "update stamp"]:
-        df[col] = pd.to_datetime(df[col])
-    return df.fillna("")
+    return df
 
 
 @register("requesting_location")
 def requesting_location(df: pd.DataFrame, loader_config: Any, dataframes: dict[str, pd.DataFrame], logger: logging.Logger) -> pd.DataFrame:
-    cols_to_take = [
-        "Company",
-        "RequestingLocation",
-        "Active",
-        "DerivedFinanceDimension1",
-        "DerivedFinanceDimension3",
-        "DerivedFinanceDimension5",
-        "DerivedProject",
-        "FillOrKill",
-        "LocationRule",
-        "DerivedFromLocation",
-        "FromCompanyLocation",
-        "PostalAddress",
-        "PostalAddress.DisplayAddressLine1",
-        "PostalAddress.DisplayAddressLine2",
-        "Name",
-        "RequisitionApprovalType",
-        "create stamp",
-        "update stamp",
-    ]
-    df = df[cols_to_take].copy()
-    for col in ["create stamp", "update stamp"]:
-        df[col] = pd.to_datetime(df[col])
-    df = df.fillna("")
+    # Column selection, source->destination renaming, datetime typing of the two
+    # stamps, and blank-filling are all handled by the mapping pipeline (see
+    # requesting_location.yaml); the transform only stamps the load-date marker.
     df["ReportDate"] = datetime.now().strftime("%Y-%m-%d")
     return df
 
@@ -523,14 +449,14 @@ def requesting_location(df: pd.DataFrame, loader_config: Any, dataframes: dict[s
 def commodity_gl(df: pd.DataFrame, loader_config: Any, dataframes: dict[str, pd.DataFrame], logger: logging.Logger) -> pd.DataFrame:
     df.drop(columns=["ItemGroup"], inplace=True)
     df["ReportDate"] = datetime.now().strftime("%Y-%m-%d")
-    return df.fillna("")
+    return _fill_string_blanks(df)
 
 
 @register("requester")
 def requester(df: pd.DataFrame, loader_config: Any, dataframes: dict[str, pd.DataFrame], logger: logging.Logger) -> pd.DataFrame:
     df.drop(columns=["Reference1", "Reference2"], inplace=True)
     df["ReportDate"] = datetime.now().strftime("%Y-%m-%d")
-    return df.fillna("")
+    return _fill_string_blanks(df)
 
 
 @register("completed_invoice")

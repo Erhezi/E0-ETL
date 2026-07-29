@@ -1,6 +1,6 @@
 name: purchaseorder_line
 enabled: true
-tags: [daily, PurchaseOrderLine]
+tags: [daily, transactional, PurchaseOrderLine]
 
 process:
   name: Purchase Order Line
@@ -19,27 +19,26 @@ process:
 source:
   multiple_input_files: true
   files:
+    # path + filename for each input live in the central registry
+    # (configs\file_folder_loader_config.yaml). company_map is a fixture there
+    # (no download); poline/fd3/fd5 arrive as downloads.
     - alias: main
-      path: 'C:\Users\dli2\OneDrive - Montefiore Medicine\Documents\INFOR_SC\temp export'
-      name: 'DataTeamPRD_POline_DL.csv'
+      input: poline
       reader: csv
       options:
         dtype: str
     - alias: company_map
-      path: 'C:\Users\dli2\OneDrive - Montefiore Medicine\Documents\INFOR_SC\misc mdm'
-      name: 'company_map.csv'
+      input: company_map
       reader: csv
       options:
         dtype: str
     - alias: fd3
-      path: 'C:\Users\dli2\OneDrive - Montefiore Medicine\Documents\INFOR_SC\misc mdm'
-      name: 'FD3.csv'
+      input: fd3
       reader: csv
       options:
         dtype: str
     - alias: fd5
-      path: 'C:\Users\dli2\OneDrive - Montefiore Medicine\Documents\INFOR_SC\misc mdm'
-      name: 'FD5.csv'
+      input: fd5
       reader: csv
       options:
         dtype: str

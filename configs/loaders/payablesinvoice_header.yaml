@@ -1,6 +1,6 @@
 name: payablesinvoice_header
 enabled: true
-tags: [daily, PayablesInvoiceHeader]
+tags: [daily, transactional, PayablesInvoiceHeader]
 
 process:
   name: Payables Invoice Header
@@ -10,8 +10,7 @@ source:
   multiple_input_files: false
   files:
     - alias: main
-      path: 'C:\Users\dli2\OneDrive - Montefiore Medicine\Documents\INFOR_SC\temp export'
-      name: 'AP_invoices_backbone_DL+-+Export+To+CSV.csv'
+      input: payablesinvoice_header   # path + filename: see configs\file_folder_loader_config.yaml
       reader: csv
       options:
         dtype: str
