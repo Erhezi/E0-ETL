@@ -170,6 +170,15 @@ inputs:
         - 'FD5 (*).csv'
 
   # ==== direct-load loaders (mdm, no staging) : misc_mdm ===================
+  commodity_gl:
+    folder: misc_mdm
+    name: 'CommodityCodeGL.csv'
+    tags: [daily, mdm]
+    download:
+      patterns:
+        - 'CommodityCodeGL.csv'
+        - 'CommodityCodeGL (*).csv'
+
   edi_sub_uom:
     folder: misc_mdm
     name: 'EDI+sub.csv'
@@ -241,6 +250,17 @@ inputs:
       patterns:
         - 'requesting+location.csv'
         - 'requesting+location (*).csv'
+
+  # Saved-search export literally named 'copy of requester' (the '+' are the
+  # export's URL-encoded spaces); consumed by the requester loader.
+  requester:
+    folder: misc_mdm
+    name: 'copy+of+requester.csv'
+    tags: [daily, mdm]
+    download:
+      patterns:
+        - 'copy+of+requester.csv'
+        - 'copy+of+requester (*).csv'
 
   supplier:
     folder: misc_mdm
