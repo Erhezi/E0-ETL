@@ -4,7 +4,9 @@ enabled: true
 # lets it be rerun on demand (--tag mdm) after a fresh Infor export lands in
 # the misc mdm folder (VendorLocation_Preprocessor.csv refreshes alongside the
 # other mdm exports).
-tags: [daily, mdm, VendorLocation]
+# 'Preprocessor' groups the loaders that feed the App Preprocessor (run them together
+# with --tag Preprocessor); see also contract_line_error and item_replenish_from.
+tags: [daily, mdm, Preprocessor, VendorLocation]
 
 process:
   name: MDM Vendor Location

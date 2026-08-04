@@ -28,6 +28,9 @@ folders:
   downloads:   'C:\Users\dli2\Downloads'
   temp_export: 'C:\Users\dli2\OneDrive - Montefiore Medicine\Documents\INFOR_SC\temp export'
   misc_mdm:    'C:\Users\dli2\OneDrive - Montefiore Medicine\Documents\INFOR_SC\misc mdm'
+  # Landing folder for the GHX CCX saved-search export (searchSyncContract). Kept
+  # separate from the Infor exports since it is a GHX/CCX concern, not Infor MDM.
+  ccx:         'C:\Users\dli2\OneDrive - Montefiore Medicine\Documents\INFOR_SC\ccx'
 
 # Fallbacks every input's `download` block inherits unless it overrides them.
 download_defaults:
@@ -143,6 +146,7 @@ inputs:
       patterns:
         - 'ReqLine.csv'
         - 'ReqLine (*).csv'
+        - 'ReqLine_*.csv'
 
   # ---- purchaseorder_line mapping side files : misc_mdm -------------------
   # company_map is a FIXTURE (maintained in place, no download) -- it still
@@ -168,6 +172,20 @@ inputs:
       patterns:
         - 'FD5.csv'
         - 'FD5 (*).csv'
+
+  # ---- App Preprocessor staging export : misc_mdm ------------------------
+  # contract_line_error is TRANSACTIONAL (staging->prod), unlike the direct-load
+  # mdm exports below: it loads a _stg table that the Preprocessor batch promotes.
+  # It shares the misc mdm folder because it supports the App Preprocessor and is
+  # operated with the other Preprocessor loaders (all tagged 'Preprocessor').
+  contract_line_error:
+    folder: misc_mdm
+    name: 'ContractLineError.csv'
+    tags: [daily]
+    download:
+      patterns:
+        - 'ContractLineError.csv'
+        - 'ContractLineError (*).csv'
 
   # ==== direct-load loaders (mdm, no staging) : misc_mdm ===================
   commodity_gl:
@@ -288,3 +306,18 @@ inputs:
       patterns:
         - 'VendorLocation_Preprocessor.csv'
         - 'VendorLocation_Preprocessor (*).csv'
+
+  # ==== GHX CCX export : ccx ================================================
+  # The "Search Sync Contract" saved search downloads with an embedded run
+  # timestamp in the name, e.g. 'searchSyncContract_31_7_2026_9_55_27 am.csv'
+  # (and the browser's ' (N)' re-download variant). The single glob below matches
+  # any of them -- no other export starts with 'searchSyncContract_' -- and each
+  # match is renamed to the canonical name the loader reads. pick_latest (the
+  # default) keeps only the newest by mtime.
+  ccx_sync_contract:
+    folder: ccx
+    name: 'searchSyncContract.csv'
+    tags: [daily]
+    download:
+      patterns:
+        - 'searchSyncContract_*.csv'

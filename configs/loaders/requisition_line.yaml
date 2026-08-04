@@ -30,12 +30,17 @@ destinations:
       table: requisition_line_stg
     prod:
       table: REQUISITION_LINE
+      # Two-step promotion (statements run in list order, one prod transaction):
+      #   1. UpdateRequisitionLine        -- pk_delete_insert_on_header (existing).
+      #   2. MergeRequisitionLinePOSource -- pk_merge of the PO-sourced fields onto
+      #      rows whose PO changed after the requisition. See the prd_load note below.
       post_sql:
         - EXEC [DM_MONTYNT\dli2].[UpdateRequisitionLine]
+        - EXEC [DM_MONTYNT\dli2].[MergeRequisitionLinePOSource]
 
-  # Disabled placeholder for the infor-side landing the other loaders have.
-  # Enable only after creating the objects (requisition_line_stg /
-  # REQUISITION_LINE / sp_UpdateRequisitionLine) on that schema.
+  # infor-side landing (mirrors the other loaders). Requires these objects on the
+  # infor schema: requisition_line_stg, REQUISITION_LINE, sp_UpdateRequisitionLine,
+  # and sp_MergeRequisitionLinePOSource (the step-2 PO-source merge).
   - name: des2
     enabled: true
     server: YNBBSTVWP02\PROCDATASRVPROD
@@ -45,8 +50,10 @@ destinations:
       table: requisition_line_stg
     prod:
       table: REQUISITION_LINE
+      # Two-step promotion, same as des1 (see the prd_load note below).
       post_sql:
         - EXEC [infor].[sp_UpdateRequisitionLine]
+        - EXEC [infor].[sp_MergeRequisitionLinePOSource]
 
 health_table:
   server: 'YNBBSTVWP02\PROCDATASRVPROD'
@@ -74,37 +81,58 @@ stg_load:
 # How the prod table is promoted from the just-loaded staging table.
 # Allowed: truncate_insert | pk_merge | pk_delete_insert | pk_delete_insert_on_header
 #          | versioned_delete_insert | filter_active
-# pk_delete_insert_on_header: DELETE prod rows matching staging on the HEADER-level
-#   key (Company, Requisition) -- a prefix of the PK (Company, Requisition,
-#   RequisitionLine) -- then INSERT all staging rows. Whole requisitions' line sets
-#   are replaced, so lines deleted at the source disappear from prod too;
-#   requisitions absent from the file are left in place.
-# VERIFIED against the proc (read 2026-07-14): UpdateRequisitionLine deletes prod
-# joining staging on company+requisition, then runs
-#   INSERT INTO REQUISITION_LINE SELECT * FROM requisition_line_stg
-# The insert is POSITIONAL (SELECT *): staging and prod column order were verified
-# identical, and the mapping below is kept in that same table order -- do not
-# reorder it without also altering both tables and the proc.
-# DECLARATIVE ONLY for now: the real promotion runs via each destination's
-# prod.post_sql (EXEC ...UpdateRequisitionLine). This records intent and is
-# validated at load time, but is not yet dispatched by the loader; header_key is
-# the spec a later template-based query generator will fill in.
+#
+# TWO-STEP promotion for this loader. Both steps run via each destination's
+# prod.post_sql (the two EXECs above), in list order, on the prod connection in a
+# single transaction (see file_loader._update_prod / db.execute_statements).
+#
+# Step 1 -- pk_delete_insert_on_header (existing proc UpdateRequisitionLine):
+#   DELETE prod rows matching staging on the HEADER-level key (Company, Requisition)
+#   -- a prefix of the PK (Company, Requisition, RequisitionLine) -- then INSERT all
+#   staging rows. Whole requisitions' line sets are replaced, so lines deleted at the
+#   source disappear from prod too; requisitions absent from the file are left in place.
+#   VERIFIED against the proc (read 2026-07-14): UpdateRequisitionLine deletes prod
+#   joining staging on company+requisition, then runs
+#     INSERT INTO REQUISITION_LINE SELECT * FROM requisition_line_stg
+#   The insert is POSITIONAL (SELECT *): staging and prod column order must stay
+#   identical, and the mapping below is kept in that same table order -- do NOT reorder
+#   it, and ADD new columns only at the END of BOTH tables. The two stamp columns are
+#   appended last for exactly this reason, so SELECT * keeps aligning after the ALTER.
+#
+# Step 2 -- pk_merge of the PO-sourced fields (new proc MergeRequisitionLinePOSource):
+#   For staging rows where [PO.update stamp] > [Requisition.update stamp] (the sourced
+#   PO changed AFTER the requisition, so its own update stamp never advanced), UPDATE
+#   only the PO-sourced columns (PO, PurchaseOrderLine, PODate, [PO.update stamp]) onto
+#   the matching prod row, joined on the line PK (Company, Requisition, RequisitionLine).
+#   No delete -- the rest of the row, and lines not in the file, are left intact.
+#
+# DECLARATIVE: the loader does not generate SQL from this spec; it dispatches the
+# prod.post_sql EXECs. strategy/header_key/merge_step record intent for the reader
+# (prd_load_strategy also feeds the ETLHealth PRD row's ProcessType).
 prd_load:
   strategy: pk_delete_insert_on_header
   header_key: [Company, Requisition]
+  merge_step:
+    proc_suffix: MergeRequisitionLinePOSource
+    match_key: [Company, Requisition, RequisitionLine]
+    update_columns: [PO, PurchaseOrderLine, PODate, 'PO.update stamp']
+    where: '[PO.update stamp] > [Requisition.update stamp]'
 
-# Delta-overlap guard: skip. The ReqLine export is a full point-in-time snapshot,
-# not a delta window: the 2026-07-14 file carried every requisition line back to
-# the Nov 2023 go-live (70,766 rows, all statuses, lines with and without POs),
-# so there is no gap between runs to guard against (source MIN would trivially be
-# <= DB MAX). The file DOES ship 'Requisition.update stamp' (not landed) -- if the
-# export is ever narrowed to a window keyed on it, land that column and switch
-# this to mode: enforce on it.
+# Delta-overlap guard on the requisition header's update stamp. Asserts the
+# incoming file overlaps what is already stored:
+#   MIN(source['Requisition.update stamp']) <= MAX(prod[[Requisition.update stamp]])
+# so a windowed/narrowed export cannot leave a gap between runs. Runs before the
+# staging truncate/insert, so a gap aborts the load without touching stored data.
+# 'Requisition.update stamp' is now landed (see mapping), which is what lets this
+# check read a matching prod column instead of the old mode: skip.
+# First run after the ALTER: prod's pre-existing rows are NULL for
+# [Requisition.update stamp] until Step 1 repopulates them, so MAX is NULL and
+# skip_if_db_empty makes the check no-op that once (thereafter it enforces).
 validation:
   overlap_check:
-    mode: skip
-    source_column: null
-    db_column: null
+    mode: enforce
+    source_column: 'Requisition.update stamp'   # name in the prepared source frame (pre-mapping)
+    db_column: 'Requisition.update stamp'        # destination column read from the baseline table
     baseline: prod                  # which already-in-DB table to read MAX from: prod | staging
     skip_if_db_empty: true          # first-ever load has nothing to overlap -> skip instead of fail
 
@@ -198,10 +226,16 @@ field_config:
     - [ItemFoundForSpecial, ItemFoundForSpecial, string, varchar(5), source]
     - [create stamp, create stamp, datetime, datetime, source]
     - [update stamp, update stamp, datetime, datetime, source]
+    # Header + sourced-PO update stamps. Appended LAST so they line up with
+    # ALTER TABLE ... ADD on both stg and prod (Step 1's INSERT ... SELECT * is
+    # positional -- see prd_load note). Keep this order (Requisition stamp, then PO
+    # stamp) identical to the ADD order in both tables.
+    # [Requisition.update stamp] drives the overlap check above; [PO.update stamp]
+    # drives the Step-2 merge ([PO.update stamp] > [Requisition.update stamp]).
+    - [Requisition.update stamp, Requisition.update stamp, datetime, datetime, source]
+    - [PurchaseOrderLineSourcesRel.PurchaseOrder.update stamp, PO.update stamp, datetime, datetime, source]
 
   # Present in the source file but not integrated into the pipeline yet. Optional:
   # a missing one only warns, since it cannot affect the output.
   extra:
     - ManufacturerNumber
-    - Requisition.update stamp   # requisition header's stamp; not in the destination table
-    - PurchaseOrderLineSourcesRel.PurchaseOrder.update stamp   # sourced PO's stamp; not in the destination table
