@@ -1,0 +1,174 @@
+name: ghx_completed_invoice_by_date
+enabled: true
+# ON-DEMAND ONLY. The 'on-demand' tag keeps this loader OUT of the daily --all
+# batch (and the move-files --check source scan) -- it is never run unattended.
+# Run it explicitly when a fresh "Completed Invoices by Date" export is in place:
+#   python -B run_daily_loaders.py --loader ghx_completed_invoice_by_date
+# 'ghx' groups it with the other GHX/CCX loaders; 'GHXCompletedInvoiceByDate' is
+# the self-select tag. NOTE: no 'daily' tag on purpose.
+tags: [on-demand, ghx, GHXCompletedInvoiceByDate]
+
+process:
+  name: GHX Completed Invoice By Date
+  frequency: On Demand
+
+source:
+  multiple_input_files: false
+  files:
+    - alias: main
+      input: ghx_completed_invoice_by_date   # path + filename: see configs\file_folder_loader_config.yaml
+      reader: excel
+      options:
+        # The export ships a one-line title banner ABOVE the real column header
+        # (row 2 is the 25-column header), so skip it. dtype=str keeps every value
+        # as text; typing and blank-filling happen in the mapping below.
+        skiprows: 1
+        dtype: str
+
+# STAGING -> PROD on two servers (same shape as daily\payablesinvoice_header.yaml).
+# The transformed export is truncate+inserted into each destination's staging
+# table, then prod.post_sql runs each server's promotion proc to update prod from
+# the just-loaded staging data. Each server keeps its own object names:
+#   des1  MISCPrdAdhocDB.PRIME.[DM_MONTYNT\dli2]  stg=ghx_completed_invoice_by_date_stg
+#                                                  prd=GHX_COMPLETED_INVOICE_BY_DATE
+#   des2  YNBBSTVWP02\PROCDATASRVPROD.PLMPreprocessorShared.ghx
+#                                                  stg=completed_invoice_by_date_stg
+#                                                  prd=COMPLETED_INVOICE_BY_DATE
+# All four tables carry the same 20 columns (VERIFIED via table-info on 2026-08-05,
+# no identity column; CatalystID/DocumentStatus/Queue/InvoiceNumber/InvoiceDate/
+# CompletedBy NOT NULL), so the single mapping below aligns on both servers.
+destinations:
+  - name: des1
+    enabled: true
+    server: MISCPrdAdhocDB
+    database: PRIME
+    schema: 'DM_MONTYNT\dli2'
+    staging:
+      table: ghx_completed_invoice_by_date_stg
+    prod:
+      table: GHX_COMPLETED_INVOICE_BY_DATE
+      post_sql:
+        - EXEC [DM_MONTYNT\dli2].[UpdateGHXCompletedInvoiceByDate]
+
+  - name: des2
+    enabled: true
+    server: YNBBSTVWP02\PROCDATASRVPROD
+    database: PLMPreprocessorShared
+    schema: ghx
+    staging:
+      table: completed_invoice_by_date_stg
+    prod:
+      table: COMPLETED_INVOICE_BY_DATE
+      # Proc assumed to live in the des2 schema (ghx); adjust if it is elsewhere.
+      post_sql:
+        - EXEC [ghx].[sp_UpdateCompletedInvoiceByDate]
+
+health_table:
+  server: 'YNBBSTVWP02\PROCDATASRVPROD'
+  database: SCSFileIngestor
+  schema: InforLoader
+  table: ETLHealth
+
+logging:
+  # <loader name> is substituted with this loader's name (ghx_completed_invoice_by_date).
+  log_root: '\\montefiore.org\centralfiles\data\Procurement PMO\dli2\DailyLoader\<loader name>\logs'
+  level: INFO
+  console: true          # echo run logs to the console (stderr) for Task Scheduler output
+  capture_streams: true  # capture stdout/stderr (prints, warnings, tracebacks) into the log file
+
+# Standard archive behavior (same as every other loader): after a successful load
+# the source file is copied here with a _YYYYMMDD stamp appended, e.g.
+# Completed Invoices by Date_20260804.xlsx. <loader name> is substituted with this
+# loader's name. Set enabled: false to skip.
+archive:
+  path: '\\montefiore.org\centralfiles\data\Procurement PMO\dli2\DailyLoader\<loader name>\archived'
+
+stg_load:
+  strategy: truncate_insert   # how each staging table is loaded from the export
+  batch_size: 50000
+
+# How prod is promoted from the just-loaded staging table.
+# Allowed: truncate_insert | pk_merge | pk_delete_insert | pk_delete_insert_on_header
+#          | versioned_delete_insert | filter_active
+# pk_delete_insert: DELETE prod rows matching staging on the PK (CatalystID), then
+#   INSERT all staging rows -- so a window's completed invoices replace their own
+#   CatalystIDs and everything outside the window is left in place, accumulating
+#   history across on-demand runs.
+# DECLARATIVE ONLY: the real promotion runs via each destination's prod.post_sql
+# (UpdateGHXCompletedInvoiceByDate / sp_UpdateCompletedInvoiceByDate). This records
+# intent + sets the PRD ETLHealth ProcessType; keep it matching what the procs do.
+prd_load:
+  strategy: pk_delete_insert
+
+# Delta-overlap guard: skip. This loader is ON-DEMAND and run sporadically, so the
+# "Completed Invoices by Date" export windows are NOT guaranteed to be contiguous
+# between runs (e.g. a Jul-Aug window may follow a Jan-Apr one). Enforcing overlap
+# would wrongly block those legitimate non-adjacent loads; prod accumulates by
+# CatalystID (pk_delete_insert) and tolerates the gaps by design.
+validation:
+  overlap_check:
+    mode: skip
+    source_column: null
+    db_column: null
+    baseline: prod                  # which already-in-DB table to read MAX from: prod | staging
+    skip_if_db_empty: true          # first-ever load has nothing to overlap -> skip instead of fail
+
+# Registered in infor_loader/transforms.py. Blanks the PO Number when it exceeds
+# the destination's varchar(40) (an over-long value is a bad export artifact, not
+# a real PO). Runs on the source-named frame before the mapping; column selection,
+# renaming, date typing, and blank-filling are handled by the mapping below +
+# normalize_for_db.
+transforms:
+  - completed_invoice
+
+# The export is one row per Catalyst ID (0 duplicates in the 2026-08-05 sample of
+# 34,028 rows). A duplicate would be an export defect -- fail here, BEFORE the
+# truncate+insert touches the table.
+fail_on_pk_duplicates: true
+
+field_config:
+  # Every date/datetime column ships ISO-formatted, e.g. 2023-03-20 00:00:00 and
+  # 2026-07-23 14:12:34 (read as text via dtype=str). Set explicitly so pandas
+  # parses fast and unambiguously instead of guessing per row. The two `date`
+  # columns carry a 00:00:00 time component, so they parse with the same format
+  # and the loader keeps only the date part.
+  date_format: '%Y-%m-%d %H:%M:%S'
+  datetime_format: '%Y-%m-%d %H:%M:%S'
+
+  # PK check runs after mapping/data conversion, so this is the destination column
+  # name (CatalystID is NOT NULL and unique per export).
+  pk_check: [CatalystID]
+
+  # Loaded columns, ordered like the destination table (ordinal position). Row
+  # format:
+  #   [source_or_computed, destination, type_to_convert_to_in_python, destination_datatype, origin]
+  # origin: source = a required column read from the export (hard-fail if missing)
+  # type: string | date | datetime | float | int
+  # Source names carry spaces (Excel headers); destinations are the DB's no-space
+  # names -- VERIFIED against all four stg/prd tables via table-info on 2026-08-05.
+  mapping:
+    - ['Catalyst ID', CatalystID, string, varchar(10), source]
+    - ['Document Status', DocumentStatus, string, varchar(20), source]
+    - [Queue, Queue, string, varchar(20), source]
+    - ['Vendor ID', VendorID, string, varchar(10), source]
+    - ['Vendor Name', VendorName, string, varchar(150), source]
+    - ['Vendor Location', VendorLocation, string, varchar(20), source]
+    - ['Document Type', DocumentType, string, varchar(40), source]
+    # PO Number: blanked by the completed_invoice transform when it exceeds 40 chars.
+    - ['PO Number', PONumber, string, varchar(40), source]
+    - ['Invoice Number', InvoiceNumber, string, varchar(100), source]
+    - ['Invoice Amt', InvoiceAmount, float, money, source]
+    - ['Currency Code', CurrencyCode, string, varchar(5), source]
+    - ['Invoice Date', InvoiceDate, date, date, source]
+    - ['Received Date', ReceivedDatetime, datetime, datetime, source]
+    - ['Date Created', CreatedDatetime, datetime, datetime, source]
+    - ['Completed Date', CompletedDatetime, datetime, datetime, source]
+    - ['Due Date', DueDate, date, date, source]
+    - ['Last Comment', LastComment, string, varchar(max), source]
+    - ['Client Owner', ClientOwner, string, varchar(150), source]
+    - [CompletedBy, CompletedBy, string, varchar(150), source]
+    - [CompletedByUserName, CompletedByUserName, string, varchar(150), source]
+
+  # Present in the export but NOT loaded (dropped): Vendor Group, Document Group,
+  # Terms, Company Code2, PaymentText. Unmapped source columns are simply not
+  # selected by the mapping, so no explicit drop list is needed.

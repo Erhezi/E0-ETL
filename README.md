@@ -2,20 +2,44 @@
 
 The loader package is driven by one YAML file per data source under
 `configs\loaders\`. The `configs\` root holds the shared
-`file_folder_loader_config.yaml` registry (see "Input files" below); everything
-else in `configs\loaders\` is a loader:
+`file_folder_loader_config.yaml` registry (see "Input files" below); the loaders
+are grouped into subfolders by how they run:
 
 ```text
 configs\
   file_folder_loader_config.yaml   # input-file registry (not a loader)
   loaders\
-    inventory_location.yaml        # one YAML per data source
-    ...
+    daily\                         # run unattended as the daily batch (--all)
+      inventory_location.yaml      # one YAML per data source
+      ...
+    on-demand\                     # run by hand only (never in --all)
+      ghx_completed_invoice_by_date.yaml
 ```
 
-Commands still take `--config configs` (the default): the loaders are read from
-`configs\loaders\` automatically, and the registry is found at the `configs\`
-root.
+Commands still take `--config configs` (the default): the loaders are discovered
+**recursively** under `configs\loaders\` (so both `daily\` and `on-demand\` are
+found), and the registry is found at the `configs\` root. The grouping is by
+`loaders\<group>\`; what actually gates a loader out of the daily batch is the
+`on-demand` **tag** (see "On-demand loaders" below), not the folder name.
+
+### On-demand loaders
+
+A loader tagged `on-demand` is **excluded** from the daily `--all` batch and from
+the `move-files --check` source scan, but is still discovered so it can be run
+explicitly by name:
+
+```powershell
+python -B run_daily_loaders.py --loader ghx_completed_invoice_by_date
+```
+
+Keep on-demand loaders under `configs\loaders\on-demand\` and give them the
+`on-demand` tag (and **not** the `daily` tag). Tag their registry input
+`on-demand` too: an on-demand input still lands in Downloads and has a normal
+`download` block, but the tag keeps it out of the **unfiltered** daily
+`move-files` dispatch (and the daily `--check` scan), so it is not pulled from
+Downloads before its loader runs. The loader's own run-time download gate stages
+it when you run the loader; you can also relocate it by hand with
+`move-files --input <key>` (or `move-files --tag on-demand`).
 
 ## Run Commands
 

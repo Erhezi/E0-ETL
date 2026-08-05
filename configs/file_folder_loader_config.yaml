@@ -31,6 +31,9 @@ folders:
   # Landing folder for the GHX CCX saved-search export (searchSyncContract). Kept
   # separate from the Infor exports since it is a GHX/CCX concern, not Infor MDM.
   ccx:         'C:\Users\dli2\OneDrive - Montefiore Medicine\Documents\INFOR_SC\ccx'
+  # Landing folder for the Baxter emergency item-audit export (ItemAudit_BaxterItem_All).
+  # A des1-only PRIME concern, kept in its own folder like the notebook did.
+  baxter_emergency: 'C:\Users\dli2\OneDrive - Montefiore Medicine\Documents\INFOR_SC\BaxterEmergency'
 
 # Fallbacks every input's `download` block inherits unless it overrides them.
 download_defaults:
@@ -146,7 +149,7 @@ inputs:
       patterns:
         - 'ReqLine.csv'
         - 'ReqLine (*).csv'
-        - 'ReqLine_*.csv'
+        - 'ReqLine_*.csv' # used when we need to re-upload a few dated exports to fix a bad run
 
   # ---- purchaseorder_line mapping side files : misc_mdm -------------------
   # company_map is a FIXTURE (maintained in place, no download) -- it still
@@ -186,6 +189,19 @@ inputs:
       patterns:
         - 'ContractLineError.csv'
         - 'ContractLineError (*).csv'
+
+  # ---- Baxter emergency item audit (staging -> prod) : baxter_emergency ---
+  # ItemAudit_BaxterItem_All is the full Baxter item-audit export; the
+  # baxter_emergency_item loader lands it in baxter_item_audit_stg and the
+  # UpdateBaxterItemAudit proc upserts it into BAXTER_ITEM_AUDIT (des1 only).
+  baxter_emergency_item:
+    folder: baxter_emergency
+    name: 'ItemAudit_BaxterItem_All.csv'
+    tags: [daily]
+    download:
+      patterns:
+        - 'ItemAudit_BaxterItem_All.csv'
+        - 'ItemAudit_BaxterItem_All (*).csv'
 
   # ==== direct-load loaders (mdm, no staging) : misc_mdm ===================
   commodity_gl:
@@ -321,3 +337,21 @@ inputs:
     download:
       patterns:
         - 'searchSyncContract_*.csv'
+
+  # ==== on-demand GHX export : misc_mdm ====================================
+  # "Completed Invoices by Date" (GHX Catalyst), consumed by the on-demand
+  # ghx_completed_invoice_by_date loader (configs\loaders\on-demand\). It lands in
+  # Downloads like the other exports (the browser's ' (N)' re-download variant is
+  # matched too) and is relocated to misc mdm under the canonical name. The
+  # 'on-demand' tag keeps it OUT of the unfiltered daily `move-files` dispatch and
+  # the daily --check scan, so it is not pulled from Downloads before its loader
+  # is run by hand; the loader's own run-time download gate stages it on demand.
+  # Select it explicitly with `move-files --input ghx_completed_invoice_by_date`.
+  ghx_completed_invoice_by_date:
+    folder: misc_mdm
+    name: 'Completed Invoices by Date.xlsx'
+    tags: [on-demand]
+    download:
+      patterns:
+        - 'Completed Invoices by Date.xlsx'
+        - 'Completed Invoices by Date (*).xlsx'

@@ -1,0 +1,148 @@
+name: baxter_emergency_item
+enabled: true
+# Transactional staging->prod loader for the Baxter emergency item-audit feed.
+# Replaces the manual notebook flow (INFOR table update.ipynb "For Baxter Item
+# Emergency"): read ItemAudit_BaxterItem_All.csv -> type-convert -> select+rename
+# columns -> truncate+insert baxter_item_audit_stg. The staging->prod promotion
+# (which the notebook ran by hand) is EXEC [DM_MONTYNT\dli2].[UpdateBaxterItemAudit].
+tags: [daily, operational, BaxterItemAudit]
+
+process:
+  name: Baxter Item Audit
+  frequency: Workdays
+
+source:
+  multiple_input_files: false
+  files:
+    - alias: main
+      input: baxter_emergency_item   # path + filename: see configs\file_folder_loader_config.yaml
+      reader: csv
+      options:
+        dtype: str
+
+# DES1 ONLY. This Baxter emergency audit lives entirely in PRIME
+# ([DM_MONTYNT\dli2]); there is no infor-side (des2) counterpart, so -- unlike the
+# usual des1+des2 loaders -- only des1 is configured (see general_rules.md
+# "Loaders land BOTH destinations unless there is a documented reason not to").
+#
+# prod.post_sql runs on the prod connection after the staging load succeeds, to
+# promote the just-loaded staging rows into prod. Object names VERIFIED via
+# table-info / sys.sql_modules on 2026-08-05:
+#   staging  PRIME.[DM_MONTYNT\dli2].baxter_item_audit_stg   (no PK constraint)
+#   prod     PRIME.[DM_MONTYNT\dli2].BAXTER_ITEM_AUDIT        (PK: Company, Location, Item, ItemLocationAudit)
+# UpdateBaxterItemAudit deletes prod rows whose PK matches staging, then
+# INSERTs every staging row (SELECT *). The stg and prod tables have identical
+# column layouts (verified), so the proc's SELECT * lines up.
+destinations:
+  - name: des1
+    enabled: true
+    server: MISCPrdAdhocDB
+    database: PRIME
+    schema: 'DM_MONTYNT\dli2'
+    staging:
+      table: baxter_item_audit_stg
+    prod:
+      table: BAXTER_ITEM_AUDIT
+      post_sql:
+        - EXEC [DM_MONTYNT\dli2].[UpdateBaxterItemAudit]
+
+health_table:
+  server: 'YNBBSTVWP02\PROCDATASRVPROD'
+  database: SCSFileIngestor
+  schema: InforLoader
+  table: ETLHealth
+
+logging:
+  # <loader name> is substituted with this loader's name (baxter_emergency_item).
+  log_root: '\\montefiore.org\centralfiles\data\Procurement PMO\dli2\DailyLoader\<loader name>\logs'
+  level: INFO
+  console: true          # echo run logs to the console (stderr) for Task Scheduler output
+  capture_streams: true  # capture stdout/stderr (prints, warnings, tracebacks) into the log file
+
+# After a successful load the source file is copied here with a _YYYYMMDD stamp
+# appended (original extension kept), e.g. ItemAudit_BaxterItem_All_20260805.csv.
+# <loader name> is substituted with this loader's name. Set enabled: false to skip.
+archive:
+  path: '\\montefiore.org\centralfiles\data\Procurement PMO\dli2\DailyLoader\<loader name>\archived'
+
+stg_load:
+  strategy: truncate_insert   # how the staging table is loaded from the source file
+  batch_size: 50000
+
+# How the prod table is promoted from the just-loaded staging table.
+# pk_delete_insert: prod rows whose PK matches staging are deleted, then every
+# staging row is inserted -- an upsert keyed on the prod PK
+# (Company, Location, Item, ItemLocationAudit). This is exactly what
+# UpdateBaxterItemAudit does.
+# DECLARATIVE ONLY: the real promotion runs via prod.post_sql (EXEC
+# UpdateBaxterItemAudit); prd_load documents the strategy the proc implements.
+# Only `strategy` is read by the loader today; keep it in sync with the proc.
+prd_load:
+  strategy: pk_delete_insert
+
+# Delta-overlap guard: skip. ItemAudit_BaxterItem_All is a full point-in-time
+# export of the Baxter item-audit rows (not a rolling delta window), and the proc
+# upserts by PK, so there is no gap between runs to guard against.
+validation:
+  overlap_check:
+    mode: skip
+    source_column: null
+    db_column: null
+    baseline: prod                  # which already-in-DB table to read MAX from: prod | staging
+    skip_if_db_empty: true          # first-ever load has nothing to overlap -> skip instead of fail
+
+# Mapping is authored in destination-table column order below, so the staging
+# insert matches the stg/prod layout the proc's SELECT * relies on.
+use_db_column_order: false
+
+field_config:
+  # strptime format for `datetime`-typed source columns, e.g. 07/27/2026 11:53:47 AM.
+  # Set explicitly so pandas parses fast and unambiguously instead of guessing per row.
+  datetime_format: '%m/%d/%Y %I:%M:%S %p'
+
+  # PK check runs after mapping/data conversion, so these are DESTINATION column
+  # names -- and they are the real prod PK (verified). A duplicate would violate
+  # BAXTER_ITEM_AUDIT's PK on the proc's INSERT; fail here first (see below).
+  pk_check: [Company, Location, Item, ItemLocationAudit]
+
+  # Loaded columns, ordered like the destination table (BAXTER_ITEM_AUDIT /
+  # baxter_item_audit_stg, verified via table-info on 2026-08-05). Row format:
+  #   [source_or_computed, destination, type_to_convert_to_in_python, destination_datatype, origin]
+  # NOTE two source->destination renames (the manual notebook renamed by position):
+  #   InventoryLocation -> Location, UpdateDate -> UpdateDateTime.
+  # type: string | date | datetime | float | int
+  mapping:
+    - [Company, Company, string, varchar(10), source]
+    - [InventoryLocation, Location, string, varchar(20), source]
+    - [Item, Item, string, varchar(10), source]
+    - [ActionContext, ActionContext, string, varchar(100), source]
+    - [Actor, Actor, string, varchar(100), source]
+    - [UpdateDate, UpdateDateTime, datetime, datetime, source]
+    - [ItemLocationAudit, ItemLocationAudit, string, varchar(10), source]
+    - [BeforeAllocatedQuantity, BeforeAllocatedQuantity, float, "numeric(18, 2)", source]
+    - [AfterAllocatedQuantity, AfterAllocatedQuantity, float, "numeric(18, 2)", source]
+    - [BeforeIntransitQuantity, BeforeIntransitQuantity, float, "numeric(18, 2)", source]
+    - [AfterIntransitQuantity, AfterIntransitQuantity, float, "numeric(18, 2)", source]
+    - [BeforeInProcessQuantity, BeforeInProcessQuantity, float, "numeric(18, 2)", source]
+    - [AfterInProcessQuantity, AfterInProcessQuantity, float, "numeric(18, 2)", source]
+    - [BeforeStockOnHandQuantity, BeforeStockOnHandQuantity, float, "numeric(18, 2)", source]
+    - [AfterStockOnHandQuantity, AfterStockOnHandQuantity, float, "numeric(18, 2)", source]
+    - [BeforeOnOrderQuantity, BeforeOnOrderQuantity, float, "numeric(18, 2)", source]
+    - [AfterOnOrderQuantity, AfterOnOrderQuantity, float, "numeric(18, 2)", source]
+
+  # Present in the export but NOT loaded (the destination table has no columns for
+  # these quantity pairs). Optional: a missing one only warns, since it cannot
+  # affect the output.
+  extra:
+    - BeforeUnallocatedQuantity
+    - AfterUnallocatedQuantity
+    - BeforeInspectionHoldQuantity
+    - AfterInspectionHoldQuantity
+    - BeforeWorkInProgressQuantity
+    - AfterWorkInProgressQuantity
+
+# The export is one row per (Company, Location, Item, ItemLocationAudit) -- the
+# prod PK (0 duplicate keys in the notebook's sample). A duplicate would be an
+# export defect that the proc's INSERT would reject; fail here, BEFORE the
+# truncate+insert touches staging.
+fail_on_pk_duplicates: true

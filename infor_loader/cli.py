@@ -14,6 +14,7 @@ from .config import LoaderConfig, TableRef
 from .file_folder import (
     CONFIG_FILENAMES as FILE_FOLDER_CONFIG_FILENAMES,
     DEFAULT_CONFIG_PATH as FILE_FOLDER_DEFAULT_CONFIG,
+    ON_DEMAND_TAG,
     InputFile,
     InputRegistry,
     load_input_registry,
@@ -27,6 +28,12 @@ from .utilities import build_column_mapping_template, inspect_table, write_mappi
 # Upper bound on concurrent loaders so a full run cannot swamp the SQL Server.
 MAX_WORKERS_CAP = 4
 
+# ON_DEMAND_TAG (imported from file_folder) gates on-demand loaders: they are
+# discovered (so name selection and `list` work) but excluded from the `--all`
+# batch and the `move-files --check` source scan -- run them explicitly by name
+# (`--loader <name>`). By convention these live under `configs/loaders/on-demand/`;
+# the tag, not the folder, is what gates the behavior.
+
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run configurable Infor file loaders.")
@@ -36,7 +43,7 @@ def main(argv: list[str] | None = None) -> int:
     # summary and asks for confirmation before running; `--auto` skips the prompt.
     parser.add_argument("--loader", action="append", default=[], help="Loader name to run. Can be repeated.")
     parser.add_argument("--tag", action="append", default=[], help="Select loaders by tag. Can be repeated.")
-    parser.add_argument("--all", action="store_true", help="Run every configured loader.")
+    parser.add_argument("--all", action="store_true", help="Run every daily loader (excludes on-demand loaders).")
     parser.add_argument("--auto", action="store_true", help="Skip the confirmation prompt and run immediately.")
     parser.add_argument(
         "--max-workers",
@@ -61,7 +68,7 @@ def main(argv: list[str] | None = None) -> int:
     run_parser = subparsers.add_parser("run", help="Run configured loaders.")
     run_parser.add_argument("--loader", action="append", default=[], help="Loader name to run. Can be repeated.")
     run_parser.add_argument("--tag", action="append", default=[], help="Run loaders with tag. Can be repeated.")
-    run_parser.add_argument("--all", action="store_true", help="Run every configured loader.")
+    run_parser.add_argument("--all", action="store_true", help="Run every daily loader (excludes on-demand loaders).")
     run_parser.add_argument(
         "--max-workers",
         type=int,
@@ -162,7 +169,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "run":
-        selected = loaders if args.all else select_loaders(loaders, names=args.loader, tags=args.tag)
+        selected = _daily_loaders(loaders) if args.all else select_loaders(loaders, names=args.loader, tags=args.tag)
         selected = [loader for loader in selected if loader.enabled]
         if not selected:
             print("No enabled loaders selected.", file=sys.stderr)
@@ -190,16 +197,21 @@ def load_loader_configs(config_ref: str) -> list[LoaderConfig]:
     if config_path.exists():
         if config_path.is_dir():
             # Loader YAMLs live in the `loaders/` subfolder when it exists
-            # (configs/loaders/*.yaml); the file-folder registry stays at the
-            # configs root. Fall back to the directory itself for the older flat
-            # layout. The registry is still skipped by name if it sits alongside.
+            # (configs/loaders/); the file-folder registry stays at the configs
+            # root. The loaders may be grouped into subfolders (daily/, on-demand/),
+            # so recurse to discover every group. Fall back to the directory itself
+            # (non-recursive) for the older flat layout. The registry is still
+            # skipped by name if it sits alongside.
             registry = _find_input_registry(config_path)
             loader_dir = config_path / "loaders"
-            if not loader_dir.is_dir():
+            if loader_dir.is_dir():
+                candidates = [*loader_dir.rglob("*.yaml"), *loader_dir.rglob("*.yml")]
+            else:
                 loader_dir = config_path
+                candidates = [*loader_dir.glob("*.yaml"), *loader_dir.glob("*.yml")]
             yaml_paths = sorted(
                 path
-                for path in [*loader_dir.glob("*.yaml"), *loader_dir.glob("*.yml")]
+                for path in candidates
                 if path.name.lower() not in FILE_FOLDER_CONFIG_FILENAMES
             )
             return [_load_yaml_config(path, registry) for path in yaml_paths]
@@ -522,6 +534,14 @@ def select_loaders(
     return selected
 
 
+def _daily_loaders(loaders: list[LoaderConfig]) -> list[LoaderConfig]:
+    """The loaders selected by ``--all``: every configured loader EXCEPT the
+    on-demand ones (tagged :data:`ON_DEMAND_TAG`). On-demand loaders are still
+    discovered so they can be run explicitly by name, but they are never swept
+    into the daily batch."""
+    return [loader for loader in loaders if ON_DEMAND_TAG not in loader.tags]
+
+
 def get_loader(loaders: list[LoaderConfig], name: str) -> LoaderConfig:
     for loader in loaders:
         if loader.name == name:
@@ -586,8 +606,14 @@ def _move_files_logger() -> logging.Logger:
 def _check_loader_sources(loader_config_ref: str) -> bool:
     """Verify every enabled loader can resolve each of its source files after a
     dispatch. Prints one FOUND/MISSING line per source file and returns False if
-    any is missing."""
-    loaders = [loader for loader in load_loader_configs(loader_config_ref) if loader.enabled]
+    any is missing. On-demand loaders (tagged ``ON_DEMAND_TAG``) are skipped:
+    their input is not expected to be present between the manual runs, so a
+    missing on-demand file must not fail the daily dispatch check."""
+    loaders = [
+        loader
+        for loader in load_loader_configs(loader_config_ref)
+        if loader.enabled and ON_DEMAND_TAG not in loader.tags
+    ]
     all_found = True
     for loader in loaders:
         for source_file in loader.source_files:
@@ -655,7 +681,7 @@ def run_interactive(
 ) -> int:
     """Print a summary of the selected loaders and run them after confirmation."""
     loaders = load_loader_configs(config_ref)
-    selected = loaders if select_all else select_loaders(loaders, names=names, tags=tags)
+    selected = _daily_loaders(loaders) if select_all else select_loaders(loaders, names=names, tags=tags)
     if not selected:
         wanted = "--all" if select_all else (", ".join([*names, *tags]) or "(none)")
         print(f"No loaders matched: {wanted}", file=sys.stderr)

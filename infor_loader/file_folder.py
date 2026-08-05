@@ -55,6 +55,13 @@ ON_EXISTS = frozenset({"replace", "skip", "fail"})
 # it. A registry key, resolved against `folders`.
 DEFAULT_DOWNLOAD_FROM = "downloads"
 
+# Inputs (and loaders) carrying this tag are ON-DEMAND: excluded from the
+# unfiltered daily selection -- `move-files` with no --input/--tag here, and the
+# loader `--all` batch in cli.py -- but still selectable explicitly by key or tag.
+# For an input this keeps a manual export from being relocated out of Downloads
+# before its on-demand loader runs (the loader's own download gate stages it).
+ON_DEMAND_TAG = "on-demand"
+
 
 @dataclass(frozen=True)
 class DownloadSpec:
@@ -212,10 +219,17 @@ def select_inputs(
     """Downloadable inputs matching the filters, in registry (file) order.
 
     A ``names`` entry that is a known input but not downloadable (a fixture) is
-    an error -- selecting a fixture to "move" is a mistake worth surfacing."""
+    an error -- selecting a fixture to "move" is a mistake worth surfacing.
+
+    Unfiltered (no ``names`` and no ``tags``) is the daily dispatch: on-demand
+    inputs (tagged :data:`ON_DEMAND_TAG`) are skipped so a manual export is not
+    pulled out of Downloads before its on-demand loader runs. An explicit
+    ``--input <key>`` or ``--tag on-demand`` still selects them."""
     names = names or []
     tags = tags or []
     selected = registry.downloadable()
+    if not names and not tags:
+        return [item for item in selected if ON_DEMAND_TAG not in item.tags]
     if names:
         wanted = set(names)
         unknown = wanted - set(registry.inputs)
