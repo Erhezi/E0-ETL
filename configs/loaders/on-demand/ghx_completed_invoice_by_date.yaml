@@ -59,9 +59,11 @@ destinations:
       table: completed_invoice_by_date_stg
     prod:
       table: COMPLETED_INVOICE_BY_DATE
-      # Proc assumed to live in the des2 schema (ghx); adjust if it is elsewhere.
+      # VERIFIED 2026-08-05: ghx.UpdateCompletedInvoiceByDate exists on des2 and does
+      # the declared pk_delete_insert (DELETE prod rows matching staging on CatalystID,
+      # then INSERT all staging rows). No 'sp_' prefix -- matches des1's naming.
       post_sql:
-        - EXEC [ghx].[sp_UpdateCompletedInvoiceByDate]
+        - EXEC [ghx].[UpdateCompletedInvoiceByDate]
 
 health_table:
   server: 'YNBBSTVWP02\PROCDATASRVPROD'
@@ -100,18 +102,27 @@ stg_load:
 prd_load:
   strategy: pk_delete_insert
 
-# Delta-overlap guard: skip. This loader is ON-DEMAND and run sporadically, so the
-# "Completed Invoices by Date" export windows are NOT guaranteed to be contiguous
-# between runs (e.g. a Jul-Aug window may follow a Jan-Apr one). Enforcing overlap
-# would wrongly block those legitimate non-adjacent loads; prod accumulates by
-# CatalystID (pk_delete_insert) and tolerates the gaps by design.
+# Delta-overlap guard on Completed Date: keep the accumulated history continuous.
+# Each "Completed Invoices by Date" export is a window keyed on Completed Date, so
+# assert the incoming window overlaps what is already stored -- no completed
+# invoices fall through a gap between runs:
+#   pass  <=>  MIN(source[Completed Date])  <=  MAX(prod[CompletedDatetime])
+# mode: enforce = fail the destination on a gap | warn = log and continue | skip = do not run.
+# enforce here: this run must extend a continuous history, so a window that starts
+# AFTER prod's newest Completed Date (a hole) aborts the destination BEFORE the
+# truncate/insert -- load the in-between window first. Runs per destination against
+# that destination's own prod table, so both des1 and des2 are guarded. NOTE: this
+# reverses the loader's original "skip because on-demand windows may be
+# non-contiguous" stance; contiguous, in-order windows are now required. Switch to
+# warn if a legitimately non-adjacent window must be loaded (prod accumulates by
+# CatalystID via pk_delete_insert and tolerates the gap).
 validation:
   overlap_check:
-    mode: skip
-    source_column: null
-    db_column: null
-    baseline: prod                  # which already-in-DB table to read MAX from: prod | staging
-    skip_if_db_empty: true          # first-ever load has nothing to overlap -> skip instead of fail
+    mode: enforce
+    source_column: 'Completed Date'   # column in the prepared source frame (post-read, pre-mapping); typed datetime by the mapping
+    db_column: 'CompletedDatetime'    # its destination name, read from the baseline prod table
+    baseline: prod                    # which already-in-DB table to read MAX from: prod | staging
+    skip_if_db_empty: true            # first-ever load has nothing to overlap -> skip instead of fail
 
 # Registered in infor_loader/transforms.py. Blanks the PO Number when it exceeds
 # the destination's varchar(40) (an over-long value is a bad export artifact, not
