@@ -240,7 +240,7 @@ field_config:
     - [Project, Project, string, varchar(40), source]
     - [InventoryFD1, InventoryFD1, string, varchar(40), source]
     # Destination keeps the table's existing "Trasient" spelling.
-    - [TransientInventoryLocation, TrasientInventoryLocation, string, varchar(40), source]
+    - [TransientInventoryLocation, TrasientInventoryLocation, string, varchar(40), source] # a typo in destination table, but the loader keeps it to avoid breaking downstream code
     - [FD1, CostCenter, string, varchar(20), source]
     - [FD1Text, CostCenterText, string, varchar(255), source]
     - [FD3, BusinessArea, string, varchar(10), source]

@@ -159,7 +159,7 @@ field_config:
     - [ItemDescription, ItemDescription, string, varchar(max), source]
     - [UOM, UOM, string, varchar(10), source]
     - [BaseCost, BaseCost, float, money, source]
-    - [DerivedUOMConversion, DerivedUOMConversion, float, "numeric(19, 4)", source]
+    - [UOMConversion, DerivedUOMConversion, float, "numeric(19, 4)", source] #source file map changed, table column name retained for now so downstream process kept intact
     - [PerOrderMinimumQuantity, PerOrderMinimumQuantity, float, "numeric(18, 4)", source]
     - [Priority, Priority, int, int, source]
     - [ErrorsExist, ErrorsExist, string, varchar(10), source]
@@ -181,3 +181,7 @@ field_config:
     - [update stamp.actor, update stamp.actor, string, varchar(100), source]
     - [create stamp, create stamp, datetime, datetime, source]
     - [update stamp, update stamp, datetime, datetime, source]
+
+  extra:
+    - Contract.update stamp
+    - HCPCS Code.HCPCS

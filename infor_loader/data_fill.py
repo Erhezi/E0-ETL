@@ -5,6 +5,10 @@ source destination's prod table and inserts them into the target destination's
 prod table. Unlike the file loaders, the input here is an existing prod table,
 not a CSV/Excel file -- it is meant for a one-time pre-population.
 
+For a DIRECT-load loader (e.g. the ``ppe_*`` reference tables) a destination has
+no separate prod table -- its single configured table IS the production table --
+so the effective table is ``prod or staging``, and the copy works the same way.
+
 Write mode is *insert only if empty*: the target prod table must have zero rows,
 otherwise the copy is skipped without writing. Pass ``--truncate`` to instead
 TRUNCATE the target prod table first and then fill it regardless of its current
@@ -98,13 +102,15 @@ def copy_prod_table(
 
     if source_dest.name == target_dest.name:
         raise ValueError(f"Source and target are the same destination ({source_dest.name!r}); nothing to copy.")
-    if source_dest.prod is None:
-        raise ValueError(f"Source destination {source_dest.name!r} has no prod table configured.")
-    if target_dest.prod is None:
-        raise ValueError(f"Target destination {target_dest.name!r} has no prod table configured.")
 
-    source_table = source_dest.prod
-    target_table = target_dest.prod
+    # Each destination's final (production) table. For a staged loader that is its
+    # `prod` table; for a DIRECT-load destination `prod` is None and the single
+    # configured table -- which IS the final production table -- lives in `staging`
+    # (see LoadDestination.is_direct). Mirror file_loader's `prod or staging` idiom
+    # so this tool pre-populates direct loaders (e.g. the ppe_* tables) too.
+    # `staging` is always present, so the effective table is never None.
+    source_table = source_dest.prod or source_dest.staging
+    target_table = target_dest.prod or target_dest.staging
 
     out(f"Loader: {config.name}")
     out(f"  FROM {source_dest.name}: {source_table.display_name(include_server=True)}")

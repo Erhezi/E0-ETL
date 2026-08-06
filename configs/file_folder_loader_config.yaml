@@ -34,6 +34,10 @@ folders:
   # Landing folder for the Baxter emergency item-audit export (ItemAudit_BaxterItem_All).
   # A des1-only PRIME concern, kept in its own folder like the notebook did.
   baxter_emergency: 'C:\Users\dli2\OneDrive - Montefiore Medicine\Documents\INFOR_SC\BaxterEmergency'
+  # Home of the hand-maintained PPE master workbook (ppe_master input below). It is
+  # a FIXTURE, not a download: it stays here and a human edits it in place, so it
+  # gets its own folder rather than the download-driven temp_export / misc_mdm.
+  custom_made: 'C:\Users\dli2\OneDrive - Montefiore Medicine\Documents\INFOR_SC\CustomMade'
 
 # Fallbacks every input's `download` block inherits unless it overrides them.
 download_defaults:
@@ -355,3 +359,20 @@ inputs:
       patterns:
         - 'Completed Invoices by Date.xlsx'
         - 'Completed Invoices by Date (*).xlsx'
+
+  # ==== on-demand PPE master workbook (FIXTURE) : custom_made ===============
+  # One hand-maintained Excel workbook feeds all four on-demand PPE loaders
+  # (ppe_category / ppe_item / ppe_parloc / ppe_facility), each reading its own
+  # sheet. It is a FIXTURE, not a download: it lives in custom_made and a human
+  # edits it in place. Before an update, the human bumps the timestamp suffix on
+  # the file name (e.g. PPE_MASTER_FILE_PREP_02060624.xlsx -> ..._<newstamp>.xlsx),
+  # so `name` is a GLOB rather than a fixed name -- SourceFile.resolve() matches it
+  # regardless of the current suffix (each loader sets pick_latest: true so the
+  # newest match wins if more than one is ever present). No `download` block (so
+  # move-files never relocates it) and the loaders set archive.enabled: false (the
+  # workbook is the fixture of record and stays put -- see the four ppe_* loaders).
+  # 'on-demand' keeps it out of the daily dispatch/--check for good measure.
+  ppe_master:
+    folder: custom_made
+    name: 'PPE_MASTER_FILE_PREP_*.xlsx'
+    tags: [on-demand, ppe]

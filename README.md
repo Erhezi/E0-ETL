@@ -324,6 +324,12 @@ the **target** destination's prod table, copying only the target's insertable
 the first destination in the YAML and the target is the second; override with
 `--from`/`--to`.
 
+This works for **direct-load** loaders too (e.g. the `ppe_*` reference tables):
+a direct-load destination has no separate prod table — its single configured
+table *is* the production table — so the tool uses that table (`prod or staging`)
+on each side. `python -B data_fill_helper.py --loader ppe_category` copies the
+des1 PPE table into the des2 PPE table.
+
 **Write modes:**
 
 - *Default (insert only if empty)* — the target prod table must have **zero
