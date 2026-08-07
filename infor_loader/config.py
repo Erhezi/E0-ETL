@@ -121,6 +121,12 @@ class LoadDestination:
     name: str
     staging: TableRef
     prod: TableRef | None = None
+    # Auxiliary staging tables on THIS destination, keyed by the loader-level
+    # aux_stagings entry's `name` (see AuxStaging). Declared per destination -- next
+    # to `staging` under `staging.aux` -- so every staging table this destination
+    # uses is listed in one place and the prod ETLHealth row can name them. Same
+    # server/database/schema as `staging`.
+    aux_staging: dict[str, TableRef] = field(default_factory=dict)
     # Statements run on the *staging* connection after the staging load.
     post_sql: tuple[str, ...] = ()
     # Statements (e.g. EXEC promotion procs) run on the *prod* connection after
@@ -147,6 +153,29 @@ class LoadDestination:
         if staging_value is None:
             raise ValueError(f"Destination {index + 1} must define staging/staging_table/table.")
 
+        # Additional staging tables listed under `staging.aux` (name -> table). They
+        # inherit the staging block's own server/db/schema (which fall back to the
+        # destination base), so build them from the staging block, not the raw base.
+        aux_staging: dict[str, TableRef] = {}
+        if isinstance(staging_value, dict):
+            staging_value = dict(staging_value)
+            aux_raw = staging_value.pop("aux", None)
+            staging_base = {
+                key: staging_value.get(key, base.get(key))
+                for key in ["server", "database", "schema"]
+                if staging_value.get(key) is not None or base.get(key) is not None
+            }
+            if aux_raw is not None:
+                if not isinstance(aux_raw, dict):
+                    raise ValueError(
+                        f"Destination {index + 1} staging.aux must be a mapping of "
+                        f"name -> table; got {type(aux_raw).__name__}."
+                    )
+                aux_staging = {
+                    str(aux_name): _table_ref_from_value(table_value, staging_base)
+                    for aux_name, table_value in aux_raw.items()
+                }
+
         prod_value = data.get("prod") or data.get("production") or data.get("prod_table") or data.get("target_table")
         prod_post_sql: tuple[str, ...] = ()
         if isinstance(prod_value, dict):
@@ -155,6 +184,7 @@ class LoadDestination:
             name=str(data.get("name") or data.get("alias") or f"destination_{index + 1}"),
             staging=_table_ref_from_value(staging_value, base),
             prod=_table_ref_from_value(prod_value, base) if prod_value is not None else None,
+            aux_staging=aux_staging,
             post_sql=tuple(data.get("post_sql") or ()),
             prod_post_sql=prod_post_sql,
             enabled=bool(data.get("enabled", True)),
@@ -170,10 +200,16 @@ class LoadDestination:
 
     def display_name(self, include_server: bool = False) -> str:
         staging_name = self.staging.display_name(include_server=include_server)
+        aux_suffix = ""
+        if self.aux_staging:
+            aux_names = ", ".join(
+                ref.display_name(include_server=include_server) for ref in self.aux_staging.values()
+            )
+            aux_suffix = f" (+aux staging: {aux_names})"
         if self.prod is None:
-            return f"{self.name}: direct={staging_name}"
+            return f"{self.name}: direct={staging_name}{aux_suffix}"
         prod_name = self.prod.display_name(include_server=include_server)
-        return f"{self.name}: staging={staging_name}, prod={prod_name}"
+        return f"{self.name}: staging={staging_name}{aux_suffix}, prod={prod_name}"
 
 
 def _table_ref_from_value(value: Any, defaults: dict[str, Any]) -> TableRef:
@@ -275,6 +311,64 @@ class OverlapCheck:
         )
 
 
+@dataclass(frozen=True)
+class AuxStaging:
+    """A secondary source file loaded into its own staging table, in ADDITION to
+    the primary file's staging load, on EACH enabled destination's connection.
+
+    This is distinct from the extra source files a transform consumes (e.g.
+    poline's company_map/fd3/fd5): those merge into the primary frame and never
+    land in a table. An aux staging is prepared on its own -- type conversions +
+    source->destination mapping + normalize -- and truncate/inserted into its
+    per-destination table AFTER the primary staging load and BEFORE the prod
+    promotion. It exists so a destination's prod.post_sql (e.g. the requisition
+    PO-source merge) can read a purpose-built feed not carried by the main export.
+
+    The staging TABLE is declared per destination (``staging.aux: {name: table}``),
+    keyed by ``name`` here, so every staging table a destination uses is listed
+    together in its own block. This entry carries only the loader-wide bits shared
+    across destinations: which source file feeds it (``source_alias``) and the
+    mapping/type rules (mirroring the loader-level ``field_config``, applied by
+    FileLoader._prepare_aux_frames exactly as the primary pipeline applies its own).
+    """
+
+    name: str
+    source_alias: str
+    column_mapping: list[dict[str, Any]] = field(default_factory=list)
+    type_changes: dict[str, list[str]] = field(default_factory=dict)
+    datetime_to_date_columns: list[str] = field(default_factory=list)
+    pk_check: list[str] = field(default_factory=list)
+    date_format: str | None = None
+    datetime_format: str | None = None
+    rename_columns: dict[str, str] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "AuxStaging":
+        source_alias = data.get("source_alias") or data.get("source")
+        if not source_alias:
+            raise ValueError("aux_stagings entry requires 'source' (a source-file alias).")
+        # `name` keys this entry to its per-destination staging.aux table; it
+        # defaults to the source alias, which is the natural identifier.
+        name = data.get("name") or source_alias
+        raw_types = data.get("type_changes") or {}
+        return cls(
+            name=str(name),
+            source_alias=str(source_alias),
+            column_mapping=list(data.get("column_mapping") or []),
+            type_changes={
+                "date": list(raw_types.get("date", [])),
+                "datetime": list(raw_types.get("datetime", [])),
+                "float": list(raw_types.get("float", [])),
+                "int": list(raw_types.get("int", [])),
+            },
+            datetime_to_date_columns=list(data.get("datetime_to_date_columns") or []),
+            pk_check=list(data.get("pk_check") or []),
+            date_format=data.get("date_format"),
+            datetime_format=data.get("datetime_format"),
+            rename_columns=dict(data.get("rename_columns") or {}),
+        )
+
+
 @dataclass
 class LoaderConfig:
     name: str
@@ -312,6 +406,9 @@ class LoaderConfig:
     # into duplicate keys. See mdm_vendor_item.
     preserve_whitespace_columns: list[str] = field(default_factory=list)
     overlap_check: OverlapCheck | None = None
+    # Secondary files loaded into their own staging tables on each destination,
+    # before prod promotion (see AuxStaging). Empty for the usual single-file loader.
+    aux_stagings: list[AuxStaging] = field(default_factory=list)
     enabled: bool = True
     tags: list[str] = field(default_factory=list)
 
@@ -337,6 +434,19 @@ class LoaderConfig:
         overlap_check = OverlapCheck.from_dict(dict(overlap_raw)) if overlap_raw else None
         name = data["name"]
         archive_dir = _archive_dir_from(data.get("archive"))
+        aux_stagings = [AuxStaging.from_dict(dict(item)) for item in data.get("aux_stagings", [])]
+        # Every enabled destination must declare a table for every aux staging under
+        # its own `staging.aux`, so all of a destination's staging tables live in one
+        # block and the prod ETLHealth row can name them. A missing declaration would
+        # also mean a prod.post_sql that reads the aux table has nothing loaded.
+        for destination in enabled_destinations:
+            missing = [aux.name for aux in aux_stagings if aux.name not in destination.aux_staging]
+            if missing:
+                raise ValueError(
+                    f"{name}: destination {destination.name!r} must declare a staging table for "
+                    f"aux staging(s) {missing} under staging.aux; every enabled destination has to "
+                    f"list all aux staging tables."
+                )
         return cls(
             name=name,
             process_name=data.get("process_name", data["name"]),
@@ -370,6 +480,7 @@ class LoaderConfig:
             fail_on_pk_duplicates=bool(data.get("fail_on_pk_duplicates", True)),
             preserve_whitespace_columns=[str(column) for column in (data.get("preserve_whitespace_columns") or [])],
             overlap_check=overlap_check,
+            aux_stagings=aux_stagings,
             enabled=bool(data.get("enabled", True)),
             tags=list(data.get("tags", [])),
         )

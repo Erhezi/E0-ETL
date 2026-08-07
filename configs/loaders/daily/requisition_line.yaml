@@ -7,10 +7,21 @@ process:
   frequency: Workdays
 
 source:
-  multiple_input_files: false
+  multiple_input_files: true
   files:
     - alias: main
       input: requisition_line   # path + filename: see configs\file_folder_loader_config.yaml
+      reader: csv
+      options:
+        dtype: str
+    # Second daily export: the PO-refresh feed. NOT merged into the main frame --
+    # it is loaded on its own into the requisition_line_po_update_stg aux staging
+    # table (see aux_stagings below), which the Step-2 PO-source merge reads. Both
+    # files must arrive for a run: the download gate requires a fresh copy of every
+    # downloadable input, so a day with only one of the two exports skips (FILE_NOT_FOUND)
+    # rather than promoting a half-updated set.
+    - alias: po_update
+      input: requisition_line_po_update
       reader: csv
       options:
         dtype: str
@@ -28,19 +39,32 @@ destinations:
     schema: 'DM_MONTYNT\dli2'
     staging:
       table: requisition_line_stg
+      # Every staging table this destination uses, in one place. `aux` maps each
+      # loader-level aux_stagings entry (by name) to its table on THIS destination;
+      # same server/database/schema as `table`. Step 2's merge reads po_update.
+      aux:
+        po_update: requisition_line_po_update_stg
     prod:
       table: REQUISITION_LINE
       # Two-step promotion (statements run in list order, one prod transaction):
       #   1. UpdateRequisitionLine        -- pk_delete_insert_on_header (existing).
       #   2. MergeRequisitionLinePOSource -- pk_merge of the PO-sourced fields onto
-      #      rows whose PO changed after the requisition. See the prd_load note below.
+      #      rows whose PO changed after the requisition. Reads the aux staging table
+      #      requisition_line_po_update_stg (the PO-refresh feed loaded from
+      #      ReqLine_POUpdate.csv; see aux_stagings + the prd_load note below), NOT
+      #      requisition_line_stg. The aux table is loaded before this runs.
       post_sql:
         - EXEC [DM_MONTYNT\dli2].[UpdateRequisitionLine]
         - EXEC [DM_MONTYNT\dli2].[MergeRequisitionLinePOSource]
+        # Step 3 (des1 only) -- refresh a downstream table another app reads off this
+        # one. Runs after Steps 1-2 so it sees the fully promoted REQUISITION_LINE.
+        # Not on des2: only this destination feeds that consumer.
+        - EXEC [dbo].[e2eCO_P6_update_INFOR_REQUISITION_PO_LINE_UNRELEASED]
 
   # infor-side landing (mirrors the other loaders). Requires these objects on the
-  # infor schema: requisition_line_stg, REQUISITION_LINE, sp_UpdateRequisitionLine,
-  # and sp_MergeRequisitionLinePOSource (the step-2 PO-source merge).
+  # infor schema: requisition_line_stg, requisition_line_po_update_stg,
+  # REQUISITION_LINE, sp_UpdateRequisitionLine, and sp_MergeRequisitionLinePOSource
+  # (the step-2 PO-source merge, which reads requisition_line_po_update_stg).
   - name: des2
     enabled: true
     server: YNBBSTVWP02\PROCDATASRVPROD
@@ -48,9 +72,14 @@ destinations:
     schema: infor
     staging:
       table: requisition_line_stg
+      # Same aux staging table on the infor side (name -> table); Step 2's merge
+      # reads it. Same server/database/schema as `table`.
+      aux:
+        po_update: requisition_line_po_update_stg
     prod:
       table: REQUISITION_LINE
-      # Two-step promotion, same as des1 (see the prd_load note below).
+      # Two-step promotion, same as des1: Step 2 reads the aux staging table
+      # requisition_line_po_update_stg (see aux_stagings + the prd_load note below).
       post_sql:
         - EXEC [infor].[sp_UpdateRequisitionLine]
         - EXEC [infor].[sp_MergeRequisitionLinePOSource]
@@ -99,12 +128,18 @@ stg_load:
 #   it, and ADD new columns only at the END of BOTH tables. The two stamp columns are
 #   appended last for exactly this reason, so SELECT * keeps aligning after the ALTER.
 #
-# Step 2 -- pk_merge of the PO-sourced fields (new proc MergeRequisitionLinePOSource):
-#   For staging rows where [PO.update stamp] > [Requisition.update stamp] (the sourced
-#   PO changed AFTER the requisition, so its own update stamp never advanced), UPDATE
-#   only the PO-sourced columns (PO, PurchaseOrderLine, PODate, [PO.update stamp]) onto
-#   the matching prod row, joined on the line PK (Company, Requisition, RequisitionLine).
-#   No delete -- the rest of the row, and lines not in the file, are left intact.
+# Step 2 -- pk_merge of the PO-sourced fields (proc MergeRequisitionLinePOSource):
+#   Reads the AUX staging table requisition_line_po_update_stg (the PO-refresh feed
+#   loaded from ReqLine_POUpdate.csv; see aux_stagings below), NOT requisition_line_stg.
+#   That feed carries lines whose sourced PO changed even when the requisition itself
+#   did not -- so those lines are absent from the main ReqLine export and could never
+#   be caught by reading requisition_line_stg. For its rows where
+#   [PO.update stamp] > [Requisition.update stamp] (the sourced PO changed AFTER the
+#   requisition), UPDATE only the PO-sourced columns (PO, PurchaseOrderLine, PODate,
+#   [PO.update stamp]) onto the matching prod row, joined on the line PK
+#   (Company, Requisition, RequisitionLine). No delete -- the rest of the row, and
+#   lines not in the feed, are left intact. The aux table is loaded (truncate/insert)
+#   before this Step-2 EXEC runs (see file_loader._load_destination).
 #
 # DECLARATIVE: the loader does not generate SQL from this spec; it dispatches the
 # prod.post_sql EXECs. strategy/header_key/merge_step record intent for the reader
@@ -114,9 +149,42 @@ prd_load:
   header_key: [Company, Requisition]
   merge_step:
     proc_suffix: MergeRequisitionLinePOSource
+    source_table: requisition_line_po_update_stg   # aux feed the merge reads (see aux_stagings)
     match_key: [Company, Requisition, RequisitionLine]
     update_columns: [PO, PurchaseOrderLine, PODate, 'PO.update stamp']
     where: '[PO.update stamp] > [Requisition.update stamp]'
+
+# Auxiliary staging: the second source file (alias `po_update`, ReqLine_POUpdate.csv)
+# is loaded on its OWN into the per-destination table declared under each
+# destination's staging.aux (requisition_line_po_update_stg on both), inheriting that
+# destination's server/database/schema. Loaded after the primary staging load and
+# BEFORE prod promotion, so Step 2's merge reads a freshly-populated feed. This is a
+# separate table load, not a transform merge into the main frame. `name` binds this
+# entry to the staging.aux key on each destination; the mapping is the po_update
+# file's own 10 columns -- keep it 1:1 with the columns of requisition_line_po_update_stg
+# (see the create-table SQL in sql/requisition_line/). Row format matches
+# field_config.mapping: [source_or_computed, destination, type, destination_datatype, origin]
+aux_stagings:
+  - name: po_update
+    source: po_update
+    field_config:
+      date_format: '%m/%d/%Y'
+      datetime_format: '%m/%d/%Y %I:%M:%S %p'
+      # One row per requisition line in the feed; a dup here means the export shipped
+      # a duplicate line (same app-side pk_check as the main file).
+      pk_check: [Company, Requisition, RequisitionLine]
+      mapping:
+        - [Company, Company, string, varchar(10), source]
+        - [Requisition, Requisition, string, varchar(20), source]
+        - [RequisitionLine, RequisitionLine, string, varchar(10), source]
+        - [last PurchaseOrderLineSourcesRel.PurchaseOrder, PO, string, varchar(20), source]
+        - [last PurchaseOrderLineSourcesRel.PurchaseOrderLine, PurchaseOrderLine, string, varchar(5), source]
+        - [last PurchaseOrderLineSourcesRel.PurchaseOrderLine.PurchaseOrder.PurchaseOrderDate, PODate, date, date, source]
+        - [create stamp, create stamp, datetime, datetime, source]
+        - [update stamp, update stamp, datetime, datetime, source]
+        # Drives the Step-2 guard [PO.update stamp] > [Requisition.update stamp].
+        - [Requisition.update stamp, Requisition.update stamp, datetime, datetime, source]
+        - [PurchaseOrderLineSourcesRel.PurchaseOrder.update stamp, PO.update stamp, datetime, datetime, source]
 
 # Delta-overlap guard on the requisition header's update stamp. Asserts the
 # incoming file overlaps what is already stored:

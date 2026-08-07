@@ -375,6 +375,16 @@ def _normalize_yaml_config(data: dict[str, Any], registry: InputRegistry | None 
             "datetime_format": field_config.get("datetime_format"),
         }
 
+    # Aux staging blocks: each names a source-file alias + a staging table and
+    # carries its OWN field_config (mapping/pk/date formats), normalized exactly
+    # like the loader-level field_config above so the run-time prep applies the
+    # same rules. Kept as a separate list so the primary pipeline is untouched.
+    if raw.get("aux_stagings"):
+        raw["aux_stagings"] = [
+            _normalize_aux_staging(dict(entry), index=index)
+            for index, entry in enumerate(raw["aux_stagings"])
+        ]
+
     process = raw.get("process")
     if isinstance(process, dict):
         if process.get("name") is not None:
@@ -454,6 +464,58 @@ def _source_column_names(items: list[Any]) -> list[str]:
         else:
             names.append(str(item))
     return names
+
+
+def _normalize_aux_staging(entry: dict[str, Any], *, index: int) -> dict[str, Any]:
+    """Normalize one ``aux_stagings`` YAML entry into the shape AuxStaging.from_dict
+    expects: an identity ``name``, a source alias, and a resolved mapping/type bundle
+    derived from the entry's own ``field_config`` (same 5-tuple mapping rows and
+    type-inference rules as the loader-level field_config). The staging TABLE is NOT
+    here -- each destination declares it under ``staging.aux: {name: table}`` -- so
+    ``name`` is what binds this entry to a destination's table."""
+    source_alias = entry.get("source") or entry.get("source_alias")
+    if not source_alias:
+        raise ValueError(f"aux_stagings[{index}] requires 'source' (a source-file alias).")
+    field_config = dict(entry.get("field_config") or {})
+    mapping = [_normalize_mapping_row(item) for item in list(field_config.get("mapping") or [])]
+    conversions = (
+        field_config.get("type_conversions")
+        or field_config.get("type_changes")
+        or _type_conversions_from_mapping(mapping)
+    )
+    return {
+        "name": entry.get("name") or source_alias,
+        "source_alias": source_alias,
+        "column_mapping": mapping,
+        "type_changes": {
+            "date": list(conversions.get("date", [])),
+            "datetime": list(conversions.get("datetime", [])),
+            "float": list(conversions.get("float", [])),
+            "int": list(conversions.get("int", [])),
+        },
+        "datetime_to_date_columns": _datetime_to_date_from_mapping(mapping),
+        "pk_check": field_config.get("pk_check") or [],
+        "date_format": field_config.get("date_format"),
+        "datetime_format": field_config.get("datetime_format"),
+        "rename_columns": field_config.get("rename_columns") or {},
+    }
+
+
+def _datetime_to_date_from_mapping(mapping: list[dict[str, Any]]) -> list[str]:
+    """Source columns typed ``datetime`` in a mapping but whose destination column
+    is ``date``: they carry a time-of-day in the file (so a strict date parse would
+    coerce them to the fallback) but must land as plain dates. Mirrors
+    LoaderConfig.datetime_to_date_columns for an aux mapping."""
+    columns: list[str] = []
+    for row in mapping:
+        if str(row.get("type") or "").strip().lower() != "datetime":
+            continue
+        if str(row.get("destination_type") or "").strip().lower() != "date":
+            continue
+        column = row.get("source") or row.get("destination")
+        if column:
+            columns.append(column)
+    return columns
 
 
 def _normalize_mapping_row(item: Any) -> dict[str, Any]:

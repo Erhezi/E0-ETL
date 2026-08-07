@@ -14,7 +14,7 @@ from typing import Any
 
 import pandas as pd
 
-from .config import LoadDestination, LoaderConfig, OverlapCheck, TableRef
+from .config import AuxStaging, LoadDestination, LoaderConfig, OverlapCheck, TableRef
 from .file_folder import InputFile, run_moves
 from .db import (
     connect_sql_server,
@@ -51,6 +51,10 @@ class StepResult:
     row_count: int | None
     error: str | None = None
     duration: int | None = None
+    # Extra staging tables to name alongside ``staging_table`` in the ETLHealth
+    # STGTableName column. Set on a prod step to list the auxiliary staging tables
+    # that also feed the promotion, so the PRD row shows every staging source.
+    extra_staging_tables: tuple[TableRef, ...] = ()
     # ETLHealth TargetTableType for this step's table. A normal staging step is
     # "STG"; a prod-promotion step is "PRD". A direct-load destination (no prod
     # table configured) types its single load step "PRD" too, because the table
@@ -120,6 +124,10 @@ class FileLoader:
                 # --prd-only promotes the already-loaded staging table, so the source
                 # file is neither moved nor read.
                 df: pd.DataFrame | None = None
+                # Prepared secondary-staging frames (source-named, type-converted),
+                # loaded into each destination before prod promotion. Empty unless the
+                # loader defines aux_stagings, and never populated for --prd-only.
+                aux_frames: list[tuple[AuxStaging, pd.DataFrame]] = []
 
                 # Download gate: unless --ignore-download, require a fresh export in
                 # Downloads for EVERY downloadable input before touching the DB. If any
@@ -144,12 +152,13 @@ class FileLoader:
                             move_files(self.config.pre_file_moves, logger)
                         dataframes, source_paths = self._read_sources(logger)
                         df, source_warning = self._prepare_dataframe(dataframes, logger)
+                        aux_frames = self._prepare_aux_frames(dataframes, logger)
 
                     for destination in self.config.destinations:
                         if not destination.enabled:
                             logger.info("Skipping destination %s (disabled in config)", destination.name)
                             continue
-                        destination_results.append(self._load_destination(destination, df, logger))
+                        destination_results.append(self._load_destination(destination, df, aux_frames, logger))
 
                     failures = [result for result in destination_results if result.status != "SUCCESS"]
                     if failures:
@@ -317,6 +326,7 @@ class FileLoader:
         self,
         destination: LoadDestination,
         df: pd.DataFrame | None,
+        aux_frames: list[tuple[AuxStaging, pd.DataFrame]],
         logger: logging.Logger,
     ) -> DestinationLoadResult:
         logger.info("Loading destination %s", destination.display_name(include_server=True))
@@ -324,6 +334,14 @@ class FileLoader:
         row_count: int | None = None
         # A direct destination's load step targets the final table, not a staging table.
         load_table_type = "PRD" if destination.is_direct else "STG"
+        # Aux staging tables this destination promotes from, in aux_stagings order.
+        # Named on the prod ETLHealth row's STGTableName alongside the primary
+        # staging table so the PRD row shows every staging source that feeds it.
+        aux_targets = tuple(
+            destination.aux_staging[aux.name]
+            for aux, _ in aux_frames
+            if aux.name in destination.aux_staging
+        )
 
         # Step 1: load the staging table (skipped for --prd-only, which promotes
         # the staging data already loaded by a prior run).
@@ -363,6 +381,7 @@ class FileLoader:
                             error="STAGING LOAD FAILED",
                             duration=0,
                             table_type="PRD",
+                            extra_staging_tables=aux_targets,
                         )
                     )
                 return DestinationLoadResult(destination, "FAILED", None, error, steps)
@@ -379,6 +398,69 @@ class FileLoader:
                     table_type=load_table_type,
                 )
             )
+
+            # Step 1b: load each auxiliary staging table (a secondary file feeding a
+            # purpose-built table this destination's prod.post_sql reads, e.g. the
+            # requisition PO-source merge). Runs on the destination connection AFTER
+            # the primary staging load and BEFORE prod promotion. A failure here is
+            # treated like a primary staging failure: the prod promotion must not run
+            # against a stale/empty aux table, so it is recorded FAILED and skipped.
+            for aux, aux_source_df in aux_frames:
+                # Resolved per destination from staging.aux (config guarantees every
+                # enabled destination declares a table for each aux staging).
+                aux_table = destination.aux_staging[aux.name]
+                aux_start = perf_counter()
+                try:
+                    aux_rows = self._load_aux_staging(aux, aux_table, aux_source_df, logger)
+                except Exception as exc:  # noqa: BLE001 - keep loading other destinations.
+                    error = f"{exc}\n{traceback.format_exc()}"
+                    logger.exception(
+                        "Destination %s aux staging load into %s failed", destination.name, aux_table.table
+                    )
+                    steps.append(
+                        StepResult(
+                            step="staging",
+                            target=aux_table,
+                            staging_table=aux_table,
+                            status="FAILED",
+                            row_count=None,
+                            error=error,
+                            duration=int(perf_counter() - aux_start),
+                            table_type="STG",
+                        )
+                    )
+                    if self.phase == "both" and destination.prod_post_sql:
+                        steps.append(
+                            StepResult(
+                                step="prod",
+                                target=destination.prod or destination.staging,
+                                staging_table=destination.staging,
+                                status="FAILED",
+                                row_count=None,
+                                error="STAGING LOAD FAILED",
+                                duration=0,
+                                table_type="PRD",
+                                extra_staging_tables=aux_targets,
+                            )
+                        )
+                    return DestinationLoadResult(destination, "FAILED", None, error, steps)
+
+                logger.info(
+                    "Loaded %s rows to aux staging %s",
+                    aux_rows,
+                    aux_table.display_name(include_server=True),
+                )
+                steps.append(
+                    StepResult(
+                        step="staging",
+                        target=aux_table,
+                        staging_table=aux_table,
+                        status="SUCCESS",
+                        row_count=aux_rows,
+                        duration=int(perf_counter() - aux_start),
+                        table_type="STG",
+                    )
+                )
 
         # Step 2: promote staging into prod via the configured prod statements
         # (skipped for --stg-only).
@@ -409,6 +491,7 @@ class FileLoader:
                         error=error,
                         duration=int(perf_counter() - prod_start),
                         table_type="PRD",
+                        extra_staging_tables=aux_targets,
                     )
                 )
                 return DestinationLoadResult(destination, "FAILED", row_count, error, steps)
@@ -423,6 +506,7 @@ class FileLoader:
                     row_count=row_count,
                     duration=int(perf_counter() - prod_start),
                     table_type="PRD",
+                    extra_staging_tables=aux_targets,
                 )
             )
 
@@ -444,39 +528,7 @@ class FileLoader:
             output_df, insert_columns = self._align_for_destination(cnxn, df, staging_table, logger)
             self._validate_pk(output_df, logger)
             if self.config.stg_load_strategy == "truncate_insert":
-                truncate_table(cnxn, staging_table)
-                expected_rows = len(output_df)
-                try:
-                    row_count = insert_dataframe(
-                        cnxn,
-                        staging_table,
-                        output_df,
-                        insert_columns,
-                        batch_size=self.config.batch_size,
-                    )
-                except Exception as exc:
-                    # The insert commits per batch, so an interrupted load leaves the
-                    # (already truncated) staging table holding only the earlier
-                    # batches. Surface that partial state explicitly in the error.
-                    committed = _committed_row_count(cnxn, staging_table)
-                    committed_text = "an unknown number of" if committed is None else str(committed)
-                    raise RuntimeError(
-                        f"PARTIAL STAGING LOAD: insert into "
-                        f"{staging_table.display_name(include_server=True)} stopped mid-load with "
-                        f"{committed_text} of {expected_rows} rows committed; the table was "
-                        f"truncated at the start of the run, so it is incomplete until the next "
-                        f"successful load."
-                    ) from exc
-                # Guard against a silent partial load: everything the insert reported
-                # must actually be in the table before post_sql or prod promotion runs.
-                landed_rows = count_rows(cnxn, staging_table)
-                if landed_rows != expected_rows:
-                    raise RuntimeError(
-                        f"PARTIAL STAGING LOAD: "
-                        f"{staging_table.display_name(include_server=True)} holds {landed_rows} "
-                        f"rows after the load but the prepared source has {expected_rows}; "
-                        f"failing so the incomplete staging data is not promoted."
-                    )
+                row_count = self._truncate_insert(cnxn, staging_table, output_df, insert_columns)
             else:
                 raise ValueError(f"Unsupported stg_load strategy: {self.config.stg_load_strategy}")
 
@@ -484,6 +536,98 @@ class FileLoader:
             if statements:
                 execute_statements(cnxn, statements)
             return row_count
+        finally:
+            cnxn.close()
+
+    def _truncate_insert(
+        self,
+        cnxn: Any,
+        table: TableRef,
+        output_df: pd.DataFrame,
+        insert_columns: list[str],
+    ) -> int:
+        """Truncate ``table`` and reload it from ``output_df``, with the partial-load
+        guardrails shared by the primary and auxiliary staging loads."""
+        truncate_table(cnxn, table)
+        expected_rows = len(output_df)
+        try:
+            row_count = insert_dataframe(
+                cnxn,
+                table,
+                output_df,
+                insert_columns,
+                batch_size=self.config.batch_size,
+            )
+        except Exception as exc:
+            # The insert commits per batch, so an interrupted load leaves the
+            # (already truncated) staging table holding only the earlier batches.
+            # Surface that partial state explicitly in the error.
+            committed = _committed_row_count(cnxn, table)
+            committed_text = "an unknown number of" if committed is None else str(committed)
+            raise RuntimeError(
+                f"PARTIAL STAGING LOAD: insert into "
+                f"{table.display_name(include_server=True)} stopped mid-load with "
+                f"{committed_text} of {expected_rows} rows committed; the table was "
+                f"truncated at the start of the run, so it is incomplete until the next "
+                f"successful load."
+            ) from exc
+        # Guard against a silent partial load: everything the insert reported must
+        # actually be in the table before post_sql or prod promotion runs.
+        landed_rows = count_rows(cnxn, table)
+        if landed_rows != expected_rows:
+            raise RuntimeError(
+                f"PARTIAL STAGING LOAD: "
+                f"{table.display_name(include_server=True)} holds {landed_rows} "
+                f"rows after the load but the prepared source has {expected_rows}; "
+                f"failing so the incomplete staging data is not promoted."
+            )
+        return row_count
+
+    def _prepare_aux_frames(
+        self, dataframes: dict[str, pd.DataFrame], logger: logging.Logger
+    ) -> list[tuple[AuxStaging, pd.DataFrame]]:
+        """Prepare each aux staging's frame from its source file: rename (if any),
+        type-convert, and normalize -- the same pre-mapping steps the primary
+        pipeline runs. The source->destination column mapping is applied later, per
+        destination, in ``_load_aux_staging`` (mirroring how the primary frame is
+        mapped at align time). One prepared frame is reused for every destination."""
+        frames: list[tuple[AuxStaging, pd.DataFrame]] = []
+        for aux in self.config.aux_stagings:
+            if aux.source_alias not in dataframes:
+                raise ValueError(
+                    f"{self.config.name} aux staging '{aux.name}' references source alias "
+                    f"{aux.source_alias!r} not found among source files: {sorted(dataframes)}"
+                )
+            logger.info("Preparing aux staging frame %r from source %r", aux.name, aux.source_alias)
+            frame = dataframes[aux.source_alias].copy()
+            if aux.rename_columns:
+                frame = frame.rename(columns=aux.rename_columns)
+            frame = apply_type_changes(
+                frame,
+                aux.type_changes,
+                date_format=aux.date_format,
+                datetime_format=aux.datetime_format,
+                datetime_to_date=aux.datetime_to_date_columns,
+            )
+            frame = normalize_for_db(frame, aux.type_changes)
+            frames.append((aux, frame))
+        return frames
+
+    def _load_aux_staging(
+        self,
+        aux: AuxStaging,
+        aux_table: TableRef,
+        source_df: pd.DataFrame,
+        logger: logging.Logger,
+    ) -> int:
+        """Map the prepared aux frame to its destination columns and truncate/insert
+        it into ``aux_table`` (this destination's copy of the aux staging table)."""
+        cnxn = connect_sql_server(aux_table.server, aux_table.database)
+        try:
+            output_df = self._apply_column_mapping(source_df, aux.column_mapping)
+            insert_columns = list(output_df.columns)
+            self._validate_pk(output_df, logger, pk_columns=aux.pk_check)
+            return self._truncate_insert(cnxn, aux_table, output_df, insert_columns)
         finally:
             cnxn.close()
 
@@ -547,8 +691,13 @@ class FileLoader:
 
         return source_warning
 
-    def _validate_pk(self, df: pd.DataFrame, logger: logging.Logger) -> None:
-        pk_columns = self.config.pk_check
+    def _validate_pk(
+        self,
+        df: pd.DataFrame,
+        logger: logging.Logger,
+        pk_columns: list[str] | None = None,
+    ) -> None:
+        pk_columns = self.config.pk_check if pk_columns is None else pk_columns
         if not pk_columns:
             return
         missing = [column for column in pk_columns if column not in df.columns]
@@ -714,9 +863,14 @@ class FileLoader:
         insert_columns = list(df.columns)
         return df, insert_columns
 
-    def _apply_column_mapping(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _apply_column_mapping(
+        self,
+        df: pd.DataFrame,
+        mapping: list[dict[str, Any]] | None = None,
+    ) -> pd.DataFrame:
+        mapping = self.config.column_mapping if mapping is None else mapping
         output = pd.DataFrame(index=df.index)
-        for item in self.config.column_mapping or []:
+        for item in mapping or []:
             destination = item.get("destination") or item.get("dest")
             if not destination:
                 continue
@@ -777,13 +931,12 @@ class FileLoader:
                         "RowCount": step.row_count,
                         "PackagePath": self.config.package_path,
                         "LogFilePath": log_file_path,
-                        # When the row's target *is* the staging table, there is no
-                        # separate staging table to reference.
-                        "STGTableName": (
-                            "Not Applicable"
-                            if step.target == step.staging_table
-                            else step.staging_table.qualified_name(include_database=True)
-                        ),
+                        # The staging table(s) this row's target was loaded from. When
+                        # the row's target *is* the staging table (a staging row), there
+                        # is no separate staging source -> "Not Applicable". A prod row
+                        # lists the primary staging table plus any aux staging tables
+                        # (extra_staging_tables) that also feed the promotion.
+                        "STGTableName": _stg_table_name(step),
                         "ProcessFrequency": self.config.process_frequency,
                         # Failed steps get a classified error; a successful step
                         # carries any non-fatal warnings (log fallback + source column).
@@ -931,6 +1084,18 @@ class FileLoader:
         for handler in list(logger.handlers):
             handler.close()
             logger.removeHandler(handler)
+
+
+def _stg_table_name(step: StepResult) -> str:
+    """ETLHealth STGTableName for a step. 'Not Applicable' when the row's target IS
+    its staging table (a staging-load row has no separate staging source); otherwise
+    the primary staging table plus any auxiliary staging tables that also fed the
+    promotion (extra_staging_tables), semicolon-joined -- so a PRD row shows every
+    staging table it was promoted from."""
+    if step.target == step.staging_table and not step.extra_staging_tables:
+        return "Not Applicable"
+    tables = [step.staging_table, *step.extra_staging_tables]
+    return "; ".join(table.qualified_name(include_database=True) for table in tables)
 
 
 def _committed_row_count(cnxn: Any, table: TableRef) -> int | None:

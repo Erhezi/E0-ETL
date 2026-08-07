@@ -153,7 +153,23 @@ inputs:
       patterns:
         - 'ReqLine.csv'
         - 'ReqLine (*).csv'
-        - 'ReqLine_*.csv' # used when we need to re-upload a few dated exports to fix a bad run
+        # Dated re-uploads used to fix a bad run (e.g. ReqLine_20260714.csv). The
+        # [0-9] guard keeps this from also swallowing ReqLine_POUpdate.csv, which is
+        # its own input below.
+        - 'ReqLine_[0-9]*.csv'
+
+  # Second daily requisition-line export: a PO-refresh feed (one row per line whose
+  # sourced PO changed, keyed on the PO update stamp). Loaded into the aux staging
+  # table requisition_line_po_update_stg, which the Step-2 PO-source merge reads.
+  # Same loader (requisition_line), so it shares temp_export.
+  requisition_line_po_update:
+    folder: temp_export
+    name: 'ReqLine_POUpdate.csv'
+    tags: [daily]
+    download:
+      patterns:
+        - 'ReqLine_POUpdate.csv'
+        - 'ReqLine_POUpdate (*).csv'
 
   # ---- purchaseorder_line mapping side files : misc_mdm -------------------
   # company_map is a FIXTURE (maintained in place, no download) -- it still
