@@ -10,4 +10,5 @@ mapping_templates/*.json
 .env
 .env.enc
 .env copy
+.env xxx
 *.ipynb

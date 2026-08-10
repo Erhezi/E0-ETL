@@ -403,6 +403,38 @@ summary).
    `python encrypt_env.py` produces `.env.enc` for moving the file between machines
    (`python decrypt_env.py` rebuilds `.env`).
 
+### Adding another app's secret
+
+Secret handling lives in [`infor_loader/env_secrets.py`](infor_loader/env_secrets.py)
+and is not Graph-specific — any `.env` key can be encrypted at rest. Declare the keys
+in the `SECRET_KEYS=` line inside `.env`, then encrypt them:
+
+```powershell
+# .env:  SECRET_KEYS=CLIENT_SECRET,CLIENT_SECRET_FUTURE,SFTP_PASSWORD
+python -m infor_loader.env_secrets status     # which declared keys are plaintext vs encrypted
+python -m infor_loader.env_secrets encrypt    # rewrite the plaintext ones as KEY_HASHED=enc::...
+python -m infor_loader.env_secrets encrypt --keys SFTP_PASSWORD   # one-off, ignores SECRET_KEYS
+```
+
+The key list is resolved as `--keys` → `E0_SECRET_KEYS` env var → the `SECRET_KEYS`
+line in `.env` → `DEFAULT_SECRET_KEYS` in the module. Encrypting is idempotent, so
+re-running it only touches newly added plaintext keys.
+
+Reading needs no list — `env_secrets.load_env(".env")` decrypts *every* `enc::` value
+in the file and exposes `KEY_HASHED` under `KEY`, so a new secret is available with no
+code change:
+
+```python
+from infor_loader.env_secrets import load_env
+
+secrets = load_env()          # {"CLIENT_SECRET": "...", "SFTP_PASSWORD": "...", ...}
+```
+
+`notify.load_secrets` is now a thin call into `load_env`, and
+[`infor_loader/msgraph.py`](infor_loader/msgraph.py) is unchanged — it still just takes
+a `secrets` dict. `python -m infor_loader.env_secrets pack` / `unpack` are the whole-file
+`.env` ⇄ `.env.enc` transport (what `encrypt_env.py` / `decrypt_env.py` call).
+
 Recipients live in `configs/email.yaml` under `notification`: `test_recipients`
 (used by `--mode test`, the default) and `recipients` (used by `--mode prd`). Keep
 the real distribution list empty until you are ready to send widely.

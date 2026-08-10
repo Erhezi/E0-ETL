@@ -1,14 +1,15 @@
 """AES-256-GCM secret encryption, ported from A13-MedlinePBO/src/secret_crypto.py.
 
+Low-level crypto only -- ``env_secrets`` holds the ``.env`` file semantics and CLI.
 Two mechanisms, both keyed off a scrypt-derived key:
 
 - Portable per-secret hashing (``enc::`` prefix): ``CLIENT_SECRET`` in ``.env`` is
   replaced by ``CLIENT_SECRET_HASHED=enc::...`` and decrypted at *runtime* by
-  ``notify.load_secrets`` using the passphrase from the ``E0_SECRET_PASSPHRASE``
+  ``env_secrets.load_env`` using the passphrase from the ``E0_SECRET_PASSPHRASE``
   environment variable. This is the unattended-friendly path: the plaintext secret
   never sits on disk, and Task Scheduler only needs the passphrase env var set.
-- Full-file transport (``encrypt_env.py``/``decrypt_env.py``) encrypts the whole
-  ``.env`` into ``.env.enc`` for moving between machines out-of-band.
+- Full-file transport (:func:`encrypt_bytes`/:func:`decrypt_bytes`) encrypts the
+  whole ``.env`` into ``.env.enc`` for moving between machines out-of-band.
 """
 
 import base64
@@ -29,6 +30,8 @@ SECRET_ENV_VARS = ("E0_SECRET_PASSPHRASE", "PBO_SECRET_PASSPHRASE")
 SECRET_ENV_VAR = SECRET_ENV_VARS[0]
 SALT_LEN = 16
 NONCE_LEN = 12
+# Whole-file (.env.enc) header marker. Layout: MAGIC | salt | nonce | ciphertext.
+FILE_MAGIC = b"ENV1"
 
 
 def _derive_key(passphrase: str, salt: bytes) -> bytes:
@@ -78,6 +81,31 @@ def decrypt_secret_value(value: str, passphrase: str | None = None) -> str:
     return plaintext.decode("utf-8")
 
 
+def encrypt_bytes(data: bytes, passphrase: str) -> bytes:
+    """Encrypt a whole file's bytes into the ``.env.enc`` transport format."""
+    salt = token_bytes(SALT_LEN)
+    nonce = token_bytes(NONCE_LEN)
+    key = _derive_key(passphrase, salt)
+    return FILE_MAGIC + salt + nonce + AESGCM(key).encrypt(nonce, data, None)
+
+
+def decrypt_bytes(blob: bytes, passphrase: str) -> bytes:
+    """Reverse :func:`encrypt_bytes`. Raises ``ValueError`` on a bad file or passphrase."""
+    header = 4 + SALT_LEN + NONCE_LEN
+    if len(blob) < header + 16:
+        raise ValueError("File too short or corrupted.")
+    if blob[:4] != FILE_MAGIC:
+        raise ValueError("Wrong file format (magic mismatch).")
+
+    salt = blob[4:4 + SALT_LEN]
+    nonce = blob[4 + SALT_LEN:header]
+    key = _derive_key(passphrase, salt)
+    try:
+        return AESGCM(key).decrypt(nonce, blob[header:], None)
+    except Exception as exc:  # noqa: BLE001 - InvalidTag means wrong passphrase.
+        raise ValueError("Decryption failed. Wrong passphrase or corrupted file.") from exc
+
+
 def encrypt_secret_env_lines(lines, secret_keys, passphrase: str | None = None):
     """Rewrite ``KEY=value`` lines whose key is in ``secret_keys`` to
     ``KEY_HASHED=enc::...``, preserving any trailing ``# comment``. Returns the new
@@ -96,6 +124,13 @@ def encrypt_secret_env_lines(lines, secret_keys, passphrase: str | None = None):
         key, _, raw_value = content.partition("=")
         normalized_key = key.strip()
 
+        # Keep an `export ` prefix on the rewritten line so shell-sourced .env files
+        # keep working.
+        export_prefix = ""
+        if normalized_key.startswith("export "):
+            export_prefix = "export "
+            normalized_key = normalized_key[len(export_prefix):].strip()
+
         if normalized_key not in secret_keys:
             updated_lines.append(line)
             continue
@@ -110,7 +145,7 @@ def encrypt_secret_env_lines(lines, secret_keys, passphrase: str | None = None):
         secret_value = value_text.strip().strip('"').strip("'")
         hashed_key = f"{normalized_key}_HASHED"
         hashed_value = encrypt_secret_value(secret_value, passphrase=passphrase)
-        updated_lines.append(f"{hashed_key}={hashed_value}{comment}{line_ending}")
+        updated_lines.append(f"{export_prefix}{hashed_key}={hashed_value}{comment}{line_ending}")
         updated_keys.append(normalized_key)
 
     return updated_lines, updated_keys

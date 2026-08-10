@@ -1,109 +1,71 @@
 #!/usr/bin/env python3
-"""Encrypt .env for transport, or hash its CLIENT_SECRET in place for runtime use.
+"""Encrypt .env for transport, or encrypt its declared secret keys in place.
 
-Two modes (ported from A13-MedlinePBO):
+Two modes (both implemented in infor_loader/env_secrets.py):
 - default: AES-256-GCM encrypt the whole .env into .env.enc (scrypt-derived key).
   Move .env.enc between machines and rebuild .env with decrypt_env.py.
-- --hash-secrets-only: replace CLIENT_SECRET (and CLIENT_SECRET_FUTURE) in .env with
-  portable CLIENT_SECRET_HASHED=enc:: values that notify.load_secrets decrypts at
-  runtime using the E0_SECRET_PASSPHRASE env var.
+- --hash-secrets-only: replace each declared secret key in .env with a portable
+  KEY_HASHED=enc:: value that env_secrets.load_env decrypts at runtime using the
+  E0_SECRET_PASSPHRASE env var.
+
+The declared keys come from --keys, then the E0_SECRET_KEYS environment variable,
+then a SECRET_KEYS= line in .env, then DEFAULT_SECRET_KEYS.
 """
 import argparse
-import getpass
-import os
 import sys
-from secrets import token_bytes
 
-from infor_loader.secret_crypto import SECRET_ENV_VAR, encrypt_secret_env_lines
-
-MAGIC = b"ENV1"  # file marker
-SALT_LEN = 16
-NONCE_LEN = 12
-
-
-def derive_key(passphrase: bytes, salt: bytes) -> bytes:
-    from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
-
-    kdf = Scrypt(salt=salt, length=32, n=2**14, r=8, p=1)
-    return kdf.derive(passphrase)
+from infor_loader.env_secrets import (
+    DEFAULT_ENC_PATH,
+    DEFAULT_ENV_PATH,
+    SECRET_KEYS_DECLARATION,
+    SECRET_KEYS_ENV_VAR,
+    main as env_secrets_main,
+)
 
 
 def main():
     ap = argparse.ArgumentParser(
         description="Encrypt a .env file with AES-256-GCM using scrypt key derivation."
     )
-    ap.add_argument("--in", dest="src", default=".env", help="Input file (default: .env)")
-    ap.add_argument("--out", dest="dst", default=".env.enc", help="Output file (default: .env.enc)")
+    ap.add_argument("--in", dest="src", default=DEFAULT_ENV_PATH, help="Input file (default: .env)")
+    ap.add_argument(
+        "--out", dest="dst", default=DEFAULT_ENC_PATH, help="Output file (default: .env.enc)"
+    )
     ap.add_argument(
         "--hash-secrets-only",
         action="store_true",
         help=(
-            "Replace CLIENT_SECRET and CLIENT_SECRET_FUTURE with portable encrypted "
-            "*_HASHED entries. Uses the passphrase from the E0_SECRET_PASSPHRASE "
-            "environment variable or prompts if it is not set."
+            "Replace the declared secret keys with portable encrypted *_HASHED "
+            "entries instead of encrypting the whole file. Uses the passphrase from "
+            "the E0_SECRET_PASSPHRASE environment variable, or prompts if unset."
+        ),
+    )
+    ap.add_argument(
+        "--keys",
+        default=None,
+        help=(
+            "Comma-separated keys to encrypt with --hash-secrets-only, overriding "
+            f"{SECRET_KEYS_ENV_VAR} and the {SECRET_KEYS_DECLARATION} line in .env."
         ),
     )
     args = ap.parse_args()
 
-    if not os.path.exists(args.src):
-        print(f"ERROR: input file not found: {args.src}", file=sys.stderr)
-        sys.exit(1)
-
     if args.hash_secrets_only:
-        passphrase = os.getenv(SECRET_ENV_VAR, "")
-        if not passphrase:
-            passphrase = getpass.getpass(
-                f"Enter passphrase for *_HASHED secrets ({SECRET_ENV_VAR}): "
-            )
-            passphrase2 = getpass.getpass("Re-enter passphrase: ")
-            if passphrase != passphrase2:
-                print("ERROR: passphrases do not match.", file=sys.stderr)
-                sys.exit(2)
+        argv = ["encrypt", "--env", args.src]
+        if args.keys:
+            argv += ["--keys", args.keys]
+        return env_secrets_main(argv)
 
-        with open(args.src, "r", encoding="utf-8-sig") as f:
-            lines = f.readlines()
-
-        updated_lines, updated_keys = encrypt_secret_env_lines(
-            lines,
-            secret_keys=("CLIENT_SECRET", "CLIENT_SECRET_FUTURE"),
-            passphrase=passphrase,
+    if args.keys:
+        print(
+            "ERROR: --keys only applies with --hash-secrets-only (whole-file mode "
+            "encrypts everything).",
+            file=sys.stderr,
         )
+        return 2
 
-        if not updated_keys:
-            print("No CLIENT_SECRET or CLIENT_SECRET_FUTURE entries were found to hash.")
-            return
-
-        with open(args.src, "w", encoding="utf-8") as f:
-            f.writelines(updated_lines)
-
-        print(f"Hashed secrets in-place -> {args.src}")
-        print(f"Set {SECRET_ENV_VAR} on every machine that will run this pipeline.")
-        for key in updated_keys:
-            print(f"Converted {key} -> {key}_HASHED")
-        return
-
-    pw = getpass.getpass("Enter passphrase: ").encode("utf-8")
-    pw2 = getpass.getpass("Re-enter passphrase: ").encode("utf-8")
-    if pw != pw2:
-        print("ERROR: passphrases do not match.", file=sys.stderr)
-        sys.exit(2)
-
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-
-    salt = token_bytes(SALT_LEN)
-    key = derive_key(pw, salt)
-    aes = AESGCM(key)
-    nonce = token_bytes(NONCE_LEN)
-
-    data = open(args.src, "rb").read()
-    ct = aes.encrypt(nonce, data, associated_data=None)
-
-    with open(args.dst, "wb") as f:
-        f.write(MAGIC + salt + nonce + ct)
-
-    print(f"Encrypted -> {args.dst}")
-    print("Share the passphrase out-of-band (phone/Teams).")
+    return env_secrets_main(["pack", "--in", args.src, "--out", args.dst])
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

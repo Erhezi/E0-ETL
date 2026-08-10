@@ -53,69 +53,16 @@ _STATUS_RANK = {_STATUS_FAILED: 0, _STATUS_SKIPPED: 1, _STATUS_SUCCESS: 2}
 # ── Secrets + config ────────────────────────────────────────────
 
 
-def _normalize_secret_value(value: str) -> str:
-    value = value.strip()
-    if not value:
-        return value
-    if value[0] in {'"', "'"}:
-        quote = value[0]
-        return value[1:-1] if value.endswith(quote) else value
-    comment_index = value.find(" #")
-    if comment_index != -1:
-        value = value[:comment_index]
-    return value.strip()
-
-
 def load_secrets(env_path: str = ".env") -> dict[str, str]:
     """Parse a ``.env`` file and decrypt any ``*_HASHED`` secret back to its plain key.
 
-    Mirrors A13-MedlinePBO's ``config_loader.load_secrets``: ``CLIENT_SECRET_HASHED``
-    (an ``enc::`` value) is decrypted with the ``E0_SECRET_PASSPHRASE`` passphrase and
-    exposed as ``CLIENT_SECRET``.
+    Kept as the notification-side entry point; :func:`infor_loader.env_secrets.load_env`
+    does the work and decrypts *every* ``enc::`` value in the file, so a secret added
+    for another app needs no change here.
     """
-    from .secret_crypto import decrypt_secret_value, get_secret_passphrase
+    from .env_secrets import load_env
 
-    if not os.path.exists(env_path):
-        raise FileNotFoundError(
-            f"{env_path} not found. Copy .env.example to .env (or run "
-            "'python decrypt_env.py' to produce it from .env.enc)."
-        )
-
-    secrets: dict[str, str] = {}
-    with open(env_path, "r", encoding="utf-8-sig") as handle:
-        for line in handle:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if line.startswith("export "):
-                line = line[7:].strip()
-            key, _, value = line.partition("=")
-            if not key:
-                continue
-            secrets[key.strip()] = _normalize_secret_value(value)
-
-    # Resolve the passphrase once (clear error if unset), then decrypt each hashed
-    # secret with it so a mismatch reports a helpful message instead of a bare
-    # InvalidTag from the crypto layer.
-    hashed_keys = [
-        key for key in ("CLIENT_SECRET", "CLIENT_SECRET_FUTURE")
-        if secrets.get(f"{key}_HASHED")
-    ]
-    passphrase = get_secret_passphrase(required=True) if hashed_keys else None
-    for secret_key in hashed_keys:
-        try:
-            secrets[secret_key] = decrypt_secret_value(
-                secrets[f"{secret_key}_HASHED"], passphrase=passphrase
-            )
-        except RuntimeError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - surface a readable passphrase-mismatch error.
-            raise RuntimeError(
-                f"Failed to decrypt {secret_key}_HASHED — wrong passphrase or corrupted "
-                f"value. Ensure E0_SECRET_PASSPHRASE (or PBO_SECRET_PASSPHRASE) matches the "
-                f"passphrase used to encrypt it."
-            ) from exc
-    return secrets
+    return load_env(env_path)
 
 
 def load_email_config(path: str = "configs/email.yaml") -> dict[str, Any]:
