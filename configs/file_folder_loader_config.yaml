@@ -56,6 +56,13 @@ download_defaults:
 # whichever matches is renamed to `name`. Do NOT shorten a pair to a prefix
 # glob like 'Item*.csv' -- it would also swallow ItemGTIN/ItemUOM/ItemReplenish.
 #
+# '+' in a download name (URL-encoded spaces from the saved-search export names):
+# the browser may render each '+' three ways -- a literal '+', a decoded space
+# ' ', or a re-encoded '%2B'. So a '+'-name uses FOUR patterns: each '+' position
+# is written as the class [+ ] (matches '+' OR ' '), plus a second pattern with
+# every '+' replaced by '%2B' -- each with its own ' (N)' re-download variant.
+# (`name` above stays the literal-'+' canonical form; only the match patterns vary.)
+#
 # The two groups below are ORGANIZATIONAL only (a human troubleshooting aid):
 # a direct-load problem -> go straight to the raw file; a staging->prod problem
 # -> check the _stg table first, then the raw file. No behavior hangs on it.
@@ -69,8 +76,10 @@ inputs:
     tags: [daily]
     download:
       patterns:
-        - 'ContractLineSimple_full+-+Export+To+CSV.csv'
-        - 'ContractLineSimple_full+-+Export+To+CSV (*).csv'
+        - 'ContractLineSimple_full[+ ]-[+ ]Export[+ ]To[+ ]CSV.csv'
+        - 'ContractLineSimple_full[+ ]-[+ ]Export[+ ]To[+ ]CSV (*).csv'
+        - 'ContractLineSimple_full%2B-%2BExport%2BTo%2BCSV.csv'
+        - 'ContractLineSimple_full%2B-%2BExport%2BTo%2BCSV (*).csv'
 
   inventory_location:
     folder: temp_export
@@ -87,8 +96,10 @@ inputs:
     tags: [daily]
     download:
       patterns:
-        - 'Inventory_Trx_and_Balance+-+Export+To+CS.csv'
-        - 'Inventory_Trx_and_Balance+-+Export+To+CS (*).csv'
+        - 'Inventory_Trx_and_Balance[+ ]-[+ ]Export[+ ]To[+ ]CS.csv'
+        - 'Inventory_Trx_and_Balance[+ ]-[+ ]Export[+ ]To[+ ]CS (*).csv'
+        - 'Inventory_Trx_and_Balance%2B-%2BExport%2BTo%2BCS.csv'
+        - 'Inventory_Trx_and_Balance%2B-%2BExport%2BTo%2BCS (*).csv'
 
   payablesinvoice_distribution:
     folder: temp_export
@@ -96,8 +107,10 @@ inputs:
     tags: [daily]
     download:
       patterns:
-        - 'GL+distribution+-+Export+To+CSV.csv'
-        - 'GL+distribution+-+Export+To+CSV (*).csv'
+        - 'GL[+ ]distribution[+ ]-[+ ]Export[+ ]To[+ ]CSV.csv'
+        - 'GL[+ ]distribution[+ ]-[+ ]Export[+ ]To[+ ]CSV (*).csv'
+        - 'GL%2Bdistribution%2B-%2BExport%2BTo%2BCSV.csv'
+        - 'GL%2Bdistribution%2B-%2BExport%2BTo%2BCSV (*).csv'
 
   payablesinvoice_header:
     folder: temp_export
@@ -105,8 +118,10 @@ inputs:
     tags: [daily]
     download:
       patterns:
-        - 'AP_invoices_backbone_DL+-+Export+To+CSV.csv'
-        - 'AP_invoices_backbone_DL+-+Export+To+CSV (*).csv'
+        - 'AP_invoices_backbone_DL[+ ]-[+ ]Export[+ ]To[+ ]CSV.csv'
+        - 'AP_invoices_backbone_DL[+ ]-[+ ]Export[+ ]To[+ ]CSV (*).csv'
+        - 'AP_invoices_backbone_DL%2B-%2BExport%2BTo%2BCSV.csv'
+        - 'AP_invoices_backbone_DL%2B-%2BExport%2BTo%2BCSV (*).csv'
 
   payablesinvoice_payment:
     folder: temp_export
@@ -133,8 +148,10 @@ inputs:
     tags: [daily]
     download:
       patterns:
-        - 'PurchaseOrderReceiptLine_DL+-+Export+To.csv'
-        - 'PurchaseOrderReceiptLine_DL+-+Export+To (*).csv'
+        - 'PurchaseOrderReceiptLine_DL[+ ]-[+ ]Export[+ ]To.csv'
+        - 'PurchaseOrderReceiptLine_DL[+ ]-[+ ]Export[+ ]To (*).csv'
+        - 'PurchaseOrderReceiptLine_DL%2B-%2BExport%2BTo.csv'
+        - 'PurchaseOrderReceiptLine_DL%2B-%2BExport%2BTo (*).csv'
 
   purchaseorder_revision_issue_method:
     folder: temp_export
@@ -239,8 +256,10 @@ inputs:
     tags: [daily, mdm]
     download:
       patterns:
-        - 'EDI+sub.csv'
-        - 'EDI+sub (*).csv'
+        - 'EDI[+ ]sub.csv'
+        - 'EDI[+ ]sub (*).csv'
+        - 'EDI%2Bsub.csv'
+        - 'EDI%2Bsub (*).csv'
 
   item:
     folder: misc_mdm
@@ -284,8 +303,10 @@ inputs:
     tags: [daily, mdm]
     download:
       patterns:
-        - 'Par+Items+DL.csv'
-        - 'Par+Items+DL (*).csv'
+        - 'Par[+ ]Items[+ ]DL.csv'
+        - 'Par[+ ]Items[+ ]DL (*).csv'
+        - 'Par%2BItems%2BDL.csv'
+        - 'Par%2BItems%2BDL (*).csv'
 
   manufacturer:
     folder: misc_mdm
@@ -302,8 +323,10 @@ inputs:
     tags: [daily, mdm]
     download:
       patterns:
-        - 'requesting+location.csv'
-        - 'requesting+location (*).csv'
+        - 'requesting[+ ]location.csv'
+        - 'requesting[+ ]location (*).csv'
+        - 'requesting%2Blocation.csv'
+        - 'requesting%2Blocation (*).csv'
 
   # Saved-search export literally named 'copy of requester' (the '+' are the
   # export's URL-encoded spaces); consumed by the requester loader.
@@ -313,8 +336,10 @@ inputs:
     tags: [daily, mdm]
     download:
       patterns:
-        - 'copy+of+requester.csv'
-        - 'copy+of+requester (*).csv'
+        - 'copy[+ ]of[+ ]requester.csv'
+        - 'copy[+ ]of[+ ]requester (*).csv'
+        - 'copy%2Bof%2Brequester.csv'
+        - 'copy%2Bof%2Brequester (*).csv'
 
   supplier:
     folder: misc_mdm

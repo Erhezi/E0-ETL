@@ -64,15 +64,23 @@ unattended/Task Scheduler runs):
 python -B run_daily_loaders.py --loader inventory_location --auto
 ```
 
-Run selected loaders in parallel once more YAML files are added:
+Run several loaders at once. The selector flags — `--loader`, `--tag`, and
+`move-files --input` — each take **multiple names**: space-separate them, or
+repeat the flag; both work and can be mixed.
 
 ```powershell
-python -B run_daily_loaders.py --loader inventory_location --loader other_loader --auto --max-workers 4
+# space-separated
+python -B run_daily_loaders.py --loader inventory_location item supplier --auto --max-workers 4
+# repeated flag (equivalent)
+python -B run_daily_loaders.py --loader inventory_location --loader item --loader supplier --auto --max-workers 4
+# by tag (e.g. the whole master-data batch)
+python -B run_daily_loaders.py --tag mdm --auto
 ```
 
 For Windows Task Scheduler, set the working directory to this folder and use the
 `--auto` form above (or the equivalent `python -B run_daily_loaders.py run ...`
-subcommand, which never prompts).
+subcommand, which never prompts — it also accepts `--auto` as a harmless no-op,
+so the same command line works with or without `run`).
 
 ### Running staging and prod separately
 
@@ -255,7 +263,7 @@ A failed step is logged `FAILED`; the full traceback goes to the per-run log fil
 
 | `Error` value | Meaning |
 | --- | --- |
-| `FILE NOT FOUND` | the source file could not be located |
+| `FILE NOT FOUND` | the source file could not be located; a multi-input loader names the missing input(s), e.g. `FILE NOT FOUND: expected file(s) fd3, fd5 missing` |
 | `COLUMN NOT FOUND` | an expected **loaded** source column is absent from the file |
 | `PK VIOLATION` | primary-key duplicate (SQL insert or the app-side `pk_check`) |
 | `UX VIOLATION` | unique key / unique index violation |
@@ -368,3 +376,67 @@ The bare config name also works in place of `--loader <name>`
 (e.g. `python -B data_fill_helper.py --inventory_location`). On completion it
 prints a status line, e.g. `COPIED  inventory_location  rows_truncated=120  rows_copied=120`;
 status is one of `COPIED`, `DRY_RUN`, `SKIPPED_NONEMPTY`, or `ABORTED`.
+
+## Daily email notification
+
+After the daily batch, `notify` reads today's **ETLHealth** rows for the daily
+loaders and emails a report via Microsoft Graph (service account
+`procurementdatateam@montefiore.org`): a one-line summary (all success, or `X/Y`
+failed), a per-target status table (Process / Status / DB Connection / Target Type
+/ Last Run / Error, with `des1`→**PRIME** and `des2`→**O2**), the log file(s)
+attached for any failure, and a consolidated copy‑pasteable rerun command for the
+failed/skipped loaders (loaders that share the same flags are batched into one
+`--loader a b c` invocation; `--prd-only` failures and full reruns each get their own line).
+Reading ETLHealth is **read-only** — it never writes to the database. When a loader
+ran more than once in the day, only its latest run is shown (and drives the
+summary).
+
+### One-time setup
+
+1. `pip install -r requirements.txt` (adds `requests`, `cryptography`).
+2. Copy `.env.example` to `.env` and fill in `TENANT_ID` / `CLIENT_ID` /
+   `CLIENT_SECRET` (same app registration as A13-MedlinePBO).
+3. `python first_time_setup.py` — saves the shared passphrase as the
+   `E0_SECRET_PASSPHRASE` user environment variable and rewrites `CLIENT_SECRET`
+   into an encrypted `CLIENT_SECRET_HASHED` line (decrypted at runtime). Open a new
+   terminal afterwards so the saved variable is loaded. Optionally
+   `python encrypt_env.py` produces `.env.enc` for moving the file between machines
+   (`python decrypt_env.py` rebuilds `.env`).
+
+Recipients live in `configs/email.yaml` under `notification`: `test_recipients`
+(used by `--mode test`, the default) and `recipients` (used by `--mode prd`). Keep
+the real distribution list empty until you are ready to send widely.
+
+### Commands
+
+```powershell
+# Read-only preview: build the report, write the HTML, send nothing.
+python -B run_daily_loaders.py notify --date 2026-08-07 --dry-run --save-html out.html
+
+# Send the report for a date to the test recipients.
+python -B run_daily_loaders.py notify --date 2026-08-07 --mode test
+
+# Send to a one-off recipient list (bypasses the config lists).
+python -B run_daily_loaders.py notify --to someone@montefiore.org
+
+# Send to the real distribution once configured.
+python -B run_daily_loaders.py notify --mode prd
+```
+
+`--date` defaults to today; `--email-config` (default `configs/email.yaml`) and
+`--env` (default `.env`) override the config/secret locations.
+
+### Send automatically after the daily run
+
+Add `--notify` to the batch to email the report when the run finishes. It is
+**best-effort**: a Graph/DB/config error is reported but never changes the run's
+exit code, so emailing can't fail an otherwise-successful load. `--notify-mode`
+(default `test`) picks the recipient set.
+
+```powershell
+python -B run_daily_loaders.py run --all --auto --notify
+python -B run_daily_loaders.py run --all --auto --notify --notify-mode prd
+```
+
+Alternatively, keep them fully decoupled and add a second Task Scheduler action
+that runs `notify` after the loader action.

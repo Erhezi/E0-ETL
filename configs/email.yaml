@@ -1,0 +1,35 @@
+# Configuration for the post-load daily email report (infor_loader/notify.py).
+# The Graph *secrets* (TENANT_ID / CLIENT_ID / CLIENT_SECRET) live in .env, NOT here.
+
+email:
+  # Microsoft Graph endpoints + the service account that sends the mail (same app
+  # registration as A13-MedlinePBO). from_email must be a mailbox the app can send as.
+  aad_endpoint: "https://login.microsoftonline.com"
+  graph_endpoint: "https://graph.microsoft.com"
+  from_email: "procurementdatateam@montefiore.org"
+
+# Where the daily run status is read from. Matches health_table in every daily
+# loader YAML (read-only SELECT; nothing is written here).
+health_table:
+  server: 'YNBBSTVWP02\PROCDATASRVPROD'
+  database: SCSFileIngestor
+  schema: InforLoader
+  table: ETLHealth
+
+# ETLHealth stores the server string in DBConnection; the report shows these
+# friendlier labels instead. des1 = PRIME, des2 = O2.
+db_labels:
+  MISCPrdAdhocDB: PRIME
+  'YNBBSTVWP02\PROCDATASRVPROD': O2
+
+notification:
+  report_name: "Infor Daily Loader Report"
+  subject_prefix: "Infor Daily Loader"
+  # Cap per-attachment size; a log larger than this is skipped with a note in the body.
+  max_attachment_mb: 20
+  # --mode test (default) sends here -- keep it to the developer while validating.
+  test_recipients:
+    - dli2@montefiore.org
+  # --mode prd sends here. Fill in the real distribution when ready.
+  recipients: []
+  cc: []

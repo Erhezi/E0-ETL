@@ -5,3 +5,8 @@ logs/
 sql/
 input_file_sample/
 mapping_templates/*.json
+# Graph secrets for the email report. .env.enc (encrypted transport) and
+# .env.example (template) stay tracked; the decrypted .env never is.
+.env
+.env.enc
+.env copy

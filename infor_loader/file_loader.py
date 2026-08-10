@@ -1126,7 +1126,7 @@ def classify_error(error_text: str | None) -> str | None:
     if text.strip() == "staging load failed":
         return "STAGING LOAD FAILED"
     if "filenotfounderror" in text or "no files matched" in text:
-        return "FILE NOT FOUND"
+        return _file_not_found_error(error_text)
     # An expected source column (that is actually loaded) is absent from the file.
     if "missing expected column" in text:
         return "COLUMN NOT FOUND"
@@ -1152,6 +1152,29 @@ def classify_error(error_text: str | None) -> str | None:
     if "partial staging load" in text:
         return "PARTIAL STAGING LOAD"
     return "See Log"
+
+
+def _file_not_found_error(error_text: str) -> str:
+    """``FILE NOT FOUND`` for the ETLHealth ``Error`` column, naming the specific
+    input file(s) when the download-gate message lists them.
+
+    The gate records ``... for input(s): fd3, fd5`` (see ``FileLoader.run``); a
+    multi-input loader like Purchase Order Line needs its report row to say *which*
+    file(s) were missing so the operator knows what to supply -- e.g.
+    ``FILE NOT FOUND: expected file(s) fd3, fd5 missing``. When no input list is
+    present (e.g. a bare FileNotFoundError from reading a source), fall back to the
+    plain code.
+    """
+    marker = "input(s):"
+    index = error_text.find(marker)
+    if index == -1:
+        return "FILE NOT FOUND"
+    # The gate message ends with the comma-separated input list; take the rest of
+    # that line so a trailing traceback (if any) is not swept in.
+    inputs = error_text[index + len(marker):].splitlines()[0].strip()
+    if not inputs:
+        return "FILE NOT FOUND"
+    return f"FILE NOT FOUND: expected file(s) {inputs} missing"
 
 
 def _truthy_indicator(value: Any) -> bool:

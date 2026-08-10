@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import importlib
 import importlib.util
 import json
@@ -41,8 +42,8 @@ def main(argv: list[str] | None = None) -> int:
 
     # Top-level run shortcut: `run_daily_loaders.py --loader <name>` prints a
     # summary and asks for confirmation before running; `--auto` skips the prompt.
-    parser.add_argument("--loader", action="append", default=[], help="Loader name to run. Can be repeated.")
-    parser.add_argument("--tag", action="append", default=[], help="Select loaders by tag. Can be repeated.")
+    parser.add_argument("--loader", action="extend", nargs="+", default=[], help="Loader name(s) to run. Space-separate several or repeat the flag.")
+    parser.add_argument("--tag", action="extend", nargs="+", default=[], help="Select loaders by tag. Space-separate several or repeat the flag.")
     parser.add_argument("--all", action="store_true", help="Run every daily loader (excludes on-demand loaders).")
     parser.add_argument("--auto", action="store_true", help="Skip the confirmation prompt and run immediately.")
     parser.add_argument(
@@ -59,16 +60,20 @@ def main(argv: list[str] | None = None) -> int:
         "source folder (no fresh download required). Use for backfills / reprocessing.",
     )
     _add_phase_flags(parser)
+    _add_notify_flags(parser)
 
     subparsers = parser.add_subparsers(dest="command", required=False)
 
     list_parser = subparsers.add_parser("list", help="List configured loaders.")
-    list_parser.add_argument("--tag", action="append", default=[])
+    list_parser.add_argument("--tag", action="extend", nargs="+", default=[])
 
     run_parser = subparsers.add_parser("run", help="Run configured loaders.")
-    run_parser.add_argument("--loader", action="append", default=[], help="Loader name to run. Can be repeated.")
-    run_parser.add_argument("--tag", action="append", default=[], help="Run loaders with tag. Can be repeated.")
+    run_parser.add_argument("--loader", action="extend", nargs="+", default=[], help="Loader name(s) to run. Space-separate several or repeat the flag.")
+    run_parser.add_argument("--tag", action="extend", nargs="+", default=[], help="Run loaders with tag. Space-separate several or repeat the flag.")
     run_parser.add_argument("--all", action="store_true", help="Run every daily loader (excludes on-demand loaders).")
+    # `run` never prompts, so --auto is a no-op here; accepted for symmetry with the
+    # top-level `--all --auto` form so the same command works with or without `run`.
+    run_parser.add_argument("--auto", action="store_true", help="No-op for `run` (it never prompts); accepted for symmetry.")
     run_parser.add_argument(
         "--max-workers",
         type=int,
@@ -83,6 +88,7 @@ def main(argv: list[str] | None = None) -> int:
         "source folder (no fresh download required). Use for backfills / reprocessing.",
     )
     _add_phase_flags(run_parser)
+    _add_notify_flags(run_parser)
 
     files_parser = subparsers.add_parser(
         "move-files",
@@ -93,9 +99,9 @@ def main(argv: list[str] | None = None) -> int:
         default=FILE_FOLDER_DEFAULT_CONFIG,
         help=f"File-folder registry YAML. Defaults to {FILE_FOLDER_DEFAULT_CONFIG}.",
     )
-    files_parser.add_argument("--input", action="append", default=[], dest="inputs",
-                              help="Input key to dispatch (e.g. item, poline). Can be repeated.")
-    files_parser.add_argument("--tag", action="append", default=[], help="Select inputs by tag. Can be repeated.")
+    files_parser.add_argument("--input", action="extend", nargs="+", default=[], dest="inputs",
+                              help="Input key(s) to dispatch (e.g. item poline). Space-separate several or repeat the flag.")
+    files_parser.add_argument("--tag", action="extend", nargs="+", default=[], help="Select inputs by tag. Space-separate several or repeat the flag.")
     files_parser.add_argument("--dry-run", action="store_true", help="Report what would be moved without touching any file.")
     files_parser.add_argument("--list", action="store_true", dest="list_moves", help="List configured download inputs and exit.")
     files_parser.add_argument(
@@ -114,6 +120,29 @@ def main(argv: list[str] | None = None) -> int:
     table_parser.add_argument("--schema", required=True)
     table_parser.add_argument("--table", required=True)
 
+    notify_parser = subparsers.add_parser(
+        "notify",
+        help="Email the daily ETLHealth report (read-only; builds a summary + status table).",
+    )
+    notify_parser.add_argument(
+        "--email-config", default="configs/email.yaml", help="Email config YAML (default: configs/email.yaml)."
+    )
+    notify_parser.add_argument("--date", default=None, help="Report date YYYY-MM-DD (default: today).")
+    notify_parser.add_argument(
+        "--mode",
+        choices=["test", "prd"],
+        default="test",
+        help="Recipient set: test (default, notification.test_recipients) or prd (notification.recipients).",
+    )
+    notify_parser.add_argument(
+        "--to", action="append", default=[], help="Override recipients (repeatable). Bypasses --mode lists."
+    )
+    notify_parser.add_argument("--env", default=".env", help="Path to the .env with Graph secrets (default: .env).")
+    notify_parser.add_argument(
+        "--dry-run", action="store_true", help="Build the report and print the summary but send no email."
+    )
+    notify_parser.add_argument("--save-html", default=None, help="Also write the rendered HTML to this path.")
+
     args = parser.parse_args(argv)
 
     if getattr(args, "all", False) and (args.loader or args.tag):
@@ -121,7 +150,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command is None:
         if args.loader or args.tag or args.all:
-            return run_interactive(
+            exit_code = run_interactive(
                 args.config,
                 names=args.loader,
                 tags=args.tag,
@@ -132,6 +161,8 @@ def main(argv: list[str] | None = None) -> int:
                 phase=_resolve_phase(args),
                 ignore_download=args.ignore_download,
             )
+            _maybe_notify(args)
+            return exit_code
         parser.print_help(sys.stderr)
         return 2
 
@@ -139,6 +170,20 @@ def main(argv: list[str] | None = None) -> int:
         table = TableRef(args.server, args.database, args.schema, args.table)
         print(json.dumps(inspect_table(table), indent=2, default=str))
         return 0
+
+    if args.command == "notify":
+        from . import notify as notify_module
+
+        return notify_module.send_daily_report(
+            args.config,
+            args.email_config,
+            report_date=_parse_report_date(args.date),
+            mode=args.mode,
+            to_override=args.to,
+            env_path=args.env,
+            dry_run=args.dry_run,
+            save_html=args.save_html,
+        )
 
     if args.command == "move-files":
         return run_move_files(
@@ -187,7 +232,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{result.status}\t{result.loader_name}\t{result.duration_seconds}s{row_text}\t{result.log_file_path}")
         # A FILE_NOT_FOUND skip (no fresh download) is a benign, expected outcome,
         # not a failure: it must not turn the whole run's exit code non-zero.
-        return 0 if all(result.status in {"SUCCESS", "FILE_NOT_FOUND"} for result in results) else 1
+        exit_code = 0 if all(result.status in {"SUCCESS", "FILE_NOT_FOUND"} for result in results) else 1
+        _maybe_notify(args)
+        return exit_code
 
     raise ValueError(f"Unknown command: {args.command}")
 
@@ -727,6 +774,61 @@ def _resolve_phase(args: argparse.Namespace) -> str:
     if getattr(args, "stg_only", False):
         return "stg"
     return "both"
+
+
+def _add_notify_flags(parser: argparse.ArgumentParser) -> None:
+    """Flags that let a batch run email the daily report when it finishes. The
+    dedicated ``notify`` subcommand exposes the fuller set (date, --to, dry-run)."""
+    parser.add_argument(
+        "--notify",
+        action="store_true",
+        help="After the run, email today's ETLHealth report (best-effort; a mail failure "
+        "never changes the load's exit code).",
+    )
+    parser.add_argument(
+        "--notify-mode",
+        choices=["test", "prd"],
+        default="test",
+        help="Recipient set for --notify: test (default) or prd.",
+    )
+    parser.add_argument(
+        "--email-config",
+        default="configs/email.yaml",
+        help="Email config YAML used by --notify (default: configs/email.yaml).",
+    )
+    parser.add_argument(
+        "--env",
+        default=".env",
+        help="Path to the .env with Graph secrets used by --notify (default: .env).",
+    )
+
+
+def _parse_report_date(value: str | None) -> dt.date | None:
+    if not value:
+        return None
+    return dt.date.fromisoformat(value)
+
+
+def _maybe_notify(args: argparse.Namespace) -> None:
+    """Send the daily report after a run when ``--notify`` was passed. Best-effort:
+    any failure (missing config, Graph error, unreachable DB) is reported but never
+    propagates, so emailing can never fail an otherwise-successful load."""
+    if not getattr(args, "notify", False):
+        return
+    try:
+        from . import notify as notify_module
+
+        rc = notify_module.send_daily_report(
+            args.config,
+            getattr(args, "email_config", "configs/email.yaml"),
+            report_date=None,  # the run just happened -> today
+            mode=getattr(args, "notify_mode", "test"),
+            env_path=getattr(args, "env", ".env"),
+        )
+        if rc != 0:
+            print("Notification step returned non-zero (email not sent).", file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001 - email must never fail the load.
+        print(f"Notification step failed (load unaffected): {exc}", file=sys.stderr)
 
 
 def run_interactive(
