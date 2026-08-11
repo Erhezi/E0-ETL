@@ -202,6 +202,7 @@ Each YAML specifies:
 - `field_config.pk_check`: duplicate-key validation columns (destination names).
 - `field_config.datetime_format` / `field_config.date_format`: optional [strptime](https://docs.python.org/3/library/datetime.html#strftime-and-strptime-format-codes) formats for `datetime`/`date`-typed source columns, e.g. `'%m/%d/%Y %I:%M:%S %p'` for `07/20/2025 10:23:07 PM`. Set these to parse fast and unambiguously; when omitted, columns are parsed as `mixed` (per-value, no warning but slower).
 - `destinations[].prod.post_sql`: statements (e.g. `EXEC` promotion procs) run on the **prod** connection after the staging load succeeds, to update prod from the just-loaded staging data.
+- `destinations[].prod.aux`: `name: table` map of the **other** prod tables those statements write (see "Promotions that write several prod tables"). Same server/database/schema as `prod` unless overridden.
 - `destinations[].post_sql`: optional statements run on the **staging** connection right after the staging load (staging-side cleanup).
 
 Destination targets use this shape:
@@ -272,6 +273,34 @@ A failed step is logged `FAILED`; the full traceback goes to the per-run log fil
 
 A failed step stops that destination's remaining steps; other destinations still run.
 
+### Promotions that write several prod tables
+
+Some promotions update more than one production table — `contract_line_error` merges
+the error rows and then writes a daily error-count snapshot. List the extra tables
+under the destination's `prod.aux` (`name: table`), alongside the statements that
+write them:
+
+```yaml
+    prod:
+      table: InforContractLineError
+      aux:
+        stat: InforContractLineErrorStat
+      post_sql:
+        - EXEC [Preprocessor].[sp_UpdateContractLineErrors]
+        - EXEC [Preprocessor].[sp_InsertInforContractLineErrorStat]
+```
+
+The `post_sql` statements still do all the work — `prod.aux` only declares what they
+touch, which buys two things: each declared table gets its own `PRD` **ETLHealth** row
+(same status/error/duration, since one statement batch writes them all; only the
+primary table carries the `RowCount`), and `data_fill_helper` can copy any of them
+between destinations by name. An `aux` name is the *same logical table* on every
+destination — `stat` is `InforContractLineErrorStat` on des1 and
+`ContractLineErrorStat` on des2 — so every enabled destination must declare the same
+names, and `main` is reserved for the destination's own `prod.table`. (The daily
+email consolidates rows per process/server/table type, so the extra rows show up in
+ETLHealth itself, not as extra lines in the report.)
+
 **Missing expected columns.** A source column is *required* when the pipeline needs it — either it is loaded to a destination (a `mapping` row with `origin: source`) or it is a `transform_inputs` entry. If a required column is missing, the run fails with `COLUMN NOT FOUND` before any table is touched. A column listed under `extra` is only present-but-unintegrated, so its absence cannot affect the output: the run **continues** and the successful staging row's `Error` column carries a non-fatal warning naming the missing columns, e.g. `COLUMN NOT FOUND (warning): expected file column(s) OrderMultiple missing; not loaded, ETL continued.`
 
 (The legacy top-level `load.post_sql` still executes on the staging connection if present, but prefer `prod.post_sql` for promotion so it runs on the prod connection.)
@@ -338,6 +367,12 @@ table *is* the production table — so the tool uses that table (`prod or stagin
 on each side. `python -B data_fill_helper.py --loader ppe_category` copies the
 des1 PPE table into the des2 PPE table.
 
+**Loaders with several prod tables** (extra ones declared under `prod.aux`, see
+above) copy one table per run: `--table <name>` picks it — `main` (the default) is
+the destination's own `prod` table, or use the `aux` name — and `--all-tables`
+copies every one in declaration order, primary table first, each with its own
+confirmation. Declining one stops the run, leaving the remaining tables untouched.
+
 **Write modes:**
 
 - *Default (insert only if empty)* — the target prod table must have **zero
@@ -372,9 +407,17 @@ skipping the prompt:
 python -B data_fill_helper.py --loader inventory_location --from server_a --to server_b --truncate --yes
 ```
 
+Seed both of a loader's prod tables on the other destination:
+
+```powershell
+python -B data_fill_helper.py --loader contract_line_error --all-tables --dry-run
+python -B data_fill_helper.py --loader contract_line_error --all-tables
+```
+
 The bare config name also works in place of `--loader <name>`
 (e.g. `python -B data_fill_helper.py --inventory_location`). On completion it
-prints a status line, e.g. `COPIED  inventory_location  rows_truncated=120  rows_copied=120`;
+prints one status line per copied table, e.g.
+`COPIED  inventory_location  main  rows_truncated=120  rows_copied=120`;
 status is one of `COPIED`, `DRY_RUN`, `SKIPPED_NONEMPTY`, or `ABORTED`.
 
 ## Daily email notification

@@ -17,31 +17,34 @@ source:
       options:
         dtype: str
 
-# STAGING-ONLY loader (NOT a direct load). Unlike a master-data direct loader (one
-# table truncated in place), contract-line-error is a staging->prod TRANSACTION
-# pipeline: the file lands in a _stg table, then a MERGE promotes it into the prod
+# STAGED loader (NOT a direct load). Unlike a master-data direct loader (one table
+# truncated in place), contract-line-error is a staging->prod TRANSACTION pipeline:
+# the file lands in a _stg table, then a MERGE promotes it into the prod
 # InforContractLineError table, stamping each error row New / Persisting / Resolved.
 #
-# This loader OWNS the file->staging load only -- it replaces the manual notebook
-# "ContractLineError" cell (read ContractLineError.csv -> truncate the _stg table ->
-# insert). The staging->prod promotion is deliberately NOT run here: it is steps 20-21
-# of the scheduled orchestrator [Preprocessor].usp_RunPreprocessor_Batch
-# (EXEC sp_UpdateContractLineErrors, then EXEC sp_InsertInforContractLineErrorStat for
-# the daily error-count snapshot). Those two must stay together, so bundling only the
-# promote into this loader would desync the stat snapshot -- hence prod.post_sql is left
-# unset. With no prod.post_sql the framework loads staging and skips promotion, while the
-# prod: blocks still mark this as a transactional (not direct) loader and document the
-# promote target (see general_rules.md).
+# This loader OWNS the whole pipeline: the file->staging load (it replaces the manual
+# notebook "ContractLineError" cell -- read ContractLineError.csv -> truncate the _stg
+# table -> insert) AND the staging->prod promotion, run as the two prod.post_sql EXECs
+# below. The promotion used to be steps 20-21 of the scheduled orchestrator
+# [Preprocessor].usp_RunPreprocessor_Batch; those two steps were commented out of that
+# proc on 2026-08-10 and moved here, so the promote and the stat snapshot still run
+# together (in that order, one prod transaction) but now immediately after the staging
+# load that feeds them -- and each gets its own ETLHealth row. Do NOT re-enable steps
+# 20-21 in usp_RunPreprocessor_Batch: they would re-run this promotion off the same
+# staging data later in the day.
 #
-# Object names VERIFIED via table-info on 2026-07-31 (all staging tables carry the same
-# 22 columns as the export; the two prod tables add ErrorStatus + LastUpdate = 24):
+# Promotion writes TWO prod tables per destination, so the second is declared under
+# prod.aux (name `stat`), which is what gives it an ETLHealth row and lets
+# data_fill_helper copy it des1 <-> des2 by name (--table stat / --all-tables).
+#
+# Object names VERIFIED against sys.objects on 2026-08-10 (all staging tables carry the
+# same 22 columns as the export; the error prod tables add ErrorStatus + LastUpdate = 24;
+# both stat tables are ErrorStatus / ErrorMessageNumber / ErrorCount / ReportDate):
 #   des1 staging  PRIME.[Preprocessor].InforContractLineError_stg
-#   des1 prod     PRIME.[Preprocessor].InforContractLineError
+#   des1 prod     PRIME.[Preprocessor].InforContractLineError (+ InforContractLineErrorStat)
 #   des2 staging  Preprocessor.[infor].contractlineerror_stg
-#   des2 prod     Preprocessor.[infor].ContractLineError
-# The des1 promotion proc [Preprocessor].sp_UpdateContractLineErrors EXISTS; the infor
-# schema on the Preprocessor DB has NO promotion proc yet (migration in progress), so
-# des2's prod table is populated only once that proc + a batch step are added there.
+#   des2 prod     Preprocessor.[infor].ContractLineError (+ ContractLineErrorStat)
+# Both promotion procs exist under each schema (des1 [Preprocessor], des2 [infor]).
 destinations:
   - name: des1
     enabled: true
@@ -51,9 +54,24 @@ destinations:
     staging:
       table: InforContractLineError_stg
     prod:
-      # Promotion runs via [Preprocessor].sp_UpdateContractLineErrors inside
-      # usp_RunPreprocessor_Batch -- not by this loader (no prod.post_sql).
       table: InforContractLineError
+      # Second prod table the promotion writes: the daily error-count snapshot
+      # sp_InsertInforContractLineErrorStat inserts. Not loaded from the file --
+      # declared so the run logs it and data_fill can address it as `stat`.
+      aux:
+        stat: InforContractLineErrorStat
+      # Two-step promotion (statements run in list order, one prod transaction):
+      #   1. sp_UpdateContractLineErrors      -- pk_merge on (Contract, ContractLine,
+      #      ErrorMessageNumber): rows missing from staging are stamped Resolved, matched
+      #      rows Persisting, new rows inserted as New (see prd_load below).
+      #   2. sp_InsertInforContractLineErrorStat -- counts the rows Step 1 just stamped
+      #      (LastUpdate >= today) by ErrorStatus + ErrorMessageNumber into the stat
+      #      table. Must run AFTER Step 1 or it would snapshot yesterday's statuses.
+      #      Idempotent: it deletes its own ReportDate rows before inserting, so a
+      #      same-day re-run replaces that day's snapshot instead of doubling it.
+      post_sql:
+        - EXEC [Preprocessor].[sp_UpdateContractLineErrors]
+        - EXEC [Preprocessor].[sp_InsertInforContractLineErrorStat]
 
   - name: des2
     enabled: true
@@ -63,9 +81,18 @@ destinations:
     staging:
       table: contractlineerror_stg
     prod:
-      # Preprocessor-DB copy. No infor-schema promotion proc/batch exists here yet
-      # (2026-07-31), so for now this loader only populates the staging table on des2.
+      # Preprocessor-DB copy of the same two tables, same promotion, infor schema.
       table: ContractLineError
+      aux:
+        stat: ContractLineErrorStat
+      # Same two steps as des1 (see the des1 block for what each does), against the
+      # infor-schema copies. Both procs were repointed at this side's table names on
+      # 2026-08-10 (they had been copied from des1 still referencing
+      # [infor].InforContractLineError*, which does not exist here); every reference
+      # now resolves -- verified via sys.dm_sql_referenced_entities the same day.
+      post_sql:
+        - EXEC [infor].[sp_UpdateContractLineErrors]
+        - EXEC [infor].[sp_InsertInforContractLineErrorStat]
 
 health_table:
   server: 'YNBBSTVWP02\PROCDATASRVPROD'
@@ -90,10 +117,14 @@ stg_load:
   strategy: truncate_insert   # how each staging table is loaded from the source file
   batch_size: 50000
 
-# How prod is promoted from the just-loaded staging table. DECLARATIVE ONLY: the real
-# promotion is a New/Persisting/Resolved MERGE on the natural key run by
-# [Preprocessor].sp_UpdateContractLineErrors, scheduled inside usp_RunPreprocessor_Batch
-# -- this loader does not run it (no prod.post_sql). Recorded here to document the pipeline.
+# How prod is promoted from the just-loaded staging table. DECLARATIVE: the loader does
+# not generate SQL from this spec -- it dispatches each destination's prod.post_sql (the
+# two EXECs above, in list order, on the prod connection in a single transaction; see
+# file_loader._update_prod / db.execute_statements). The real Step-1 promotion is a
+# New/Persisting/Resolved MERGE on the natural key inside sp_UpdateContractLineErrors:
+# prod rows with no staging match are stamped Resolved, matched rows are updated to
+# Persisting, and unmatched staging rows are inserted as New. Nothing is deleted, so prod
+# accumulates the error history. strategy also feeds the PRD ETLHealth row's ProcessType.
 prd_load:
   strategy: pk_merge
 

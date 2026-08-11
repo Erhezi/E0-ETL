@@ -66,6 +66,13 @@ pair only untrimmed. Don't hack around it in a transform.
 - Verify a destination table before enabling it -- the CLI's read-only
   `table-info --server ... --database ... --schema ... --table ...` prints the
   live columns/nullability -- and note the verification date in the config.
+- Declare EVERY prod table a promotion writes: the main one as `prod.table`, any
+  others as `prod.aux` (`name: table`). The `post_sql` procs do the writing
+  either way, but an undeclared table gets no ETLHealth row and cannot be moved
+  between destinations by `data_fill_helper --table <name>`. Use the same `aux`
+  name on every destination for the same logical table (`stat` =
+  `InforContractLineErrorStat` on des1, `ContractLineErrorStat` on des2) --
+  mismatched names are rejected at config load.
 - Master data with no staging table uses a direct-load destination (`table:`
   only) and writes its load settings under `direct_load:` -- an alias of
   `stg_load` (same `strategy` / `batch_size` fields) named for what actually

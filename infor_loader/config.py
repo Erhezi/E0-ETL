@@ -7,6 +7,11 @@ from typing import Any
 
 DEFAULT_DRIVER = "ODBC Driver 17 for SQL Server"
 
+# Key the PRIMARY prod table takes in LoadDestination.prod_tables; each `prod.aux`
+# entry sits alongside it under its own name. Tools that address one production
+# table by name (data_fill's --table) use this for "the destination's own prod table".
+MAIN_TABLE_KEY = "main"
+
 # How staging tables are loaded from the source file.
 STG_LOAD_STRATEGIES = frozenset({"truncate_insert"})
 
@@ -127,6 +132,14 @@ class LoadDestination:
     # uses is listed in one place and the prod ETLHealth row can name them. Same
     # server/database/schema as `staging`.
     aux_staging: dict[str, TableRef] = field(default_factory=dict)
+    # Additional PRODUCTION tables this destination's promotion writes, keyed by a
+    # loader-chosen name (declared under `prod.aux`, mirroring `staging.aux`), with
+    # the same server/database/schema as `prod` unless overridden. The prod.post_sql
+    # statements own the writes; declaring the tables here is what lets the run log an
+    # ETLHealth row for each one and lets data_fill copy them destination-to-
+    # destination by name. Every enabled destination must declare the same names --
+    # each name identifies the SAME logical table on both sides (see LoaderConfig).
+    aux_prod: dict[str, TableRef] = field(default_factory=dict)
     # Statements run on the *staging* connection after the staging load.
     post_sql: tuple[str, ...] = ()
     # Statements (e.g. EXEC promotion procs) run on the *prod* connection after
@@ -159,32 +172,39 @@ class LoadDestination:
         aux_staging: dict[str, TableRef] = {}
         if isinstance(staging_value, dict):
             staging_value = dict(staging_value)
-            aux_raw = staging_value.pop("aux", None)
-            staging_base = {
-                key: staging_value.get(key, base.get(key))
-                for key in ["server", "database", "schema"]
-                if staging_value.get(key) is not None or base.get(key) is not None
-            }
-            if aux_raw is not None:
-                if not isinstance(aux_raw, dict):
-                    raise ValueError(
-                        f"Destination {index + 1} staging.aux must be a mapping of "
-                        f"name -> table; got {type(aux_raw).__name__}."
-                    )
-                aux_staging = {
-                    str(aux_name): _table_ref_from_value(table_value, staging_base)
-                    for aux_name, table_value in aux_raw.items()
-                }
+            aux_staging = _aux_table_refs(
+                staging_value.pop("aux", None),
+                _block_defaults(staging_value, base),
+                index=index,
+                block="staging",
+            )
 
         prod_value = data.get("prod") or data.get("production") or data.get("prod_table") or data.get("target_table")
         prod_post_sql: tuple[str, ...] = ()
+        # Same shape on the prod side: `prod.aux` lists the OTHER production tables
+        # the promotion statements write, inheriting the prod block's own server/db/
+        # schema. `post_sql`/`aux` are popped so what is left describes the table.
+        aux_prod: dict[str, TableRef] = {}
         if isinstance(prod_value, dict):
-            prod_post_sql = tuple(prod_value.get("post_sql") or ())
+            prod_value = dict(prod_value)
+            prod_post_sql = tuple(prod_value.pop("post_sql", None) or ())
+            aux_prod = _aux_table_refs(
+                prod_value.pop("aux", None),
+                _block_defaults(prod_value, base),
+                index=index,
+                block="prod",
+            )
+            if MAIN_TABLE_KEY in aux_prod:
+                raise ValueError(
+                    f"Destination {index + 1} cannot name a prod.aux table {MAIN_TABLE_KEY!r}: "
+                    f"that name is reserved for the destination's own `prod.table`."
+                )
         return cls(
             name=str(data.get("name") or data.get("alias") or f"destination_{index + 1}"),
             staging=_table_ref_from_value(staging_value, base),
             prod=_table_ref_from_value(prod_value, base) if prod_value is not None else None,
             aux_staging=aux_staging,
+            aux_prod=aux_prod,
             post_sql=tuple(data.get("post_sql") or ()),
             prod_post_sql=prod_post_sql,
             enabled=bool(data.get("enabled", True)),
@@ -198,18 +218,64 @@ class LoadDestination:
         loaders that have no staging table."""
         return self.prod is None
 
+    @property
+    def prod_tables(self) -> dict[str, TableRef]:
+        """Every production table this destination owns, keyed by name and in
+        declaration order: the primary one under :data:`MAIN_TABLE_KEY`, then each
+        ``prod.aux`` entry. A direct destination has no separate prod table -- its
+        single configured table IS production -- so that table is the ``main`` entry
+        (the same ``prod or staging`` idiom the load path uses)."""
+        return {MAIN_TABLE_KEY: self.prod or self.staging, **self.aux_prod}
+
     def display_name(self, include_server: bool = False) -> str:
         staging_name = self.staging.display_name(include_server=include_server)
-        aux_suffix = ""
-        if self.aux_staging:
-            aux_names = ", ".join(
-                ref.display_name(include_server=include_server) for ref in self.aux_staging.values()
-            )
-            aux_suffix = f" (+aux staging: {aux_names})"
+        aux_suffix = _aux_display(self.aux_staging, "aux staging", include_server)
         if self.prod is None:
             return f"{self.name}: direct={staging_name}{aux_suffix}"
         prod_name = self.prod.display_name(include_server=include_server)
-        return f"{self.name}: staging={staging_name}{aux_suffix}, prod={prod_name}"
+        prod_suffix = _aux_display(self.aux_prod, "aux prod", include_server)
+        return f"{self.name}: staging={staging_name}{aux_suffix}, prod={prod_name}{prod_suffix}"
+
+
+def _block_defaults(block: dict[str, Any], base: dict[str, Any]) -> dict[str, Any]:
+    """server/database/schema an ``aux`` table inherits: the owning block's own
+    overrides where it sets them, else the destination-level defaults. Used so a
+    ``staging.aux``/``prod.aux`` table follows the block it is declared in even when
+    that block overrides the destination (e.g. staging in a different database)."""
+    return {
+        key: block.get(key, base.get(key))
+        for key in ["server", "database", "schema"]
+        if block.get(key) is not None or base.get(key) is not None
+    }
+
+
+def _aux_table_refs(
+    aux_raw: Any,
+    defaults: dict[str, Any],
+    *,
+    index: int,
+    block: str,
+) -> dict[str, TableRef]:
+    """Build one destination's ``<block>.aux`` mapping of name -> :class:`TableRef`."""
+    if aux_raw is None:
+        return {}
+    if not isinstance(aux_raw, dict):
+        raise ValueError(
+            f"Destination {index + 1} {block}.aux must be a mapping of "
+            f"name -> table; got {type(aux_raw).__name__}."
+        )
+    return {
+        str(aux_name): _table_ref_from_value(table_value, defaults)
+        for aux_name, table_value in aux_raw.items()
+    }
+
+
+def _aux_display(tables: dict[str, TableRef], label: str, include_server: bool) -> str:
+    """`` (+aux staging: a, b)`` suffix for a destination summary; '' when empty."""
+    if not tables:
+        return ""
+    names = ", ".join(ref.display_name(include_server=include_server) for ref in tables.values())
+    return f" (+{label}: {names})"
 
 
 def _table_ref_from_value(value: Any, defaults: dict[str, Any]) -> TableRef:
@@ -447,6 +513,20 @@ class LoaderConfig:
                     f"aux staging(s) {missing} under staging.aux; every enabled destination has to "
                     f"list all aux staging tables."
                 )
+        # A `prod.aux` name identifies the SAME logical production table on every
+        # destination (des1's InforContractLineErrorStat and des2's
+        # ContractLineErrorStat are both `stat`), which is what lets data_fill copy
+        # one named table between destinations. Names that differ across
+        # destinations would leave a table unaddressable, so require them to match.
+        aux_prod_names = {
+            destination.name: sorted(destination.aux_prod) for destination in enabled_destinations
+        }
+        if len({tuple(names) for names in aux_prod_names.values()}) > 1:
+            raise ValueError(
+                f"{name}: prod.aux names differ across enabled destinations ({aux_prod_names}); "
+                f"every enabled destination must declare the same aux prod table names -- a name "
+                f"is the same logical table on each side."
+            )
         return cls(
             name=name,
             process_name=data.get("process_name", data["name"]),

@@ -14,7 +14,14 @@ from typing import Any
 
 import pandas as pd
 
-from .config import AuxStaging, LoadDestination, LoaderConfig, OverlapCheck, TableRef
+from .config import (
+    MAIN_TABLE_KEY,
+    AuxStaging,
+    LoadDestination,
+    LoaderConfig,
+    OverlapCheck,
+    TableRef,
+)
 from .file_folder import InputFile, run_moves
 from .db import (
     connect_sql_server,
@@ -371,17 +378,14 @@ class FileLoader:
                 # destination with no prod promotion (no prod.post_sql) has no PRD job
                 # to log.
                 if self.phase == "both" and destination.prod_post_sql:
-                    steps.append(
-                        StepResult(
-                            step="prod",
-                            target=destination.prod or destination.staging,
-                            staging_table=destination.staging,
+                    steps.extend(
+                        self._prod_steps(
+                            destination,
                             status="FAILED",
                             row_count=None,
                             error="STAGING LOAD FAILED",
                             duration=0,
-                            table_type="PRD",
-                            extra_staging_tables=aux_targets,
+                            aux_targets=aux_targets,
                         )
                     )
                 return DestinationLoadResult(destination, "FAILED", None, error, steps)
@@ -430,17 +434,14 @@ class FileLoader:
                         )
                     )
                     if self.phase == "both" and destination.prod_post_sql:
-                        steps.append(
-                            StepResult(
-                                step="prod",
-                                target=destination.prod or destination.staging,
-                                staging_table=destination.staging,
+                        steps.extend(
+                            self._prod_steps(
+                                destination,
                                 status="FAILED",
                                 row_count=None,
                                 error="STAGING LOAD FAILED",
                                 duration=0,
-                                table_type="PRD",
-                                extra_staging_tables=aux_targets,
+                                aux_targets=aux_targets,
                             )
                         )
                     return DestinationLoadResult(destination, "FAILED", None, error, steps)
@@ -474,43 +475,70 @@ class FileLoader:
             )
 
         if destination.prod_post_sql:
-            prod_target = destination.prod or destination.staging
+            prod_target = destination.prod_tables[MAIN_TABLE_KEY]
             prod_start = perf_counter()
             try:
                 self._update_prod(destination, prod_target, logger)
             except Exception as exc:  # noqa: BLE001 - keep loading other configured destinations.
                 error = f"{exc}\n{traceback.format_exc()}"
                 logger.exception("Destination %s prod update failed", destination.name)
-                steps.append(
-                    StepResult(
-                        step="prod",
-                        target=prod_target,
-                        staging_table=destination.staging,
+                steps.extend(
+                    self._prod_steps(
+                        destination,
                         status="FAILED",
                         row_count=None,
                         error=error,
                         duration=int(perf_counter() - prod_start),
-                        table_type="PRD",
-                        extra_staging_tables=aux_targets,
+                        aux_targets=aux_targets,
                     )
                 )
                 return DestinationLoadResult(destination, "FAILED", row_count, error, steps)
 
             logger.info("Updated prod %s from staging", prod_target.display_name(include_server=True))
-            steps.append(
-                StepResult(
-                    step="prod",
-                    target=prod_target,
-                    staging_table=destination.staging,
+            steps.extend(
+                self._prod_steps(
+                    destination,
                     status="SUCCESS",
                     row_count=row_count,
+                    error=None,
                     duration=int(perf_counter() - prod_start),
-                    table_type="PRD",
-                    extra_staging_tables=aux_targets,
+                    aux_targets=aux_targets,
                 )
             )
 
         return DestinationLoadResult(destination, "SUCCESS", row_count, None, steps)
+
+    @staticmethod
+    def _prod_steps(
+        destination: LoadDestination,
+        *,
+        status: str,
+        row_count: int | None,
+        error: str | None,
+        duration: int,
+        aux_targets: tuple[TableRef, ...],
+    ) -> list[StepResult]:
+        """One PRD step -- and so one ETLHealth row -- per production table the
+        promotion writes: the destination's own prod table plus every ``prod.aux``
+        table (e.g. the ContractLineError stat snapshot). All of them are written by
+        the same prod.post_sql batch on the same connection, so they share this
+        step's status, error and duration. Only the primary table carries the row
+        count (the staging rows that fed the promotion); an aux prod table is a
+        derived write with no count of its own, so it is logged without one."""
+        return [
+            StepResult(
+                step="prod",
+                target=table,
+                staging_table=destination.staging,
+                status=status,
+                row_count=row_count if key == MAIN_TABLE_KEY else None,
+                error=error,
+                duration=duration,
+                table_type="PRD",
+                extra_staging_tables=aux_targets,
+            )
+            for key, table in destination.prod_tables.items()
+        ]
 
     def _load_staging(
         self,
