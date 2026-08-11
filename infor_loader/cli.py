@@ -8,6 +8,7 @@ import json
 import logging
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -60,6 +61,7 @@ def main(argv: list[str] | None = None) -> int:
         "source folder (no fresh download required). Use for backfills / reprocessing.",
     )
     _add_phase_flags(parser)
+    _add_destination_flag(parser)
     _add_notify_flags(parser)
 
     subparsers = parser.add_subparsers(dest="command", required=False)
@@ -88,6 +90,7 @@ def main(argv: list[str] | None = None) -> int:
         "source folder (no fresh download required). Use for backfills / reprocessing.",
     )
     _add_phase_flags(run_parser)
+    _add_destination_flag(run_parser)
     _add_notify_flags(run_parser)
 
     files_parser = subparsers.add_parser(
@@ -160,6 +163,7 @@ def main(argv: list[str] | None = None) -> int:
                 log_root=args.log_root,
                 phase=_resolve_phase(args),
                 ignore_download=args.ignore_download,
+                destinations=args.destination,
             )
             _maybe_notify(args)
             return exit_code
@@ -218,6 +222,14 @@ def main(argv: list[str] | None = None) -> int:
         selected = [loader for loader in selected if loader.enabled]
         if not selected:
             print("No enabled loaders selected.", file=sys.stderr)
+            return 2
+        try:
+            selected = filter_destinations(selected, args.destination)
+        except ValueError as exc:
+            print(f"run: {exc}", file=sys.stderr)
+            return 2
+        if not selected:
+            print("No loaders left after --destination filtering.", file=sys.stderr)
             return 2
         results = run_loaders(
             selected,
@@ -758,6 +770,62 @@ def _add_phase_flags(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_destination_flag(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--destination",
+        action="extend",
+        nargs="+",
+        default=[],
+        help="Run only the named destination(s) of each selected loader (e.g. des1 or des2). "
+        "Space-separate several or repeat the flag. Default: every enabled destination.",
+    )
+
+
+def filter_destinations(loaders: list[LoaderConfig], names: list[str]) -> list[LoaderConfig]:
+    """Restrict each loader to the destination(s) named by ``--destination``.
+
+    Narrows a run to one side (``--destination des2``) without editing config: the
+    unnamed destinations are skipped exactly as if they were disabled -- no staging
+    load, no prod promotion, no ETLHealth rows. The filter only ever narrows, so a
+    destination disabled in YAML stays skipped even when it is named.
+
+    A loader left with no enabled destination (it declares none of the names, or has
+    them all disabled) drops out of the run with a note on stderr, since running it
+    would load nothing. A name no selected loader declares at all is a typo, not a
+    narrower run, so it raises instead of silently running everything.
+    """
+    if not names:
+        return loaders
+
+    wanted = set(names)
+    available = {destination.name for loader in loaders for destination in loader.destinations}
+    unknown = sorted(wanted - available)
+    if unknown:
+        raise ValueError(
+            f"No destination named {', '.join(unknown)} in the selected loader(s). "
+            f"Available: {', '.join(sorted(available)) or '(none)'}"
+        )
+
+    filtered: list[LoaderConfig] = []
+    for loader in loaders:
+        kept = [destination for destination in loader.destinations if destination.name in wanted]
+        enabled = [destination for destination in kept if destination.enabled]
+        if not enabled:
+            reason = "declares none of them" if not kept else "has them disabled in config"
+            print(
+                f"Skipping loader {loader.name}: --destination {' '.join(sorted(wanted))} "
+                f"{reason}.",
+                file=sys.stderr,
+            )
+            continue
+        # `destination` is the legacy single-destination field, derived by
+        # LoaderConfig.from_dict as "the first enabled destination's staging table";
+        # keep it consistent with the narrowed list. (`target_table` is left alone:
+        # it can be set explicitly in config and nothing on the run path reads it.)
+        filtered.append(replace(loader, destinations=kept, destination=enabled[0].staging))
+    return filtered
+
+
 def _resolve_max_workers(args: argparse.Namespace) -> int:
     requested = args.max_workers
     if requested is None:
@@ -842,6 +910,7 @@ def run_interactive(
     phase: str = "both",
     select_all: bool = False,
     ignore_download: bool = False,
+    destinations: list[str] | None = None,
 ) -> int:
     """Print a summary of the selected loaders and run them after confirmation."""
     loaders = load_loader_configs(config_ref)
@@ -851,7 +920,21 @@ def run_interactive(
         print(f"No loaders matched: {wanted}", file=sys.stderr)
         return 2
 
+    # Narrow each loader to the named destination(s) BEFORE the summary is printed,
+    # so what is shown (and confirmed) is exactly what will be loaded.
+    destinations = destinations or []
+    try:
+        selected = filter_destinations(selected, destinations)
+    except ValueError as exc:
+        print(f"--destination: {exc}", file=sys.stderr)
+        return 2
+    if not selected:
+        print("No loaders left after --destination filtering.", file=sys.stderr)
+        return 2
+
     print(f"Mode: {PHASE_LABELS.get(phase, phase)}")
+    if destinations:
+        print(f"Destinations: {', '.join(destinations)} ONLY (each loader's other destinations are skipped)")
     if phase != "prd":
         if ignore_download:
             print("Download check: OFF (--ignore-download; loading the file already in place)")

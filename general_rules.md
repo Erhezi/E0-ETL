@@ -63,6 +63,11 @@ pair only untrimmed. Don't hack around it in a transform.
 - Loaders land BOTH destinations unless there is a documented reason not to:
   - `des1`: `MISCPrdAdhocDB` / `PRIME` / `DM_MONTYNT\dli2`
   - `des2`: `YNBBSTVWP02\PROCDATASRVPROD` / `PLMPreprocessorShared` / `infor`
+  Name them `des1`/`des2` consistently: the run-time `--destination <name>` flag
+  (one-off single-side run) and `data_fill_helper --from/--to` both address a
+  destination by name across loaders. To pause a side for good, set
+  `enabled: false` on its block -- `--destination` is for one run, not a config
+  change, and never re-enables a disabled destination.
 - Verify a destination table before enabling it -- the CLI's read-only
   `table-info --server ... --database ... --schema ... --table ...` prints the
   live columns/nullability -- and note the verification date in the config.

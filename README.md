@@ -102,6 +102,35 @@ python -B run_daily_loaders.py --loader inventory_location --prd-only
 destination's `prod.post_sql`. `--stg-only` does not run `post_file_moves`, so the
 source file stays in place for a later `--prd-only` or a re-run.
 
+### Running one destination
+
+A loader normally lands **both** destinations (`des1` and `des2`) on every run.
+`--destination <name>` narrows a run to one side without editing config — useful
+when one server was down, or when only that side's promotion needs a re-run:
+
+```powershell
+# Load only the PRIME (des1) side of Contract Line Error.
+python -B run_daily_loaders.py --loader contract_line_error --destination des1
+
+# Re-promote just des2 after its prod EXEC failed, off the staging data already there.
+python -B run_daily_loaders.py --loader contract_line_error --destination des2 --prd-only
+
+# Works with any selector, and takes several names (space-separated or repeated).
+python -B run_daily_loaders.py --tag mdm --destination des2 --auto
+```
+
+The skipped destinations are skipped **entirely** — no staging load, no prod
+promotion, no ETLHealth rows — exactly as if they were `enabled: false`. The flag
+only ever narrows: a destination already disabled in YAML stays skipped even when
+named. The summary lists only the destinations that will actually run, so what you
+confirm is what gets loaded.
+
+A selected loader that declares none of the named destinations (or has them all
+disabled) drops out of the run with a note on stderr, since it would load nothing;
+if no selected loader declares the name at all, the run exits `2` rather than
+quietly loading everything — the usual cause is a typo. Both the `--loader` form
+and the `run` subcommand accept the flag.
+
 ## Input files: the central registry + `move-files`
 
 `configs\file_folder_loader_config.yaml` is the **single source of truth** for
