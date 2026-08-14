@@ -31,7 +31,7 @@ destinations:
         target: sp_InsertDailyArchive
         timeout_seconds: 600
         options:
-          backfill_days: 3
+          backfill_days: 5
           procedure: BullardBurnDown.sp_InsertDailyArchive
 
       # Rebuild the SearchTerms fixture from vw_SearchHelperPreAgg (truncate+insert).

@@ -24,7 +24,7 @@ destinations:
     steps:
       - name: run_preprocessor_batch
         exec: EXEC [Preprocessor].[usp_RunPreprocessor_Batch]
-        timeout_seconds: 1200
+        timeout_seconds: 1800
 
   # des2 is not deployed yet -- see the commented block in plm.yaml for the shape.
 

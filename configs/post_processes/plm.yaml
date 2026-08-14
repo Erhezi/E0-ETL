@@ -31,7 +31,7 @@ destinations:
     steps:
       - name: run_plm_batch
         exec: EXEC [PLM].[usp_RunPLM_Batch]
-        timeout_seconds: 1200
+        timeout_seconds: 1800
 
   # des2 is not deployed yet. When it is, add the block below -- the requirement
   # gate then checks the des2 rows of the same loaders, because scope is
