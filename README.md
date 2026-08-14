@@ -14,6 +14,10 @@ configs\
       ...
     on-demand\                     # run by hand only (never in --all)
       ghx_completed_invoice_by_date.yaml
+  post_processes\                  # run AFTER the loaders (see "Post-load processes")
+    plm.yaml
+    preprocessor.yaml
+    bullard_burn_down.yaml
 ```
 
 Commands still take `--config configs` (the default): the loaders are discovered
@@ -21,6 +25,8 @@ Commands still take `--config configs` (the default): the loaders are discovered
 found), and the registry is found at the `configs\` root. The grouping is by
 `loaders\<group>\`; what actually gates a loader out of the daily batch is the
 `on-demand` **tag** (see "On-demand loaders" below), not the folder name.
+`post_processes\` is a **sibling** of `loaders\`, not under it, so its YAMLs are
+never swept into `--all`.
 
 ### On-demand loaders
 
@@ -449,16 +455,106 @@ prints one status line per copied table, e.g.
 `COPIED  inventory_location  main  rows_truncated=120  rows_copied=120`;
 status is one of `COPIED`, `DRY_RUN`, `SKIPPED_NONEMPTY`, or `ABORTED`.
 
+## Post-load processes
+
+Three processes consume what the loaders land, and none depends on the others:
+
+| Process | Config | What it runs |
+| ------- | ------ | ------------ |
+| `plm` | `configs\post_processes\plm.yaml` | `EXEC [PLM].[usp_RunPLM_Batch]` |
+| `preprocessor` | `configs\post_processes\preprocessor.yaml` | `EXEC [Preprocessor].[usp_RunPreprocessor_Batch]` |
+| `bullard_burn_down` | `configs\post_processes\bullard_burn_down.yaml` | `sp_InsertDailyArchive` per date, then rebuild `SearchTerms` |
+
+All three currently run on **des1** only (`MISCPrdAdhocDB` / `PRIME`); each config
+carries a commented `des2` block to uncomment when that side is deployed.
+
+### The requirement gate
+
+A process declares the **loaders** it needs, by loader `name`:
+
+```yaml
+requires:
+  loaders: [inventory_location, inventory_transaction]
+  scope: destination     # only rows written on THIS destination's server
+  on_unmet: block        # record BLOCKED and execute nothing
+```
+
+Before running, it reads today's ETLHealth and requires every named loader to be
+`SUCCESS`. Names resolve to the friendly `ProcessName` through the loader configs,
+so the two can't drift. Because the check reads **ETLHealth** rather than the
+results of the batch that just ran, an attached run and one started hours later
+decide identically — and a loader you re-ran by hand clears the gate the moment it
+succeeds, with no flag needed.
+
+`scope: destination` means a des2 failure never blocks des1 work that is fine; when
+a des2 block is added it gates on des2's own rows. `on_unmet: block` records one
+`BLOCKED` row naming what it is waiting on, touches no table, and **leaves the exit
+code at 0** — the upstream loader's own `FAILED` row is the real alarm, and counting
+it twice would make one bad loader look like two broken jobs. Use
+`--ignore-gate` to run anyway.
+
+### ETLHealth: one row per process
+
+Each process writes exactly **one** ETLHealth row per destination — the top-level
+verdict, typed `TargetTableType: PROC`. The batch procs already log every
+sub-procedure to their own `process_log` tables, so that detail is not duplicated;
+per-step timings, row counts and the failing traceback go to the run's **log file**,
+which the daily email attaches on failure. A `BLOCKED` row's `Error` column names
+the unmet requirement, since that is the one detail the rolled-up row can't be read
+off at a glance.
+
+### Commands
+
+```powershell
+# What is configured, and what each requires.
+python -B run_daily_loaders.py post-run --list
+
+# Run all three, or one by name. Without --auto it prints a summary and asks first.
+python -B run_daily_loaders.py post-run --all
+python -B run_daily_loaders.py post-run --process plm --auto
+
+# Re-drive one after fixing its upstream loader (the gate re-checks and clears).
+python -B run_daily_loaders.py post-run --process bullard_burn_down --auto
+
+# Run despite an unmet requirement (deliberate override).
+python -B run_daily_loaders.py post-run --process plm --auto --ignore-gate
+```
+
+`--destination`, `--log-root` and `--tag` work as they do for loaders. `--date`
+moves which day's ETLHealth rows the gate checks. `--max-workers` runs the
+processes concurrently (they have no dependencies on each other); it defaults to
+`1` because the batch procs are heavy and share a server.
+
+### Run end to end with the loaders
+
+Add `--post-run` to a batch run. The processes run **after** the loaders and
+**before** `--notify`, so a single email covers the whole night:
+
+```powershell
+python -B run_daily_loaders.py run --all --auto --post-run --notify
+```
+
+Unlike `--notify`, this is real work against prod, so a `FAILED` process **does**
+make the run exit non-zero (a `BLOCKED` one does not). `--post-process <name>`
+limits which ones the flag runs. A run narrowed with `--destination` to a side no
+process targets yet simply skips this step with a note.
+
 ## Daily email notification
 
 After the daily batch, `notify` reads today's **ETLHealth** rows for the daily
-loaders and emails a report via Microsoft Graph (service account
-`procurementdatateam@montefiore.org`): a one-line summary (all success, or `X/Y`
-failed), a per-target status table (Process / Status / DB Connection / Target Type
-/ Last Run / Error, with `des1`→**PRIME** and `des2`→**O2**), the log file(s)
-attached for any failure, and a consolidated copy‑pasteable rerun command for the
-failed/skipped loaders (loaders that share the same flags are batched into one
-`--loader a b c` invocation; `--prd-only` failures and full reruns each get their own line).
+loaders **and the post-load processes** and emails a report via Microsoft Graph
+(service account `procurementdatateam@montefiore.org`): a one-line summary (all
+success, or `X/Y` failed), a per-target status table (Process / Status / DB
+Connection / Target Type / Last Run / Error, with `des1`→**PRIME** and
+`des2`→**O2**), the log file(s) attached for any failure, and a consolidated
+copy‑pasteable rerun command for the failed/skipped/blocked entries (entries that
+share the same flags are batched into one invocation; `--prd-only` failures, full
+loader reruns, and `post-run --process a b` each get their own line).
+
+`BLOCKED` counts with the skips, not the failures — a process that never ran
+because its loader failed is not a second alarm. The roster the percentages read
+against (`X/Y`) includes the post-processes, so one that never ran shows under
+"did not run today".
 Reading ETLHealth is **read-only** — it never writes to the database. When a loader
 ran more than once in the day, only its latest run is shown (and drives the
 summary).

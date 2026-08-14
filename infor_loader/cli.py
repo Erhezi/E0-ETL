@@ -62,6 +62,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     _add_phase_flags(parser)
     _add_destination_flag(parser)
+    _add_post_run_flags(parser)
     _add_notify_flags(parser)
 
     subparsers = parser.add_subparsers(dest="command", required=False)
@@ -91,6 +92,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     _add_phase_flags(run_parser)
     _add_destination_flag(run_parser)
+    _add_post_run_flags(run_parser)
     _add_notify_flags(run_parser)
 
     files_parser = subparsers.add_parser(
@@ -122,6 +124,44 @@ def main(argv: list[str] | None = None) -> int:
     table_parser.add_argument("--database", required=True)
     table_parser.add_argument("--schema", required=True)
     table_parser.add_argument("--table", required=True)
+
+    post_parser = subparsers.add_parser(
+        "post-run",
+        help="Run the post-load processes (PLM / Preprocessor / BullardBurnDown) that "
+        "follow the daily loaders.",
+    )
+    post_parser.add_argument(
+        "--process",
+        action="extend",
+        nargs="+",
+        default=[],
+        help="Post-process name(s) to run. Space-separate several or repeat the flag.",
+    )
+    post_parser.add_argument("--tag", action="extend", nargs="+", default=[], help="Select post-processes by tag.")
+    post_parser.add_argument("--all", action="store_true", help="Run every enabled post-process.")
+    post_parser.add_argument("--auto", action="store_true", help="Skip the confirmation prompt and run immediately.")
+    post_parser.add_argument("--list", action="store_true", dest="list_processes", help="List configured post-processes and exit.")
+    post_parser.add_argument(
+        "--date",
+        default=None,
+        help="Date whose ETLHealth rows the requirement gate checks, YYYY-MM-DD (default: today).",
+    )
+    post_parser.add_argument(
+        "--ignore-gate",
+        action="store_true",
+        help="Run even when a required loader is not SUCCESS today. For a deliberate "
+        "rerun after the upstream loader was fixed by hand.",
+    )
+    post_parser.add_argument("--log-root", default=None, help="Override each process's YAML logging.log_root.")
+    post_parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=None,
+        help="Run this many processes concurrently (they have no dependencies on each "
+        "other). Defaults to 1: the batch procs are heavy and share a server.",
+    )
+    _add_destination_flag(post_parser)
+    _add_notify_flags(post_parser)
 
     notify_parser = subparsers.add_parser(
         "notify",
@@ -165,8 +205,11 @@ def main(argv: list[str] | None = None) -> int:
                 ignore_download=args.ignore_download,
                 destinations=args.destination,
             )
+            # Post-load processes run BEFORE the email so one report covers the
+            # loaders and everything downstream of them.
+            post_code = _maybe_post_run(args)
             _maybe_notify(args)
-            return exit_code
+            return exit_code or post_code
         parser.print_help(sys.stderr)
         return 2
 
@@ -188,6 +231,9 @@ def main(argv: list[str] | None = None) -> int:
             dry_run=args.dry_run,
             save_html=args.save_html,
         )
+
+    if args.command == "post-run":
+        return run_post_run(args)
 
     if args.command == "move-files":
         return run_move_files(
@@ -245,8 +291,9 @@ def main(argv: list[str] | None = None) -> int:
         # A FILE_NOT_FOUND skip (no fresh download) is a benign, expected outcome,
         # not a failure: it must not turn the whole run's exit code non-zero.
         exit_code = 0 if all(result.status in {"SUCCESS", "FILE_NOT_FOUND"} for result in results) else 1
+        post_code = _maybe_post_run(args)
         _maybe_notify(args)
-        return exit_code
+        return exit_code or post_code
 
     raise ValueError(f"Unknown command: {args.command}")
 
@@ -897,6 +944,267 @@ def _maybe_notify(args: argparse.Namespace) -> None:
             print("Notification step returned non-zero (email not sent).", file=sys.stderr)
     except Exception as exc:  # noqa: BLE001 - email must never fail the load.
         print(f"Notification step failed (load unaffected): {exc}", file=sys.stderr)
+
+
+# ── Post-load processes ──────────────────────────────────────────
+
+# Only three processes exist, and two of them are heavy batch procs on one server.
+POST_PROCESS_MAX_WORKERS_CAP = 3
+
+
+def _add_post_run_flags(parser: argparse.ArgumentParser) -> None:
+    """Flags that let a batch run continue into the post-load processes when the
+    loaders finish. The dedicated ``post-run`` subcommand exposes the fuller set
+    (--list, --date, tag selection, confirmation prompt)."""
+    parser.add_argument(
+        "--post-run",
+        action="store_true",
+        help="After the loaders finish, run the post-load processes (PLM / Preprocessor "
+        "/ BullardBurnDown). Each checks its required loaders in today's ETLHealth first "
+        "and records BLOCKED instead of running if any is not SUCCESS.",
+    )
+    parser.add_argument(
+        "--post-process",
+        action="extend",
+        nargs="+",
+        default=[],
+        help="Limit --post-run to the named process(es). Default: every enabled one.",
+    )
+    parser.add_argument(
+        "--ignore-gate",
+        action="store_true",
+        help="Skip the post-run requirement check and run the processes regardless of "
+        "the upstream loaders' status.",
+    )
+
+
+def _maybe_post_run(args: argparse.Namespace) -> int:
+    """Run the post-load processes after a batch run when ``--post-run`` was passed.
+
+    Returns this step's exit-code contribution. Unlike the email step, this is real
+    work against prod, so a FAILED process does surface in the run's exit code -- but
+    a BLOCKED one does not, matching how a loader's FILE_NOT_FOUND skip is treated.
+    """
+    if not getattr(args, "post_run", False):
+        return 0
+
+    from .post_process import (
+        filter_process_destinations,
+        load_post_process_configs,
+        run_post_processes,
+        select_processes,
+    )
+
+    try:
+        processes = [process for process in load_post_process_configs(args.config) if process.enabled]
+        names = getattr(args, "post_process", []) or []
+        if names:
+            processes = select_processes(processes, names=names)
+        requested = getattr(args, "destination", []) or []
+        if requested:
+            # Narrow to the destinations the processes actually declare. A batch run
+            # aimed at a side no post-process targets yet (des2) is a normal thing to
+            # do -- skip quietly rather than failing the run on a name mismatch. The
+            # `post-run` subcommand still rejects an unknown name as the typo it is.
+            declared = {
+                destination.name for process in processes for destination in process.destinations
+            }
+            wanted = [name for name in requested if name in declared]
+            if not wanted:
+                print(
+                    f"--post-run: no post-process declares destination(s) "
+                    f"{', '.join(requested)}; skipping.",
+                    file=sys.stderr,
+                )
+                return 0
+            processes = filter_process_destinations(processes, wanted)
+    except (OSError, ValueError) as exc:
+        print(f"--post-run: {exc}", file=sys.stderr)
+        return 1
+
+    if not processes:
+        print("--post-run: no enabled post-processes selected.", file=sys.stderr)
+        return 0
+
+    print()
+    print(f"Post-load processes: {', '.join(process.name for process in processes)}")
+    results = run_post_processes(
+        processes,
+        config_ref=args.config,
+        ignore_gate=getattr(args, "ignore_gate", False),
+    )
+    print_post_results(results)
+    return post_run_exit_code(results)
+
+
+def run_post_run(args: argparse.Namespace) -> int:
+    """The ``post-run`` subcommand: drive the post-load processes on their own.
+
+    Same selection / summary / confirm shape as a loader run, so a process can be
+    re-driven detached from the daily batch -- typically after a required loader was
+    fixed and re-run, which clears the gate without any flag.
+    """
+    from .post_process import (
+        filter_process_destinations,
+        load_post_process_configs,
+        run_post_processes,
+        select_processes,
+    )
+
+    try:
+        processes = load_post_process_configs(args.config)
+    except (OSError, ValueError) as exc:
+        print(f"post-run: {exc}", file=sys.stderr)
+        return 2
+
+    if not processes:
+        print(
+            f"No post-processes configured under {Path(args.config) / 'post_processes'}.",
+            file=sys.stderr,
+        )
+        return 2
+
+    if args.list_processes:
+        for process in processes:
+            enabled = "enabled" if process.enabled else "disabled"
+            requires = ",".join(process.requires.loaders) or "(none)"
+            destinations = "; ".join(
+                destination.display_name() for destination in process.destinations
+            )
+            print(
+                f"{process.name}\t{enabled}\t{','.join(process.tags)}\t"
+                f"requires={requires}\t{destinations}"
+            )
+        return 0
+
+    if not (args.all or args.process or args.tag):
+        print(
+            "post-run: select what to run with --all, --process <name>, or --tag <tag> "
+            "(--list shows what is configured).",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
+        selected = processes if args.all else select_processes(processes, names=args.process, tags=args.tag)
+        selected = [process for process in selected if process.enabled]
+        selected = filter_process_destinations(selected, args.destination)
+    except ValueError as exc:
+        print(f"post-run: {exc}", file=sys.stderr)
+        return 2
+
+    if not selected:
+        print("No enabled post-processes selected.", file=sys.stderr)
+        return 2
+
+    report_date = _parse_report_date(args.date) or dt.date.today()
+    if args.ignore_gate:
+        print("Requirement gate: OFF (--ignore-gate; upstream loader status is not checked)")
+    else:
+        print(
+            "Requirement gate: ON (each process's required loaders must be SUCCESS in "
+            f"ETLHealth for {report_date.isoformat()})"
+        )
+    if args.destination:
+        print(f"Destinations: {', '.join(args.destination)} ONLY")
+    print()
+    for process in selected:
+        print_process_summary(process)
+        print()
+
+    if not args.auto and not confirm_post_run(selected):
+        print("Aborted; nothing was run.")
+        return 1
+
+    results = run_post_processes(
+        selected,
+        config_ref=args.config,
+        log_root=args.log_root,
+        report_date=report_date,
+        ignore_gate=args.ignore_gate,
+        max_workers=_resolve_post_max_workers(args),
+    )
+    print_post_results(results)
+    exit_code = post_run_exit_code(results)
+    _maybe_notify(args)
+    return exit_code
+
+
+def print_process_summary(process: Any) -> None:
+    print(f"Post-process: {process.name}")
+    print(f"  enabled:  {process.enabled}")
+    print(f"  tags:     {', '.join(process.tags) if process.tags else '(none)'}")
+    requires = process.requires
+    if requires.loaders:
+        print(
+            f"  requires: {', '.join(requires.loaders)} SUCCESS today "
+            f"(scope={requires.scope}, on_unmet={requires.on_unmet})"
+        )
+    else:
+        print("  requires: (nothing)")
+    print("  destinations:")
+    for destination in process.destinations:
+        state = "" if destination.enabled else "   (disabled)"
+        print(f"    - {destination.display_name()}{state}")
+        for step in destination.steps:
+            what = step.exec_sql or f"python:{step.python}"
+            print(f"        {step.name}: {what}")
+    print(f"  logs:     {process.log_root}")
+
+
+def confirm_post_run(processes: list[Any]) -> bool:
+    names = ", ".join(process.name for process in processes)
+    print(f"About to run {len(processes)} post-process(es): {names}")
+    print("This executes the batch procedures against the LIVE tables shown above.")
+    while True:
+        try:
+            answer = input("Proceed? Type 'yes' to run, 'no' to exit: ").strip().lower()
+        except EOFError:
+            return False
+        if answer in {"yes", "y"}:
+            return True
+        if answer in {"no", "n"}:
+            return False
+        print("Please type 'yes' or 'no'.")
+
+
+def print_post_results(results: list[Any]) -> None:
+    for result in results:
+        row_text = "" if result.row_count is None else f" rows={result.row_count}"
+        print(
+            f"{result.status}\t{result.process}\t{result.duration_seconds}s{row_text}\t"
+            f"{result.log_file_path}"
+        )
+        # Name what a blocked destination is waiting on: it is the one detail the
+        # single rolled-up ETLHealth row cannot be read off at a glance.
+        for outcome in result.destinations:
+            if outcome.unmet:
+                print(f"  {outcome.destination.name} blocked by: {'; '.join(outcome.unmet)}")
+
+
+def post_run_exit_code(results: list[Any]) -> int:
+    """0 unless a process actually FAILED.
+
+    BLOCKED is benign: the loader it waits on already reports its own failure, and
+    counting it again would make one bad loader look like two broken jobs.
+    """
+    from .post_process import STATUS_BLOCKED, STATUS_SUCCESS
+
+    return 0 if all(result.status in {STATUS_SUCCESS, STATUS_BLOCKED} for result in results) else 1
+
+
+def _resolve_post_max_workers(args: argparse.Namespace) -> int:
+    requested = args.max_workers
+    if requested is None:
+        return 1
+    if requested > POST_PROCESS_MAX_WORKERS_CAP:
+        print(
+            f"--max-workers {requested} exceeds the post-run cap; "
+            f"using {POST_PROCESS_MAX_WORKERS_CAP}.",
+            file=sys.stderr,
+        )
+        return POST_PROCESS_MAX_WORKERS_CAP
+    return max(1, requested)
 
 
 def run_interactive(

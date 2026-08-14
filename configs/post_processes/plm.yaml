@@ -1,0 +1,61 @@
+name: plm
+enabled: true
+tags: [daily, post_process]
+
+process:
+  name: PLM Batch
+  frequency: Workdays
+
+# Loaders that must show SUCCESS in today's ETLHealth before this runs.
+# These are loader `name`s (configs/loaders/daily/*.yaml), not ETLHealth
+# ProcessNames -- the runner resolves one to the other from the loader configs.
+#   scope: destination = only the rows written on THIS destination's server, so a
+#          des2 failure never blocks des1 work that is fine. (any = clean everywhere)
+#   on_unmet: block    = record BLOCKED, execute nothing, leave the run's exit code
+#          alone; the upstream loader's own FAILED row is the real alarm.
+# Bypass for a deliberate manual rerun with `post-run --process plm --ignore-gate`.
+requires:
+  loaders: [inventory_location, inventory_transaction]
+  scope: destination
+  on_unmet: block
+
+# The top-level proc owns the batch: its sub-procedures log their own results to the
+# PLM process_log table, so only ONE ETLHealth row is written here (the verdict).
+# Per-step timings and the failing traceback go to this run's log file.
+destinations:
+  - name: des1
+    enabled: true
+    server: MISCPrdAdhocDB
+    database: PRIME
+    schema: PLM
+    steps:
+      - name: run_plm_batch
+        exec: EXEC [PLM].[usp_RunPLM_Batch]
+        timeout_seconds: 1200
+
+  # des2 is not deployed yet. When it is, add the block below -- the requirement
+  # gate then checks the des2 rows of the same loaders, because scope is
+  # `destination`. Nothing else needs to change.
+  #
+  # - name: des2
+  #   enabled: true
+  #   server: YNBBSTVWP02\PROCDATASRVPROD
+  #   database: PLMPreprocessorShared
+  #   schema: PLM
+  #   steps:
+  #     - name: run_plm_batch
+  #       exec: EXEC [PLM].[usp_RunPLM_Batch]
+  #       timeout_seconds: 3600
+
+health_table:
+  server: 'YNBBSTVWP02\PROCDATASRVPROD'
+  database: SCSFileIngestor
+  schema: InforLoader
+  table: ETLHealth
+
+logging:
+  # <loader name> is substituted with this process's name (plm).
+  log_root: '\\montefiore.org\centralfiles\data\Procurement PMO\dli2\DailyLoader\<loader name>\logs'
+  level: INFO
+  console: true          # echo run logs to the console (stderr) for Task Scheduler output
+  capture_streams: true  # capture stdout/stderr (prints, warnings, tracebacks) into the log file

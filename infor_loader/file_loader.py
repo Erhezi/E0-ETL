@@ -208,7 +208,7 @@ class FileLoader:
                     logger=logger,
                 )
 
-        self._close_logger(logger)
+        close_logger(logger)
 
         return LoaderResult(
             loader_name=self.config.name,
@@ -1053,65 +1053,92 @@ class FileLoader:
         ]
 
     def _build_logger(self, process_id: str) -> tuple[logging.Logger, Path, str | None]:
-        stamp = datetime.now().strftime("%Y%m%d")
-        log_dir, fallback_note = self._resolve_log_dir(stamp)
-        log_file_path = log_dir / f"{self.config.name}_{process_id}.log"
-
-        logger = logging.getLogger(f"infor_loader.{self.config.name}.{process_id}")
-        logger.setLevel(self._log_level())
-        logger.propagate = False
-        formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s - %(message)s")
-
-        file_handler = logging.FileHandler(log_file_path, encoding="utf-8")
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
-
-        if self.config.log_to_console:
-            # Bind to the real stderr *now*, before _capture_streams replaces it,
-            # so console output never feeds back into the capture writer.
-            console_handler = logging.StreamHandler(sys.stderr)
-            console_handler.setFormatter(formatter)
-            logger.addHandler(console_handler)
-
-        if fallback_note:
-            # Record why the configured log_root was not used, now that the logger exists.
-            logger.warning(fallback_note)
-
-        return logger, log_file_path, fallback_note
-
-    def _resolve_log_dir(self, stamp: str) -> tuple[Path, str | None]:
-        """Return the dated log directory to use, plus a warning note if the
-        configured ``log_root`` was unusable and a local fallback was chosen.
-
-        The logger is built before the run's try/except, so an unwritable
-        ``log_root`` (e.g. an unreachable network share) must not crash the job:
-        we fall back to a local ``logs\\<loader>`` folder and continue, so the
-        load still runs and still writes its ETLHealth row.
-        """
-        primary = self.log_root / stamp
-        try:
-            primary.mkdir(parents=True, exist_ok=True)
-            return primary, None
-        except OSError as exc:
-            fallback = Path("logs") / self.config.name / stamp
-            fallback.mkdir(parents=True, exist_ok=True)
-            note = (
-                f"Configured log_root {self.log_root} is not usable ({exc.strerror or exc}); "
-                f"logging to local fallback {fallback.resolve()} instead."
-            )
-            # The file logger does not exist yet, so surface this on stderr too.
-            print(f"WARNING: {note}", file=sys.stderr)
-            return fallback, note
+        return build_run_logger(
+            name=self.config.name,
+            process_id=process_id,
+            log_root=self.log_root,
+            level=self._log_level(),
+            to_console=self.config.log_to_console,
+        )
 
     def _log_level(self) -> int:
         level = logging.getLevelName(str(self.config.log_level).upper())
         return level if isinstance(level, int) else logging.INFO
 
-    @staticmethod
-    def _close_logger(logger: logging.Logger) -> None:
-        for handler in list(logger.handlers):
-            handler.close()
-            logger.removeHandler(handler)
+
+def build_run_logger(
+    *,
+    name: str,
+    process_id: str,
+    log_root: Path,
+    level: int,
+    to_console: bool,
+) -> tuple[logging.Logger, Path, str | None]:
+    """Build one run's file logger and return it with its log path and any
+    log-root fallback note.
+
+    Shared by the file loaders and the post-load processes (post_process.py) so
+    both write their per-run log the same way: a dated folder under ``log_root``,
+    one ``<name>_<process_id>.log`` per run, and the same fallback behavior when
+    ``log_root`` is unreachable.
+    """
+    stamp = datetime.now().strftime("%Y%m%d")
+    log_dir, fallback_note = resolve_log_dir(log_root, name, stamp)
+    log_file_path = log_dir / f"{name}_{process_id}.log"
+
+    logger = logging.getLogger(f"infor_loader.{name}.{process_id}")
+    logger.setLevel(level)
+    logger.propagate = False
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s - %(message)s")
+
+    file_handler = logging.FileHandler(log_file_path, encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    if to_console:
+        # Bind to the real stderr *now*, before _capture_streams replaces it,
+        # so console output never feeds back into the capture writer.
+        console_handler = logging.StreamHandler(sys.stderr)
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
+
+    if fallback_note:
+        # Record why the configured log_root was not used, now that the logger exists.
+        logger.warning(fallback_note)
+
+    return logger, log_file_path, fallback_note
+
+
+def resolve_log_dir(log_root: Path, name: str, stamp: str) -> tuple[Path, str | None]:
+    """Return the dated log directory to use, plus a warning note if the
+    configured ``log_root`` was unusable and a local fallback was chosen.
+
+    The logger is built before the run's try/except, so an unwritable
+    ``log_root`` (e.g. an unreachable network share) must not crash the job:
+    we fall back to a local ``logs\\<name>`` folder and continue, so the
+    run still happens and still writes its ETLHealth row.
+    """
+    primary = log_root / stamp
+    try:
+        primary.mkdir(parents=True, exist_ok=True)
+        return primary, None
+    except OSError as exc:
+        fallback = Path("logs") / name / stamp
+        fallback.mkdir(parents=True, exist_ok=True)
+        note = (
+            f"Configured log_root {log_root} is not usable ({exc.strerror or exc}); "
+            f"logging to local fallback {fallback.resolve()} instead."
+        )
+        # The file logger does not exist yet, so surface this on stderr too.
+        print(f"WARNING: {note}", file=sys.stderr)
+        return fallback, note
+
+
+def close_logger(logger: logging.Logger) -> None:
+    """Close and detach every handler so the run's log file is released."""
+    for handler in list(logger.handlers):
+        handler.close()
+        logger.removeHandler(handler)
 
 
 def _stg_table_name(step: StepResult) -> str:

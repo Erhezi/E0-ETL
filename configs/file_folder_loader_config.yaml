@@ -213,6 +213,27 @@ inputs:
         - 'FD5.csv'
         - 'FD5 (*).csv'
 
+  # NOT AN INPUT -- a note so the file is not mistaken for junk. A fixture sits
+  # next to company_map at misc_mdm\obsolete_cost_center_FD1_names.csv: eight
+  # 300xx cost centers with their names (columns FinanceDimension1,Description,
+  # the same shape as FD1.csv so it merges on FD1 the way fd3/fd5 do).
+  #
+  # Why it exists: those cost centers still show up on exported transactions but
+  # were never published with a description -- FD1.csv has no row for them (as of
+  # 2026-08, only 30069 has since appeared) -- so the names had to be hand-filled
+  # to get any label on the line. The old notebook carried them as an inline
+  # FD1_desc_fill dict.
+  #
+  # Why it is NOT wired up: the loader labels a line from the Index description
+  # (FD5), which IS published now, so the hand-filled FD1 names are no longer
+  # needed -- purchaseorder_line only falls back to FD1Text when the FD5 merge
+  # comes up empty. Kept in case a future consumer needs the FD1-side name; wire
+  # it in by adding an input entry here and a source file alias on the loader.
+  #
+  # obsolete_cost_center_fd1_names:
+  #   folder: misc_mdm
+  #   name: 'obsolete_cost_center_FD1_names.csv'
+
   # ---- App Preprocessor staging export : misc_mdm ------------------------
   # contract_line_error is TRANSACTIONAL (staging->prod), unlike the direct-load
   # mdm exports below: it loads a _stg table that the Preprocessor batch promotes.

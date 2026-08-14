@@ -1,0 +1,60 @@
+name: bullard_burn_down
+enabled: true
+tags: [daily, post_process]
+
+process:
+  name: Bullard Burn Down
+  frequency: Workdays
+
+# Same upstream feeds as PLM. See plm.yaml for what each key does.
+requires:
+  loaders: [inventory_location, inventory_transaction]
+  scope: destination
+  on_unmet: block
+
+# Two steps, ported from BullardBurnDownDaily.ipynb (the notebook is kept for
+# reference/ad-hoc use; this config is what runs unattended). They run in order and
+# roll up into ONE ETLHealth row -- per-step timings, row counts and any traceback
+# go to this run's log file. `python:` steps resolve inside infor_loader/processes/.
+destinations:
+  - name: des1
+    enabled: true
+    server: MISCPrdAdhocDB
+    database: PRIME
+    schema: BullardBurnDown
+    steps:
+      # sp_InsertDailyArchive per date across a trailing window. backfill_days: 3
+      # archives FOUR dates (today and the three before it), because a day's data
+      # keeps settling after it closes; the proc is idempotent per date.
+      - name: daily_archive
+        python: bullard.insert_daily_archive
+        target: sp_InsertDailyArchive
+        timeout_seconds: 600
+        options:
+          backfill_days: 3
+          procedure: BullardBurnDown.sp_InsertDailyArchive
+
+      # Rebuild the SearchTerms fixture from vw_SearchHelperPreAgg (truncate+insert).
+      - name: search_terms
+        python: bullard.build_search_terms
+        target: SearchTerms
+        timeout_seconds: 600
+        options:
+          source_view: BullardBurnDown.vw_SearchHelperPreAgg
+          target_table: SearchTerms
+          batch_size: 50000
+
+  # des2 is not deployed yet -- see the commented block in plm.yaml for the shape.
+
+health_table:
+  server: 'YNBBSTVWP02\PROCDATASRVPROD'
+  database: SCSFileIngestor
+  schema: InforLoader
+  table: ETLHealth
+
+logging:
+  # <loader name> is substituted with this process's name (bullard_burn_down).
+  log_root: '\\montefiore.org\centralfiles\data\Procurement PMO\dli2\DailyLoader\<loader name>\logs'
+  level: INFO
+  console: true
+  capture_streams: true

@@ -1,0 +1,42 @@
+name: preprocessor
+enabled: true
+tags: [daily, post_process]
+
+process:
+  name: Preprocessor Batch
+  frequency: Workdays
+
+# See plm.yaml for what each key does. The Preprocessor depends on the contract and
+# master-data feeds rather than the inventory ones.
+requires:
+  loaders: [ccx_sync_contract, contract_line, manufacturer, supplier]
+  scope: destination
+  on_unmet: block
+
+# One ETLHealth row (the verdict); the sub-procedures keep their own detail in the
+# Preprocessor process_log table, and this run's log file carries the traceback.
+destinations:
+  - name: des1
+    enabled: true
+    server: MISCPrdAdhocDB
+    database: PRIME
+    schema: Preprocessor
+    steps:
+      - name: run_preprocessor_batch
+        exec: EXEC [Preprocessor].[usp_RunPreprocessor_Batch]
+        timeout_seconds: 1200
+
+  # des2 is not deployed yet -- see the commented block in plm.yaml for the shape.
+
+health_table:
+  server: 'YNBBSTVWP02\PROCDATASRVPROD'
+  database: SCSFileIngestor
+  schema: InforLoader
+  table: ETLHealth
+
+logging:
+  # <loader name> is substituted with this process's name (preprocessor).
+  log_root: '\\montefiore.org\centralfiles\data\Procurement PMO\dli2\DailyLoader\<loader name>\logs'
+  level: INFO
+  console: true
+  capture_streams: true

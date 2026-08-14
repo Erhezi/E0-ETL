@@ -40,14 +40,25 @@ _HEALTH_COLUMNS = [
     "ProcessFrequency",
 ]
 
-# Status buckets. FILE_NOT_FOUND is a benign skip (no fresh download), not a failure
-# -- it must not count toward the failed tally (mirrors cli.run's exit-code rule).
+# Status buckets. FILE_NOT_FOUND (no fresh download) and BLOCKED (a post-load
+# process whose required loaders were not SUCCESS) are both benign skips, not
+# failures -- neither counts toward the failed tally, mirroring the exit-code rules
+# in cli.run and cli.post_run_exit_code.
 _STATUS_SKIPPED = "FILE_NOT_FOUND"
+_STATUS_BLOCKED = "BLOCKED"
 _STATUS_FAILED = "FAILED"
 _STATUS_SUCCESS = "SUCCESS"
 
-# Sort order for the table: failures first, then skips, then successes.
-_STATUS_RANK = {_STATUS_FAILED: 0, _STATUS_SKIPPED: 1, _STATUS_SUCCESS: 2}
+# Statuses that mean "did not run, and that is not itself an alarm".
+_BENIGN_SKIPS = frozenset({_STATUS_SKIPPED, _STATUS_BLOCKED})
+
+# Sort order for the table: failures first, then skips/blocks, then successes.
+_STATUS_RANK = {
+    _STATUS_FAILED: 0,
+    _STATUS_SKIPPED: 1,
+    _STATUS_BLOCKED: 2,
+    _STATUS_SUCCESS: 3,
+}
 
 
 # ── Secrets + config ────────────────────────────────────────────
@@ -79,21 +90,44 @@ def load_email_config(path: str = "configs/email.yaml") -> dict[str, Any]:
 
 
 def _daily_process_map(config_ref: str) -> dict[str, str]:
-    """Map ``ProcessName`` -> loader ``name`` for the daily (non-on-demand) loaders.
+    """Map ``ProcessName`` -> config ``name`` for the whole daily roster.
 
     ETLHealth stores the friendly ``ProcessName`` (e.g. ``Requisition Line``); the
-    rerun command needs the loader ``name`` (e.g. ``requisition_line``). Loaded from
+    rerun command needs the config ``name`` (e.g. ``requisition_line``). Loaded from
     the same configs the batch runs from, so the two never drift.
+
+    The roster is the daily (non-on-demand) file loaders PLUS the post-load
+    processes that follow them -- this map is also the report's filter, so a process
+    missing from it has its ETLHealth rows dropped from the report entirely.
     """
     from .cli import load_loader_configs
     from .file_folder import ON_DEMAND_TAG
+    from .post_process import load_post_process_configs
 
     process_map: dict[str, str] = {}
     for loader in load_loader_configs(config_ref):
         if ON_DEMAND_TAG in loader.tags:
             continue
         process_map[loader.process_name] = loader.name
+    for process in load_post_process_configs(config_ref):
+        if process.enabled:
+            process_map[process.process_name] = process.name
     return process_map
+
+
+def _post_process_names(config_ref: str) -> set[str]:
+    """``ProcessName``s belonging to post-load processes rather than file loaders.
+
+    They rerun through ``post-run --process``, not ``--loader``, so the rerun block
+    has to tell the two apart.
+    """
+    from .post_process import load_post_process_configs
+
+    return {
+        process.process_name
+        for process in load_post_process_configs(config_ref)
+        if process.enabled
+    }
 
 
 # ── ETLHealth read + consolidation ──────────────────────────────
@@ -178,11 +212,17 @@ def consolidate(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _process_status(process_rows: list[dict[str, Any]]) -> str:
+    """The one status for a process across its rows (des1/des2 x STG/PRD).
+
+    A failure anywhere wins. A benign skip only wins when EVERY row is one, so a
+    post-process that ran on des1 and was blocked on des2 still reads as a success
+    that skipped a side -- the same rule post_process._roll_up applies.
+    """
     statuses = {str(row.get("TaskStatus") or "") for row in process_rows}
     if _STATUS_FAILED in statuses:
         return _STATUS_FAILED
-    if statuses and statuses <= {_STATUS_SKIPPED}:
-        return _STATUS_SKIPPED
+    if statuses and statuses <= _BENIGN_SKIPS:
+        return _STATUS_BLOCKED if _STATUS_BLOCKED in statuses else _STATUS_SKIPPED
     return _STATUS_SUCCESS
 
 
@@ -200,8 +240,9 @@ def summarize(
     attempted = sorted(process_status)
     failed = sorted(n for n, s in process_status.items() if s == _STATUS_FAILED)
     skipped = sorted(n for n, s in process_status.items() if s == _STATUS_SKIPPED)
+    blocked = sorted(n for n, s in process_status.items() if s == _STATUS_BLOCKED)
     succeeded = sorted(n for n, s in process_status.items() if s == _STATUS_SUCCESS)
-    # Configured daily loaders that produced no ETLHealth row today (never ran).
+    # Configured daily loaders / post-processes that produced no ETLHealth row today.
     not_run = sorted(name for name in process_map if name not in process_status)
 
     # y = the full daily roster (ran + never-ran) so every count reads against the same
@@ -212,21 +253,25 @@ def summarize(
         f"{len(skipped)}/{total} skipped",
         f"{len(succeeded)}/{total} succeeded",
     ]
+    if blocked:
+        segments.insert(2, f"{len(blocked)}/{total} blocked")
     if not_run:
         segments.append(f"{len(not_run)}/{total} not run")
     headline = "; ".join(segments) + f" for {report_date.isoformat()}"
 
     return {
         "headline": headline,
-        "all_success": not failed and not skipped and not not_run,
+        "all_success": not failed and not skipped and not blocked and not not_run,
         "has_failures": bool(failed),
         "total": total,
         "n_failed": len(failed),
         "n_skipped": len(skipped),
+        "n_blocked": len(blocked),
         "n_succeeded": len(succeeded),
         "n_not_run": len(not_run),
         "failed": failed,
         "skipped": skipped,
+        "blocked": blocked,
         "succeeded": succeeded,
         "not_run": not_run,
         "process_status": process_status,
@@ -237,43 +282,53 @@ def summarize(
 def build_rerun_commands(
     summary: dict[str, Any],
     process_map: dict[str, str],
+    post_process_names: Iterable[str] = (),
 ) -> list[dict[str, str]]:
-    """Consolidated rerun commands for the failed AND skipped processes.
+    """Consolidated rerun commands for the failed, skipped AND blocked processes.
 
-    Loaders that share the same rerun flags are batched into ONE command -- the
-    CLI's ``--loader`` accepts several names (``--loader a b c``) -- so a day with
-    several failures yields one copy-pasteable line per flag group instead of one
-    per loader. Two groups:
+    Entries that share the same rerun flags are batched into ONE command -- both
+    ``--loader`` and ``post-run --process`` accept several names -- so a day with
+    several failures yields one copy-pasteable line per group instead of one per
+    process. Three groups:
 
-      * ``--prd-only``: failed processes whose only failed targets are ``PRD``
+      * ``--prd-only``: failed loaders whose only failed targets are ``PRD``
         (staging already succeeded -- promote without re-reading the file).
-      * full rerun (no phase flag): failed processes with a staging/read failure,
-        plus every skipped (FILE_NOT_FOUND) process -- re-read the file once it lands.
+      * full rerun (no phase flag): failed loaders with a staging/read failure,
+        plus every skipped (FILE_NOT_FOUND) loader -- re-read the file once it lands.
+      * ``post-run --process``: failed or blocked post-load processes. A blocked one
+        needs no flag beyond this: rerunning it re-checks the gate, which clears by
+        itself once the required loader has been re-run successfully.
 
-    A process with no matching loader config cannot be batched; it gets its own
-    ``# ... rerun by hand`` note. Uses the real loader ``name`` from the configs.
+    A process with no matching config cannot be batched; it gets its own
+    ``# ... rerun by hand`` note. Uses the real config ``name`` from the configs.
     """
+    post_names = set(post_process_names)
     prd_only_loaders: list[str] = []
     prd_only_processes: list[str] = []
     full_loaders: list[str] = []
     full_processes: list[str] = []
+    post_targets: list[str] = []
+    post_processes: list[str] = []
     unmatched: list[dict[str, str]] = []
 
     def route(process_name: str, *, prd_only: bool) -> None:
-        loader_name = process_map.get(process_name)
-        if loader_name is None:
+        target_name = process_map.get(process_name)
+        if target_name is None:
             unmatched.append(
                 {
-                    "command": f"# no loader config matched ProcessName '{process_name}'; rerun by hand",
+                    "command": f"# no config matched ProcessName '{process_name}'; rerun by hand",
                     "processes": process_name,
                     "reason": "unmatched",
                 }
             )
+        elif process_name in post_names:
+            post_targets.append(target_name)
+            post_processes.append(process_name)
         elif prd_only:
-            prd_only_loaders.append(loader_name)
+            prd_only_loaders.append(target_name)
             prd_only_processes.append(process_name)
         else:
-            full_loaders.append(loader_name)
+            full_loaders.append(target_name)
             full_processes.append(process_name)
 
     for process_name in summary["failed"]:
@@ -284,6 +339,8 @@ def build_rerun_commands(
         )
         route(process_name, prd_only=prd_only)
     for process_name in summary["skipped"]:
+        route(process_name, prd_only=False)
+    for process_name in summary.get("blocked", []):
         route(process_name, prd_only=False)
 
     commands: list[dict[str, str]] = []
@@ -307,6 +364,17 @@ def build_rerun_commands(
                 ),
                 "processes": ", ".join(full_processes),
                 "reason": "failed / skipped — full rerun",
+            }
+        )
+    if post_targets:
+        commands.append(
+            {
+                "command": (
+                    "python -B run_daily_loaders.py post-run --process "
+                    f"{' '.join(post_targets)} --auto"
+                ),
+                "processes": ", ".join(post_processes),
+                "reason": "failed / blocked — rerun once the required loaders are SUCCESS",
             }
         )
     commands.extend(unmatched)
@@ -337,6 +405,8 @@ _STATUS_COLORS = {
     _STATUS_SUCCESS: ("#e6f4ea", "#137333"),
     _STATUS_FAILED: ("#fce8e6", "#c5221f"),
     _STATUS_SKIPPED: ("#fef7e0", "#b06000"),
+    # Blocked reads as a skip, not a failure: the alarm is on the loader it waits for.
+    _STATUS_BLOCKED: ("#fef7e0", "#b06000"),
 }
 
 
@@ -416,6 +486,12 @@ def render_html(
     unified = (
         f'<span style="{seg}color:#c5221f;">{summary["n_failed"]}/{y} failed</span>'
         f'{sep}<span style="{seg}color:#b06000;">{summary["n_skipped"]}/{y} skipped</span>'
+    )
+    # Only shown when something is actually blocked, so the usual all-loader day
+    # keeps the three-metric line it has always had.
+    if summary.get("n_blocked"):
+        unified += f'{sep}<span style="{seg}color:#b06000;">{summary["n_blocked"]}/{y} blocked</span>'
+    unified += (
         f'{sep}<span style="{seg}color:#137333;">{summary["n_succeeded"]}/{y} succeeded</span>'
     )
     if summary["n_not_run"]:
@@ -624,10 +700,11 @@ def send_daily_report(
     report_name = notification.get("report_name", "Daily Loader Report")
 
     process_map = _daily_process_map(config_ref)
+    post_process_names = _post_process_names(config_ref)
     rows = fetch_health_rows(health_table, report_date, process_map.keys())
     consolidated = consolidate(rows)
     summary = summarize(consolidated, report_date, process_map)
-    rerun_commands = build_rerun_commands(summary, process_map)
+    rerun_commands = build_rerun_commands(summary, process_map, post_process_names)
     log_paths = failed_log_paths(consolidated)
 
     print(summary["headline"])

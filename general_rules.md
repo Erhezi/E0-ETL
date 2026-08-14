@@ -86,6 +86,28 @@ pair only untrimmed. Don't hack around it in a transform.
   with `stg_load`. Transactional loaders use `staging:` / `prod:` with
   post_sql promotion and keep `stg_load` / `prd_load`.
 
+## Post-load processes
+
+Jobs that run *after* the loaders (PLM, Preprocessor, BullardBurnDown) are
+declared in `configs\post_processes\<name>.yaml`, not as loaders — they read no
+file and have no staging/prod split.
+
+- Declare what a process needs under `requires.loaders` using loader **names**
+  (`inventory_location`), never the friendly ProcessName. Keep
+  `scope: destination` so one side's failure can't block the other, and
+  `on_unmet: block` so an unmet gate records BLOCKED instead of running on
+  stale data.
+- One ETLHealth row per process per destination, typed `PROC` — the verdict
+  only. Sub-procedure detail belongs in that process's own `process_log` table
+  and in the run's log file; don't fan it out into ETLHealth rows.
+- Keep steps ordered and idempotent: the first failure stops the destination,
+  and the fix is re-running the whole process, not resuming mid-way.
+- Put Python steps in `infor_loader\processes\`, one callable per step taking a
+  `StepContext`. Raise on failure — the runner records it and logs the
+  traceback; never swallow an error to keep a batch green.
+- Mirror the loaders' destination names (`des1`/`des2`) so `--destination`
+  addresses the same side across loaders and processes.
+
 ## Other conventions
 
 - `pk_check` lists destination column names; use `fail_on_pk_duplicates: false`
