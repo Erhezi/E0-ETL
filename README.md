@@ -521,9 +521,35 @@ python -B run_daily_loaders.py post-run --process plm --auto --ignore-gate
 ```
 
 `--destination`, `--log-root` and `--tag` work as they do for loaders. `--date`
-moves which day's ETLHealth rows the gate checks. `--max-workers` runs the
-processes concurrently (they have no dependencies on each other); it defaults to
-`1` because the batch procs are heavy and share a server.
+moves which day's ETLHealth rows the gate checks.
+
+### Concurrency: two axes that multiply
+
+| Flag | Controls | Default | Why |
+| ---- | -------- | ------- | --- |
+| `--max-workers` | how many **processes** overlap | `1` | PLM and Preprocessor are heavy procs on the **same** server — overlapping them buys contention |
+| `--destination-workers` | how many **destinations** of one process overlap | `2` | des1 and des2 are **different** servers, so there is nothing to contend over |
+
+At most `max-workers × destination-workers` procedures run at once. The defaults
+put exactly **one procedure on each server at a time**, which is the shape you
+want — both servers busy, neither doubled up:
+
+```text
+des1 (PRIME):   PLM ────► Preprocessor ────► Bullard ──►
+des2 (O2):      PLM ────► Preprocessor ────► Bullard ──►
+                wall clock = max(des1, des2), not the sum
+```
+
+Raising **both** is what stacks several procs onto one server. `post-run` prints
+the resolved product before it runs, so what you get is stated up front.
+
+Within a destination, steps always run **sequentially** in declaration order and
+the first failure stops the rest (recorded `NOT RUN` in the log). Every log line
+is tagged `[des1]` / `[des2]` so concurrent destinations stay readable in the one
+per-run log file.
+
+With des2 still commented out there is one enabled destination per process, so
+`--destination-workers` is a no-op today — the pool is never larger than the work.
 
 ### Run end to end with the loaders
 
@@ -538,6 +564,10 @@ Unlike `--notify`, this is real work against prod, so a `FAILED` process **does*
 make the run exit non-zero (a `BLOCKED` one does not). `--post-process <name>`
 limits which ones the flag runs. A run narrowed with `--destination` to a side no
 process targets yet simply skips this step with a note.
+
+On a batch run, `--max-workers` sizes the **loader** batch only — the processes
+always run one at a time there. `--destination-workers` *is* honored, so the two
+servers still work in parallel inside each process.
 
 ## Daily email notification
 

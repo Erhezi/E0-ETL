@@ -28,6 +28,7 @@ import logging
 import sys
 import traceback
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -55,6 +56,14 @@ STATUS_FAILED = "FAILED"
 STATUS_BLOCKED = "BLOCKED"
 #: A step that never started because an earlier step in the same destination failed.
 STATUS_NOT_RUN = "NOT RUN"
+
+#: Destinations run concurrently by default: des1 and des2 are different servers, so
+#: there is nothing for them to contend over and a process finishes in max(des1, des2)
+#: rather than the sum. Naturally bounded by how many destinations are enabled -- with
+#: des2 not yet deployed this changes nothing.
+DEFAULT_DESTINATION_WORKERS = 2
+#: Sanity bound; there are only ever a handful of destinations.
+DESTINATION_WORKERS_CAP = 4
 
 #: ETLHealth TargetTableType for a post-process row. These rows describe a procedure
 #: run, not a staging or production table load, so they take their own type rather
@@ -603,10 +612,13 @@ class PostProcessRunner:
         report_date: dt.date | None = None,
         ignore_gate: bool = False,
         process_map: dict[str, str] | None = None,
+        destination_workers: int = DEFAULT_DESTINATION_WORKERS,
     ) -> None:
         self.config = config
         self.log_root = Path(log_root or config.log_root)
         self.report_date = report_date or dt.date.today()
+        # How many of THIS process's destinations run at once (see _run_destinations).
+        self.destination_workers = max(1, destination_workers)
         # Skip the requirement gate for a deliberate manual rerun (mirrors the
         # loaders' --ignore-download): the operator has decided the upstream data is
         # good enough, e.g. after re-running the failed loader by hand.
@@ -641,11 +653,7 @@ class PostProcessRunner:
                 self.report_date.isoformat(),
             )
             try:
-                for destination in self.config.destinations:
-                    if not destination.enabled:
-                        logger.info("Skipping destination %s (disabled in config)", destination.name)
-                        continue
-                    outcomes.append(self._run_destination(destination, logger))
+                outcomes = self._run_destinations(logger)
 
                 status, error = _roll_up(outcomes)
                 counts = [
@@ -683,19 +691,67 @@ class PostProcessRunner:
             destinations=outcomes,
         )
 
+    def _run_destinations(self, logger: logging.Logger) -> list[DestinationOutcome]:
+        """Run every enabled destination and return their outcomes in config order.
+
+        des1 and des2 are different SERVERS, so there is nothing to contend over --
+        each destination opens its own connection, checks its own gate and produces
+        its own outcome. Running them together therefore costs nothing and makes a
+        process take max(des1, des2) instead of the sum. Concurrency is per
+        destination, NOT per process, precisely because processes DO share a server.
+
+        Every destination gets a name-prefixed logger so the single per-run log file
+        stays readable when two of them interleave.
+        """
+        enabled: list[ProcessDestination] = []
+        for destination in self.config.destinations:
+            if not destination.enabled:
+                logger.info("Skipping destination %s (disabled in config)", destination.name)
+                continue
+            enabled.append(destination)
+        if not enabled:
+            return []
+
+        # Never more threads than there is work: with one destination configured
+        # (des2 not deployed yet) this stays sequential no matter what was asked for.
+        workers = min(self.destination_workers, len(enabled))
+        if workers <= 1:
+            return [
+                self._run_destination(destination, _destination_logger(logger, destination))
+                for destination in enabled
+            ]
+
+        logger.info(
+            "Running %s destinations concurrently: %s",
+            len(enabled),
+            ", ".join(destination.name for destination in enabled),
+        )
+        collected: list[tuple[int, DestinationOutcome]] = []
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(
+                    self._run_destination, destination, _destination_logger(logger, destination)
+                ): index
+                for index, destination in enumerate(enabled)
+            }
+            # A raise propagates to run()'s handler and fails the whole process, but
+            # the executor still waits for the other destination on the way out --
+            # a batch proc already running is left to finish, not orphaned mid-flight.
+            for future in as_completed(futures):
+                collected.append((futures[future], future.result()))
+        collected.sort(key=lambda item: item[0])
+        return [outcome for _, outcome in collected]
+
     def _run_destination(
         self, destination: ProcessDestination, logger: logging.Logger
     ) -> DestinationOutcome:
         start_perf = perf_counter()
-        logger.info("Destination %s -> %s", destination.name, destination.display_name())
+        logger.info("Starting %s", destination.display_name())
 
         unmet = self._check_gate(destination, logger)
         if unmet and self.config.requires.on_unmet == "block":
             logger.warning(
-                "Destination %s is %s: %s. No statement was executed.",
-                destination.name,
-                STATUS_BLOCKED,
-                "; ".join(unmet),
+                "%s: %s. No statement was executed.", STATUS_BLOCKED, "; ".join(unmet)
             )
             return DestinationOutcome(
                 destination=destination,
@@ -759,7 +815,7 @@ class PostProcessRunner:
             cnxn.close()
 
         counts = [outcome.row_count for outcome in steps if outcome.row_count is not None]
-        _log_step_summary(destination, steps, logger)
+        _log_step_summary(steps, logger)
         return DestinationOutcome(
             destination=destination,
             status=STATUS_FAILED if error else STATUS_SUCCESS,
@@ -875,13 +931,22 @@ def run_post_processes(
     report_date: dt.date | None = None,
     ignore_gate: bool = False,
     max_workers: int = 1,
+    destination_workers: int = DEFAULT_DESTINATION_WORKERS,
 ) -> list[PostProcessResult]:
     """Run each selected post-process and return one result apiece.
 
-    Sequential by default: the batch procs are heavy and currently share one server,
-    so overlapping them buys little and costs contention. ``max_workers`` > 1 runs
-    them concurrently (they have no dependencies on each other), with stream capture
-    forced off, exactly as ``run_loaders`` does.
+    Two INDEPENDENT concurrency axes, which multiply -- at most
+    ``max_workers x destination_workers`` procedures run at once:
+
+    * ``max_workers`` -- how many PROCESSES overlap. Defaults to 1 because the batch
+      procs are heavy and PLM/Preprocessor share a server, so overlapping them buys
+      little and costs contention.
+    * ``destination_workers`` -- how many DESTINATIONS of one process overlap.
+      Defaults to 2 because des1 and des2 are different servers with nothing to
+      contend over.
+
+    The defaults therefore put exactly one procedure on each server at a time, which
+    is the shape you want; raising both is what would stack several onto one server.
     """
     # Built once for the whole batch: every process's gate resolves loader names
     # against the same map instead of re-parsing every loader YAML per process.
@@ -895,12 +960,11 @@ def run_post_processes(
             report_date=report_date,
             ignore_gate=ignore_gate,
             process_map=process_map,
+            destination_workers=destination_workers,
         )
 
     if max_workers <= 1:
         return [make(process, capture=None).run() for process in processes]
-
-    from concurrent.futures import ThreadPoolExecutor, as_completed
 
     results: list[PostProcessResult] = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -956,11 +1020,28 @@ def _process_type(destination: ProcessDestination) -> str:
     return "mixed"
 
 
-def _log_step_summary(
-    destination: ProcessDestination, steps: list[StepOutcome], logger: logging.Logger
-) -> None:
+class _DestinationLogAdapter(logging.LoggerAdapter):
+    """Tag every line with the destination it came from.
+
+    Destinations share one per-run log file, so once two of them run concurrently an
+    untagged ``Step 1/2: daily_archive`` is ambiguous. The prefix is applied even
+    when running sequentially, so the log format does not change shape depending on
+    how the run was invoked.
+    """
+
+    def process(self, msg: Any, kwargs: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
+        return f"[{self.extra['destination']}] {msg}", kwargs
+
+
+def _destination_logger(
+    logger: logging.Logger, destination: ProcessDestination
+) -> logging.LoggerAdapter:
+    return _DestinationLogAdapter(logger, {"destination": destination.name})
+
+
+def _log_step_summary(steps: list[StepOutcome], logger: logging.Logger) -> None:
     """Write the per-step breakdown the single ETLHealth row deliberately omits."""
-    logger.info("Step summary for destination %s:", destination.name)
+    logger.info("Step summary:")
     for outcome in steps:
         rows = "" if outcome.row_count is None else f" rows={outcome.row_count}"
         logger.info(

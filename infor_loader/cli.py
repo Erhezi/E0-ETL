@@ -24,6 +24,7 @@ from .file_folder import (
     select_inputs,
 )
 from .file_loader import FileLoader, LoaderResult
+from .post_process import DEFAULT_DESTINATION_WORKERS, DESTINATION_WORKERS_CAP
 from .utilities import build_column_mapping_template, inspect_table, write_mapping_template
 
 
@@ -159,6 +160,14 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Run this many processes concurrently (they have no dependencies on each "
         "other). Defaults to 1: the batch procs are heavy and share a server.",
+    )
+    post_parser.add_argument(
+        "--destination-workers",
+        type=int,
+        default=None,
+        help="How many destinations of each process run at once (des1/des2 are "
+        f"different servers, so this is the cheap axis). Defaults to "
+        f"{DEFAULT_DESTINATION_WORKERS}. Multiplies with --max-workers.",
     )
     _add_destination_flag(post_parser)
     _add_notify_flags(post_parser)
@@ -976,6 +985,14 @@ def _add_post_run_flags(parser: argparse.ArgumentParser) -> None:
         help="Skip the post-run requirement check and run the processes regardless of "
         "the upstream loaders' status.",
     )
+    parser.add_argument(
+        "--destination-workers",
+        type=int,
+        default=None,
+        help="How many destinations of each post-process run at once (des1/des2 are "
+        f"different servers). Defaults to {DEFAULT_DESTINATION_WORKERS}. Independent of "
+        "--max-workers, which sizes the LOADER batch.",
+    )
 
 
 def _maybe_post_run(args: argparse.Namespace) -> int:
@@ -1026,12 +1043,17 @@ def _maybe_post_run(args: argparse.Namespace) -> int:
         print("--post-run: no enabled post-processes selected.", file=sys.stderr)
         return 0
 
+    destination_workers = _resolve_destination_workers(args)
     print()
-    print(f"Post-load processes: {', '.join(process.name for process in processes)}")
+    print(
+        f"Post-load processes: {', '.join(process.name for process in processes)} "
+        f"(sequential; up to {destination_workers} destination(s) each at once)"
+    )
     results = run_post_processes(
         processes,
         config_ref=args.config,
         ignore_gate=getattr(args, "ignore_gate", False),
+        destination_workers=destination_workers,
     )
     print_post_results(results)
     return post_run_exit_code(results)
@@ -1107,6 +1129,14 @@ def run_post_run(args: argparse.Namespace) -> int:
         )
     if args.destination:
         print(f"Destinations: {', '.join(args.destination)} ONLY")
+    # The two axes multiply, so show the product: that is how many procedures can be
+    # running at the same moment, and what decides whether a server sees more than one.
+    process_workers = _resolve_post_max_workers(args)
+    destination_workers = _resolve_destination_workers(args)
+    print(
+        f"Concurrency: up to {process_workers} process(es) x {destination_workers} "
+        f"destination(s) = {process_workers * destination_workers} procedure(s) at once"
+    )
     print()
     for process in selected:
         print_process_summary(process)
@@ -1122,7 +1152,8 @@ def run_post_run(args: argparse.Namespace) -> int:
         log_root=args.log_root,
         report_date=report_date,
         ignore_gate=args.ignore_gate,
-        max_workers=_resolve_post_max_workers(args),
+        max_workers=process_workers,
+        destination_workers=destination_workers,
     )
     print_post_results(results)
     exit_code = post_run_exit_code(results)
@@ -1191,6 +1222,26 @@ def post_run_exit_code(results: list[Any]) -> int:
     from .post_process import STATUS_BLOCKED, STATUS_SUCCESS
 
     return 0 if all(result.status in {STATUS_SUCCESS, STATUS_BLOCKED} for result in results) else 1
+
+
+def _resolve_destination_workers(args: argparse.Namespace) -> int:
+    """How many destinations of one post-process run at once.
+
+    Independent of ``--max-workers`` (which sizes the loader batch, and on the
+    ``post-run`` subcommand the *process* batch): des1 and des2 are different
+    servers, so this axis is cheap where the process axis is not.
+    """
+    requested = getattr(args, "destination_workers", None)
+    if requested is None:
+        return DEFAULT_DESTINATION_WORKERS
+    if requested > DESTINATION_WORKERS_CAP:
+        print(
+            f"--destination-workers {requested} exceeds the cap; "
+            f"using {DESTINATION_WORKERS_CAP}.",
+            file=sys.stderr,
+        )
+        return DESTINATION_WORKERS_CAP
+    return max(1, requested)
 
 
 def _resolve_post_max_workers(args: argparse.Namespace) -> int:
