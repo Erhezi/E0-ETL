@@ -436,6 +436,41 @@ def vendor_location(df: pd.DataFrame, loader_config: Any, dataframes: dict[str, 
     return df
 
 
+@register("vendor")
+def vendor(df: pd.DataFrame, loader_config: Any, dataframes: dict[str, pd.DataFrame], logger: logging.Logger) -> pd.DataFrame:
+    # Column selection, source->destination renaming, datetime typing of the two
+    # stamps, and blank-filling are all handled by the mapping pipeline (see
+    # vendor.yaml). This transform does two things the mapping cannot.
+    #
+    # 1. Drop the export's trailer rows. Unlike every other Infor export in this
+    #    repo, the vendor saved search ships with subtotals ON, so the file ends
+    #    with two summary lines that are NOT vendors:
+    #        'Total for: Vendor Group: 1 (VENDOR GROUP)  1'
+    #        'Total'
+    #    in the Vendor column, every other field blank. Real vendor numbers are
+    #    all digits (5-7 of them in the 2026-09-01 sample), so keeping only
+    #    all-digit keys drops the trailers and any future subtotal variant --
+    #    a prefix match on 'Total' would not. astype(str) first so a missing key
+    #    reads as 'nan' and is dropped rather than raising.
+    #
+    #    This runs BEFORE pk_check and before the truncate+insert, so a trailer
+    #    row can never reach the table or trip the NOT NULL on ReportDate.
+    keep = df["Vendor"].astype(str).str.strip().str.fullmatch(r"\d+")
+    if not keep.all():
+        dropped = df.loc[~keep, "Vendor"].astype(str).tolist()
+        logger.info(
+            "Dropping %d non-vendor row(s) (export subtotal trailers): %s",
+            len(dropped),
+            dropped[:10],
+        )
+        df = df[keep].copy()
+
+    # 2. Stamp the load-date marker (mapped to the ReportDate date column); tells
+    #    consumers when this snapshot was last reloaded.
+    df["ReportDate"] = datetime.now().strftime("%Y-%m-%d")
+    return df
+
+
 @register("requesting_location")
 def requesting_location(df: pd.DataFrame, loader_config: Any, dataframes: dict[str, pd.DataFrame], logger: logging.Logger) -> pd.DataFrame:
     # Column selection, source->destination renaming, datetime typing of the two

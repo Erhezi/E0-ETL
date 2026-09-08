@@ -1,7 +1,7 @@
 """Post-load processes: the SQL / Python jobs that run once the daily loaders land.
 
-Three of them run after the daily batch -- PLM, Preprocessor and BullardBurnDown --
-none depending on each other, each depending on specific loaders having landed
+Four of them run after the daily batch -- PLM, Preprocessor, BullardBurnDown and
+PayablesInvoiceVendorGLIndex -- none depending on each other, each depending on specific loaders having landed
 cleanly. Each is declared in ``configs/post_processes/<name>.yaml`` as an ordered
 list of steps against one or more destinations, and each writes exactly ONE
 ETLHealth row per destination carrying the top-level status. Per-step detail (which

@@ -128,8 +128,8 @@ def main(argv: list[str] | None = None) -> int:
 
     post_parser = subparsers.add_parser(
         "post-run",
-        help="Run the post-load processes (PLM / Preprocessor / BullardBurnDown) that "
-        "follow the daily loaders.",
+        help="Run the post-load processes (PLM / Preprocessor / BullardBurnDown / "
+        "PayablesInvoice Vendor GL Index) that follow the daily loaders.",
     )
     post_parser.add_argument(
         "--process",
@@ -957,8 +957,9 @@ def _maybe_notify(args: argparse.Namespace) -> None:
 
 # ── Post-load processes ──────────────────────────────────────────
 
-# Only three processes exist, and two of them are heavy batch procs on one server.
-POST_PROCESS_MAX_WORKERS_CAP = 3
+# One worker per configured process is the ceiling worth offering, and two of them
+# are heavy batch procs on one server.
+POST_PROCESS_MAX_WORKERS_CAP = 4
 
 
 def _add_post_run_flags(parser: argparse.ArgumentParser) -> None:
@@ -969,7 +970,8 @@ def _add_post_run_flags(parser: argparse.ArgumentParser) -> None:
         "--post-run",
         action="store_true",
         help="After the loaders finish, run the post-load processes (PLM / Preprocessor "
-        "/ BullardBurnDown). Each checks its required loaders in today's ETLHealth first "
+        "/ BullardBurnDown / PayablesInvoice Vendor GL Index). Each checks its required "
+        "loaders in today's ETLHealth first "
         "and records BLOCKED instead of running if any is not SUCCESS.",
     )
     parser.add_argument(

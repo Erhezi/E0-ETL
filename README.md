@@ -18,6 +18,7 @@ configs\
     plm.yaml
     preprocessor.yaml
     bullard_burn_down.yaml
+    payablesinvoice_vendor_gl_index.yaml
 ```
 
 Commands still take `--config configs` (the default): the loaders are discovered
@@ -457,16 +458,28 @@ status is one of `COPIED`, `DRY_RUN`, `SKIPPED_NONEMPTY`, or `ABORTED`.
 
 ## Post-load processes
 
-Three processes consume what the loaders land, and none depends on the others:
+Four processes consume what the loaders land, and none depends on the others:
 
 | Process | Config | What it runs |
 | ------- | ------ | ------------ |
 | `plm` | `configs\post_processes\plm.yaml` | `EXEC [PLM].[usp_RunPLM_Batch]` |
 | `preprocessor` | `configs\post_processes\preprocessor.yaml` | `EXEC [Preprocessor].[usp_RunPreprocessor_Batch]` |
 | `bullard_burn_down` | `configs\post_processes\bullard_burn_down.yaml` | `sp_InsertDailyArchive` per date, then rebuild `SearchTerms` |
+| `payablesinvoice_vendor_gl_index` | `configs\post_processes\payablesinvoice_vendor_gl_index.yaml` | `MakePayablesInvoiceWithVendorGLIndexStg` (rebuild staging), then `UpdatePayablesInvoiceWithVendorGLIndex` (replace prod by invoice) |
 
-All three currently run on **des1** only (`MISCPrdAdhocDB` / `PRIME`); each config
-carries a commented `des2` block to uncomment when that side is deployed.
+`payablesinvoice_vendor_gl_index` was a monthly hand-run until it joined the daily
+batch; the trailing window its staging proc rebuilds was cut from 45 days to 5 to
+match the workday cadence, so a run missed for several days should be re-driven
+against a widened window rather than left to catch up on its own.
+
+`plm`, `preprocessor` and `bullard_burn_down` run on **des1** only
+(`MISCPrdAdhocDB` / `PRIME`); each carries a commented `des2` block to uncomment
+when that side is deployed. `payablesinvoice_vendor_gl_index` runs on **both** —
+des2 is `PLMPreprocessorShared` / schema `infor` on O2, where the same two procs
+carry O2's `sp_` prefix and the staging build joins `infor.MDM_VENDOR` in place of
+des1's `MDM_VENDOR_INFOR` (the vendor loader lands that master under a different
+name per side). Its des2 staging proc is
+`sql\payablesinvoice_vendor_gl_index\des2_infor_create_make_stg_proc.sql`.
 
 ### The requirement gate
 
@@ -548,8 +561,9 @@ the first failure stops the rest (recorded `NOT RUN` in the log). Every log line
 is tagged `[des1]` / `[des2]` so concurrent destinations stay readable in the one
 per-run log file.
 
-With des2 still commented out there is one enabled destination per process, so
-`--destination-workers` is a no-op today — the pool is never larger than the work.
+`payablesinvoice_vendor_gl_index` is the only process with two enabled
+destinations today, so it is the only one `--destination-workers` acts on; the other
+three have a single destination and the pool is never larger than the work.
 
 ### Run end to end with the loaders
 

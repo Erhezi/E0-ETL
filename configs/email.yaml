@@ -30,6 +30,10 @@ notification:
   # --mode test (default) sends here -- keep it to the developer while validating.
   test_recipients:
     - dli2@montefiore.org
-  # --mode prd sends here. Fill in the real distribution when ready.
-  recipients: []
-  cc: []
+  # --mode prd sends here.
+  recipients:
+    # - dli2@montefiore.org
+    # - abhashem@montefiore.org
+  # Copied on every send, test mode included -- cc is not mode-specific.
+  cc:
+    # - mcondoleo@montefiore.org

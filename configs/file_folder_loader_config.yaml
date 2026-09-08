@@ -389,6 +389,19 @@ inputs:
         - 'VendorLocation_Preprocessor.csv'
         - 'VendorLocation_Preprocessor (*).csv'
 
+  # Vendor master. The name follows the PRD_DataTeam_* saved-search convention of
+  # the temp_export transactional feeds, but this one is a direct-load MDM
+  # snapshot, so it lands in misc_mdm with the other mdm exports and refreshes
+  # with them under --tag mdm.
+  vendor:
+    folder: misc_mdm
+    name: 'PRD_DataTeam_VM_DL.csv'
+    tags: [daily, mdm]
+    download:
+      patterns:
+        - 'PRD_DataTeam_VM_DL.csv'
+        - 'PRD_DataTeam_VM_DL (*).csv'
+
   # ==== GHX CCX export : ccx ================================================
   # The "Search Sync Contract" saved search downloads with an embedded run
   # timestamp in the name, e.g. 'searchSyncContract_31_7_2026_9_55_27 am.csv'

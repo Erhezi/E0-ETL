@@ -1,0 +1,93 @@
+name: payablesinvoice_vendor_gl_index
+enabled: true
+tags: [daily, post_process]
+
+process:
+  name: Payables Invoice Vendor GL Index
+  frequency: Workdays
+
+# Was a monthly hand-run; now part of the daily batch. The cadence change lives in
+# the SQL, not here: MakePayablesInvoiceWithVendorGLIndexStg rebuilds staging from a
+# trailing window of PAYABLESINVOICE_HEADER.[update stamp] (45 days when this was
+# monthly, 5 now that it runs every workday), and the promote replaces prod on
+# (Company, PayablesInvoice), so a shorter window is safe as long as this runs daily.
+#
+# See plm.yaml for what each `requires` key does. Both loaders land on des1's server,
+# so scope: destination gates on exactly the rows this destination is about to read.
+# The Make proc also LEFT JOINs MDM_COMPANY_GROUP_CUSTOM and MDM_VENDOR_INFOR (from
+# the vendor loader) for the entity/vendor-class labels; those are label lookups, not
+# the grain, so a stale one mislabels rather than drops rows and does not gate here.
+requires:
+  loaders: [payablesinvoice_header, payablesinvoice_distribution]
+  scope: destination
+  on_unmet: block
+
+# Two steps in order, rolled up into ONE ETLHealth row -- per-step timings and any
+# traceback go to this run's log file. Each step commits on its own, so a failure in
+# update_prod leaves prod untouched (its DELETE + INSERT pair is one transaction) and
+# only staging is left rebuilt; re-running the process is the fix, and both procs are
+# safe to repeat (Make truncates staging, Update replaces prod by PK).
+destinations:
+  - name: des1
+    enabled: true
+    server: MISCPrdAdhocDB
+    database: PRIME
+    schema: 'DM_MONTYNT\dli2'
+    steps:
+      # Truncate + rebuild staging: released header rows inside the trailing window,
+      # joined to their released 'Distribution' rows, aggregated to one row per
+      # invoice/GL/index/cost-center.
+      - name: make_stg
+        exec: EXEC [DM_MONTYNT\dli2].[MakePayablesInvoiceWithVendorGLIndexStg]
+        target: payablesinvoice_with_vendor_gl_index_stg
+        timeout_seconds: 1800
+
+      # Promote: DELETE prod rows matching staging on (Company, PayablesInvoice) --
+      # header-level, so an invoice that moved to a different GL/index is replaced
+      # whole rather than duplicated -- then INSERT all of staging.
+      - name: update_prod
+        exec: EXEC [DM_MONTYNT\dli2].[UpdatePayablesInvoiceWithVendorGLIndex]
+        target: PAYABLESINVOICE_WITH_VENDOR_GL_INDEX
+        timeout_seconds: 900
+
+  # O2. Same two-step shape; only the object names differ. The procs live in the
+  # `infor` schema and take O2's sp_ prefix, and the staging build is a port of des1's
+  # (sql/payablesinvoice_vendor_gl_index/des2_infor_create_make_stg_proc.sql), verbatim
+  # except that it joins infor.MDM_VENDOR where des1 joins MDM_VENDOR_INFOR -- the
+  # vendor loader lands the same master under a different name on each side (see
+  # configs/loaders/daily/vendor.yaml). Verified 2026-09-04: for the same 5-day window
+  # both sides build byte-identical staging (128,015 rows, equal SUM(InvoiceGLAmount)).
+  #
+  # The 5-day window is written into BOTH procs. Change one, change the other, or the
+  # destinations quietly refresh different amounts of history per run.
+  - name: des2
+    enabled: true
+    server: YNBBSTVWP02\PROCDATASRVPROD
+    database: PLMPreprocessorShared
+    schema: infor
+    steps:
+      - name: make_stg
+        exec: EXEC [infor].[sp_MakePayablesInvoiceWithVendorGLIndexStg]
+        target: payablesinvoice_with_vendor_gl_index_stg
+        timeout_seconds: 1800
+
+      - name: update_prod
+        exec: EXEC [infor].[sp_UpdatePayablesInvoiceWithVendorGLIndex]
+        target: PAYABLESINVOICE_WITH_VENDOR_GL_INDEX
+        timeout_seconds: 900
+
+health_table:
+  server: 'YNBBSTVWP02\PROCDATASRVPROD'
+  database: SCSFileIngestor
+  schema: InforLoader
+  table: ETLHealth
+  # Note: both qualified targets together run past TargetTableName's varchar(100),
+  # so that column shows the staging target and a trimmed prod one. The log file and
+  # this config carry the full pair.
+
+logging:
+  # <loader name> is substituted with this process's name (payablesinvoice_vendor_gl_index).
+  log_root: '\montefiore.org\centralfiles\data\Procurement PMO\dli2\DailyLoader\<loader name>\logs'
+  level: INFO
+  console: true
+  capture_streams: true
