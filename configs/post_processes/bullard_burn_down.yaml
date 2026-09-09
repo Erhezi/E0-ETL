@@ -16,9 +16,14 @@ requires:
 # reference/ad-hoc use; this config is what runs unattended). They run in order and
 # roll up into ONE ETLHealth row -- per-step timings, row counts and any traceback
 # go to this run's log file. `python:` steps resolve inside infor_loader/processes/.
+#
+# CUT-OVER 2026-09-08: moved to O2 with the PLM app (see plm.yaml). Nothing in
+# bullard.py changed -- both steps address their objects with two-part names
+# (`BullardBurnDown.<object>`), so they resolve inside whatever database the
+# destination connects to. Switching des1 off and des2 on IS the repoint.
 destinations:
   - name: des1
-    enabled: true
+    enabled: false          # retired 2026-09-08 -- see plm.yaml
     server: MISCPrdAdhocDB
     database: PRIME
     schema: BullardBurnDown
@@ -44,7 +49,47 @@ destinations:
           target_table: SearchTerms
           batch_size: 50000
 
-  # des2 is not deployed yet -- see the commented block in plm.yaml for the shape.
+  # O2. BullardBurnDown landed in the `PBI` database (its own reporting database),
+  # NOT alongside PLM -- so unlike PLM the database name changes as well as the
+  # server, while the schema and every object name stay the same. That is what lets
+  # the `options` below stay byte-identical to des1's.
+  #
+  # Where the data now comes from: O2's [PBI].[BullardBurnDown].[sp_InsertDailyArchive]
+  # reads PLMPreprocessorShared.infor.ITEM_LOCATION / INVENTORY_TRANSACTION -- the
+  # des2 targets of the same two loaders this process gates on (see
+  # configs/loaders/daily/inventory_location.yaml) -- where des1's read the
+  # DM_MONTYNT\dli2 tables in PRIME. vw_SearchHelperPreAgg likewise reads
+  # PBI.BullardBurnDown.vw_CurrentItemStatus and O2's
+  # Preprocessor.Preprocessor.fn_ReduceCatalogNumber. The whole chain is O2-local;
+  # nothing reaches back to MISCPrdAdhocDB.
+  #
+  # Verified 2026-09-08 before the cut-over: DailyArchive matched des1 exactly
+  # (183,623 rows, 2026-05-01..2026-09-08) and SearchTerms held the same 1,365 rows
+  # with an identical column list, so the first des2 run continues the series rather
+  # than rebuilding it. O2 also has a stale [PRIME].[BullardBurnDown] (data stops
+  # 2026-08-07); it is NOT this target.
+  - name: des2
+    enabled: true
+    server: YNBBSTVWP02\PROCDATASRVPROD
+    database: PBI
+    schema: BullardBurnDown
+    steps:
+      - name: daily_archive
+        python: bullard.insert_daily_archive
+        target: sp_InsertDailyArchive
+        timeout_seconds: 600
+        options:
+          backfill_days: 5
+          procedure: BullardBurnDown.sp_InsertDailyArchive
+
+      - name: search_terms
+        python: bullard.build_search_terms
+        target: SearchTerms
+        timeout_seconds: 600
+        options:
+          source_view: BullardBurnDown.vw_SearchHelperPreAgg
+          target_table: SearchTerms
+          batch_size: 50000
 
 health_table:
   server: 'YNBBSTVWP02\PROCDATASRVPROD'

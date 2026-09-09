@@ -1,6 +1,12 @@
 """BullardBurnDown daily steps, ported from ``BullardBurnDownDaily.ipynb``.
 
-Two steps, run in order against des1:
+Two steps, run in order against whichever destination the config enables -- des2
+(O2's ``PBI`` database) since the 2026-09-08 cut-over, des1 (``PRIME``) before it.
+Neither step names a server or database: the connection and engine come from the
+destination via :class:`~infor_loader.post_process.StepContext`, and every object is
+addressed with a two-part ``BullardBurnDown.<object>`` name that resolves inside
+whatever database that connection opened. Moving sides is therefore a config change
+only -- see ``configs/post_processes/bullard_burn_down.yaml``:
 
 1. :func:`insert_daily_archive` -- ``sp_InsertDailyArchive`` once per date across a
    short trailing window, so late-arriving data is picked up on the following runs.

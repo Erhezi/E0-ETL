@@ -22,9 +22,14 @@ requires:
 # The top-level proc owns the batch: its sub-procedures log their own results to the
 # PLM process_log table, so only ONE ETLHealth row is written here (the verdict).
 # Per-step timings and the failing traceback go to this run's log file.
+#
+# CUT-OVER 2026-09-08: the PLM app now lives on O2 and des1 is retired. This was a
+# one-time move, not a dual-run -- des1's [PRIME].[PLM] is frozen where the last des1
+# batch left it (2026-09-08), so re-enabling it would resume writing a copy nothing
+# reads. The des1 block is kept, disabled, as the record of where PLM came from.
 destinations:
   - name: des1
-    enabled: true
+    enabled: false          # retired 2026-09-08 -- PLM app migrated to des2/O2
     server: MISCPrdAdhocDB
     database: PRIME
     schema: PLM
@@ -33,19 +38,24 @@ destinations:
         exec: EXEC [PLM].[usp_RunPLM_Batch]
         timeout_seconds: 1800
 
-  # des2 is not deployed yet. When it is, add the block below -- the requirement
-  # gate then checks the des2 rows of the same loaders, because scope is
-  # `destination`. Nothing else needs to change.
+  # O2. The app moved to its OWN database (`PLM`), not into PLMPreprocessorShared --
+  # that database holds the `infor` loader tables the PLM views read across
+  # (PLMPreprocessorShared.infor.*), which is why the two are separate here. Schema,
+  # proc name and batch shape are unchanged from des1, so only server/database move.
+  # Note O2 also carries a stale pre-migration copy at [PRIME].[PLM] (last batch
+  # 2026-08-07); it is NOT this target.
   #
-  # - name: des2
-  #   enabled: true
-  #   server: YNBBSTVWP02\PROCDATASRVPROD
-  #   database: PLMPreprocessorShared
-  #   schema: PLM
-  #   steps:
-  #     - name: run_plm_batch
-  #       exec: EXEC [PLM].[usp_RunPLM_Batch]
-  #       timeout_seconds: 3600
+  # The requirement gate now checks the des2 rows of the same loaders, because scope
+  # is `destination` and both land on this server.
+  - name: des2
+    enabled: true
+    server: YNBBSTVWP02\PROCDATASRVPROD
+    database: PLM
+    schema: PLM
+    steps:
+      - name: run_plm_batch
+        exec: EXEC [PLM].[usp_RunPLM_Batch]
+        timeout_seconds: 3600
 
 health_table:
   server: 'YNBBSTVWP02\PROCDATASRVPROD'
