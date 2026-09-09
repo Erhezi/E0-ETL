@@ -71,7 +71,10 @@ DESTINATION_WORKERS_CAP = 4
 TARGET_TABLE_TYPE = "PROC"
 
 # ETLHealth column widths that the rolled-up values can realistically reach.
-_MAX_TARGET_TABLE_NAME = 100
+# TargetTableName was widened from varchar(100) to varchar(255) on 2026-09-09 so a
+# multi-step destination can spell out every qualified target instead of trimming
+# the last one (payablesinvoice_vendor_gl_index's pair needs 146).
+_MAX_TARGET_TABLE_NAME = 255
 _MAX_ERROR = 400
 
 # What an unmet requirement does.

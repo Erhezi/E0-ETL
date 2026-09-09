@@ -81,9 +81,9 @@ health_table:
   database: SCSFileIngestor
   schema: InforLoader
   table: ETLHealth
-  # Note: both qualified targets together run past TargetTableName's varchar(100),
-  # so that column shows the staging target and a trimmed prod one. The log file and
-  # this config carry the full pair.
+  # Note: both qualified targets together are 146 chars, which fits TargetTableName
+  # since it was widened to varchar(255) on 2026-09-09 -- that column now spells out
+  # the staging AND prod target in full. Rows written before then stay trimmed.
 
 logging:
   # <loader name> is substituted with this process's name (payablesinvoice_vendor_gl_index).
