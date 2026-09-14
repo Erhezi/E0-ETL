@@ -29,11 +29,24 @@ from .db import (
     execute_statements,
     get_insert_columns,
     get_max_value,
+    get_table_columns,
     insert_dataframe,
     insert_health_record,
     truncate_table,
 )
-from .transforms import TRANSFORMS, apply_type_changes, move_files, normalize_for_db
+from .transforms import (
+    TRANSFORMS,
+    apply_type_changes,
+    drain_transform_warnings,
+    move_files,
+    normalize_for_db,
+)
+
+# Inferred dtypes pandas' .str accessor accepts. Checked by value rather than by
+# dtype because a text column reaches the guard as either object or pandas' str
+# dtype, while a date column is object dtype too but infers as 'date' and would
+# make .str raise.
+_STRING_DTYPES = {"string", "empty", "mixed", "mixed-integer"}
 
 
 @dataclass
@@ -67,6 +80,10 @@ class StepResult:
     # table configured) types its single load step "PRD" too, because the table
     # it truncates/loads IS the final production table.
     table_type: str = "STG"
+    # Non-fatal warning raised while loading this specific table (currently the
+    # width guard's clamp note). Reported in the ETLHealth Error column on this
+    # step's row, so the warning points at the table it actually happened on.
+    warning: str | None = None
 
 
 @dataclass
@@ -308,12 +325,21 @@ class FileLoader:
         if drop_columns:
             df = df.drop(columns=drop_columns)
 
+        # Drop any residue from an earlier loader on this thread, then collect the
+        # data-quality notes this chain records (e.g. a source value it had to
+        # repair) so a silent fix still shows up on the ETLHealth staging row.
+        drain_transform_warnings()
         for transform_name in self.config.transforms:
             transform = TRANSFORMS.get(transform_name)
             if transform is None:
                 raise ValueError(f"Unknown transform {transform_name!r}")
             logger.info("Applying transform %s", transform_name)
             df = transform(df, self.config, dataframes, logger)
+        transform_warnings = drain_transform_warnings()
+        if transform_warnings:
+            source_warning = "; ".join(
+                note for note in (source_warning, *transform_warnings) if note
+            )
 
         destination_columns = self.config.destination_columns
         if destination_columns:
@@ -355,7 +381,7 @@ class FileLoader:
         if self.phase != "prd":
             staging_start = perf_counter()
             try:
-                row_count = self._load_staging(destination, df, logger)
+                row_count, width_warning = self._load_staging(destination, df, logger)
             except Exception as exc:  # noqa: BLE001 - keep loading other configured destinations.
                 error = f"{exc}\n{traceback.format_exc()}"
                 logger.exception("Destination %s staging load failed", destination.name)
@@ -400,6 +426,7 @@ class FileLoader:
                     row_count=row_count,
                     duration=int(perf_counter() - staging_start),
                     table_type=load_table_type,
+                    warning=width_warning,
                 )
             )
 
@@ -415,7 +442,9 @@ class FileLoader:
                 aux_table = destination.aux_staging[aux.name]
                 aux_start = perf_counter()
                 try:
-                    aux_rows = self._load_aux_staging(aux, aux_table, aux_source_df, logger)
+                    aux_rows, aux_width_warning = self._load_aux_staging(
+                        aux, aux_table, aux_source_df, logger
+                    )
                 except Exception as exc:  # noqa: BLE001 - keep loading other destinations.
                     error = f"{exc}\n{traceback.format_exc()}"
                     logger.exception(
@@ -460,6 +489,7 @@ class FileLoader:
                         row_count=aux_rows,
                         duration=int(perf_counter() - aux_start),
                         table_type="STG",
+                        warning=aux_width_warning,
                     )
                 )
 
@@ -545,7 +575,7 @@ class FileLoader:
         destination: LoadDestination,
         df: pd.DataFrame,
         logger: logging.Logger,
-    ) -> int:
+    ) -> tuple[int, str | None]:
         # Delta-overlap guard runs before the truncate/insert so a gap in the
         # incoming file aborts this destination without touching stored data.
         self._check_overlap(destination, df, logger)
@@ -555,6 +585,7 @@ class FileLoader:
         try:
             output_df, insert_columns = self._align_for_destination(cnxn, df, staging_table, logger)
             self._validate_pk(output_df, logger)
+            output_df, width_warning = self._check_column_widths(cnxn, output_df, staging_table, logger)
             if self.config.stg_load_strategy == "truncate_insert":
                 row_count = self._truncate_insert(cnxn, staging_table, output_df, insert_columns)
             else:
@@ -563,7 +594,7 @@ class FileLoader:
             statements = [*self.config.post_sql, *destination.post_sql]
             if statements:
                 execute_statements(cnxn, statements)
-            return row_count
+            return row_count, width_warning
         finally:
             cnxn.close()
 
@@ -647,7 +678,7 @@ class FileLoader:
         aux_table: TableRef,
         source_df: pd.DataFrame,
         logger: logging.Logger,
-    ) -> int:
+    ) -> tuple[int, str | None]:
         """Map the prepared aux frame to its destination columns and truncate/insert
         it into ``aux_table`` (this destination's copy of the aux staging table)."""
         cnxn = connect_sql_server(aux_table.server, aux_table.database)
@@ -655,7 +686,9 @@ class FileLoader:
             output_df = self._apply_column_mapping(source_df, aux.column_mapping)
             insert_columns = list(output_df.columns)
             self._validate_pk(output_df, logger, pk_columns=aux.pk_check)
-            return self._truncate_insert(cnxn, aux_table, output_df, insert_columns)
+            output_df, width_warning = self._check_column_widths(cnxn, output_df, aux_table, logger)
+            row_count = self._truncate_insert(cnxn, aux_table, output_df, insert_columns)
+            return row_count, width_warning
         finally:
             cnxn.close()
 
@@ -891,6 +924,69 @@ class FileLoader:
         insert_columns = list(df.columns)
         return df, insert_columns
 
+    def _check_column_widths(
+        self,
+        cnxn: Any,
+        output_df: pd.DataFrame,
+        table: TableRef,
+        logger: logging.Logger,
+    ) -> tuple[pd.DataFrame, str | None]:
+        """Clamp string values wider than their destination column, and report which
+        column overflowed.
+
+        With fast_executemany the ODBC driver casts each parameter to the described
+        column type on the client, so an over-wide value is rejected at bind time
+        ("String data, right truncation") -- and by then the truncate has already
+        run, which leaves the table empty until the next good file (2026-09-10: a
+        vendor name typed into CCXSyncContract's varchar(20) ERPVendorID emptied both
+        destinations). Clamping keeps the load whole, and the returned warning rides
+        this step's ETLHealth row so the column is named on the health report and can
+        be traced back to the source export.
+        """
+        limits = {
+            column["name"]: column["max_length"]
+            for column in get_table_columns(cnxn, table)
+            # varchar(max)/text report -1 (a non-character column reports None); only
+            # a fixed character width can overflow.
+            if (column.get("max_length") or 0) > 0
+        }
+        notes: list[str] = []
+        # Copied lazily, so an in-spec frame is returned untouched.
+        clamped = output_df
+        for name in output_df.columns:
+            limit = limits.get(name)
+            series = clamped[name]
+            if limit is None:
+                continue
+            if pd.api.types.infer_dtype(series, skipna=True) not in _STRING_DTYPES:
+                continue
+            lengths = series.str.len()
+            # A NA cell has no width; under the nullable string dtype the comparison
+            # would carry NA through into the mask, which .loc will not accept.
+            over = (lengths > limit).fillna(False).astype(bool)
+            over_count = int(over.sum())
+            if not over_count:
+                continue
+            examples = ", ".join(repr(value[:60]) for value in sorted(set(series[over]))[:3])
+            notes.append(
+                f"{name} holds {over_count} of {len(series)} value(s) longer than its "
+                f"{limit}-char destination column (longest {int(lengths.max())}), "
+                f"clamped to fit. e.g. {examples}"
+            )
+            if clamped is output_df:
+                clamped = output_df.copy()
+            clamped.loc[over, name] = series[over].str.slice(0, limit)
+
+        if not notes:
+            return output_df, None
+        detail = "; ".join(notes)
+        warning = (
+            f"FIELD TRUNCATE (warning): {detail}. "
+            f"Loaded into {table.display_name(include_server=True)}, ETL continued."
+        )
+        logger.warning(warning)
+        return clamped, warning
+
     def _apply_column_mapping(
         self,
         df: pd.DataFrame,
@@ -993,12 +1089,21 @@ class FileLoader:
         """Value for the ETLHealth ``Error`` column.
 
         Failed steps report a classified error. Successful steps report any
-        non-fatal warnings: the log-fallback note (run-level, on every row) plus
-        the source-column warning (on the staging row).
+        non-fatal warnings: the log-fallback note (run-level, on every row), the
+        step's own warning (e.g. the width guard naming a clamped column), plus the
+        source-column and transform warnings (on the staging row).
         """
         if step.status != "SUCCESS":
             return classify_error(step.error)
-        notes = [note for note in (log_note, source_warning if step.step == "staging" else None) if note]
+        notes = [
+            note
+            for note in (
+                log_note,
+                step.warning,
+                source_warning if step.step == "staging" else None,
+            )
+            if note
+        ]
         return "; ".join(notes) or None
 
     def _build_health_steps(
@@ -1197,8 +1302,10 @@ def classify_error(error_text: str | None) -> str | None:
     # SQL Server 2627 UNIQUE constraint / 2601 unique index.
     if "unique key" in text or "unique index" in text:
         return "UX VIOLATION"
-    # SQL Server 8152/2628: "String or binary data would be truncated ...".
-    if "would be truncated" in text:
+    # SQL Server 8152/2628 ("String or binary data would be truncated ..."), and the
+    # client-side equivalent pyodbc raises under fast_executemany when a value is
+    # wider than the column it is bound to ("String data, right truncation").
+    if "would be truncated" in text or "right truncation" in text:
         return "FIELD TRUNCATE"
     # The staging insert stopped mid-load or landed fewer rows than the prepared
     # source (see _load_staging's guardrail). Checked after the specific SQL

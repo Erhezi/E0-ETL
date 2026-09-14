@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
+import re
 import shutil
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -12,6 +14,36 @@ import pandas as pd
 
 Transform = Callable[[pd.DataFrame, Any, dict[str, pd.DataFrame], logging.Logger], pd.DataFrame]
 TRANSFORMS: dict[str, Transform] = {}
+
+# Non-fatal data-quality notes raised by a transform -- e.g. a malformed source
+# value it had to repair. FileLoader._prepare_dataframe clears this before the
+# transform chain and drains it afterwards onto the ETLHealth staging row, so a
+# silent repair is still visible on the health report. Held outside the transform
+# signature (which is fixed across every transform) and kept thread-local, because
+# the CLI can run loaders in parallel (run_loaders' ThreadPoolExecutor) and each
+# run's notes must stay on its own health row.
+_TRANSFORM_STATE = threading.local()
+
+
+def _transform_warnings() -> list[str]:
+    warnings = getattr(_TRANSFORM_STATE, "warnings", None)
+    if warnings is None:
+        warnings = []
+        _TRANSFORM_STATE.warnings = warnings
+    return warnings
+
+
+def record_transform_warning(message: str) -> None:
+    """Surface ``message`` on this run's ETLHealth row as a non-fatal warning."""
+    _transform_warnings().append(message)
+
+
+def drain_transform_warnings() -> list[str]:
+    """Return and clear the warnings recorded on this thread since the last drain."""
+    warnings = _transform_warnings()
+    drained = list(warnings)
+    warnings.clear()
+    return drained
 
 
 def register(name: str) -> Callable[[Transform], Transform]:
@@ -406,12 +438,73 @@ def item(df: pd.DataFrame, loader_config: Any, dataframes: dict[str, pd.DataFram
     return df
 
 
+# The CCX export writes ERP vendor # as a 7-digit id, on its own ("1000703") or
+# with a location suffix written either "1000703 B001" or "1000703-B001" -- all
+# three are valid downstream; today's suffixes run B001-B009. Anything else is a
+# data-entry slip in GHX: on 2026-09-10 two rows arrived as
+# "1025146 -MERZ PHARMACEUTICAL LLC" -- 32 chars bound against a varchar(20)
+# column -- and the driver rejected them at bind time, which aborted the insert
+# after the truncate and left both CCXSyncContract tables empty for the day.
+_ERP_VENDOR_ALLOWED_FORM = r"^\d{7}([ -][A-Za-z]\d{3})?$"
+_ERP_VENDOR_CANONICAL = re.compile(r"^(\d{7})(?:\s*([ -])\s*([A-Za-z]\d{3}))?$")
+_ERP_VENDOR_LEADING_ID = re.compile(r"^(\d{7})\b")
+
+
+def _normalize_erp_vendor_id(value: Any) -> str:
+    """Reduce an ``ERP vendor #`` cell to ``0000000``, ``0000000 B000`` or
+    ``0000000-B000`` -- the only shapes the column is allowed to hold.
+
+    The separator the source used is preserved; only padding, casing and a
+    non-conforming tail are dropped. A value with no leading 7-digit id at all is
+    left as-is rather than blanked, so it is not silently discarded: the width
+    guard in ``file_loader`` clamps it to fit and names the column on the health
+    report, which is the signal to go look at the source export.
+    """
+    # A blank cell arrives as NA, not '': the reader hands this column back as
+    # pandas' str dtype, which _fill_string_blanks (object-dtype only) skips.
+    # normalize_for_db lands those on '' anyway, so match it here rather than
+    # stringifying NA into a literal "nan".
+    if value is None or (not isinstance(value, str) and pd.isna(value)):
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    match = _ERP_VENDOR_CANONICAL.match(text)
+    if match:
+        vendor_id, separator, suffix = match.groups()
+        return vendor_id if suffix is None else f"{vendor_id}{separator}{suffix.upper()}"
+    leading = _ERP_VENDOR_LEADING_ID.match(text)
+    return leading.group(1) if leading else text
+
+
 @register("ccx_sync_contract")
 def ccx_sync_contract(df: pd.DataFrame, loader_config: Any, dataframes: dict[str, pd.DataFrame], logger: logging.Logger) -> pd.DataFrame:
     df = _fill_string_blanks(df)
     df["report stamp"] = datetime.today().strftime("%Y-%m-%d %H:%M:%S")
     df["Synced"] = df["Synced"].apply(lambda x: 1 if x == "True" else 0)
     df["Organization"] = df["Organization"].apply(lambda x: str(x).strip())
+
+    vendor = df["ERP vendor #"]
+    normalized = vendor.map(_normalize_erp_vendor_id)
+    # Compare against the blank-filled original so the NA cells this column is full
+    # of (see _normalize_erp_vendor_id) are not counted as repairs.
+    original = vendor.fillna("").astype(str)
+    repaired = original[normalized != original]
+    if not repaired.empty:
+        # The health row states the rule, not the data; the run log keeps the
+        # offending values so the source export can be traced.
+        examples = ", ".join(repr(value) for value in sorted(set(repaired))[:5])
+        logger.warning(
+            "ERP vendor # held %s value(s) outside %s; rewritten to fit. e.g. %s",
+            len(repaired),
+            _ERP_VENDOR_ALLOWED_FORM,
+            examples,
+        )
+        record_transform_warning(
+            f"ERP VENDOR NORMALIZED (warning), allow {_ERP_VENDOR_ALLOWED_FORM}, "
+            f"rewritten to fit, ETL continued"
+        )
+    df["ERP vendor #"] = normalized
     return df
 
 
