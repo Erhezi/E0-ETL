@@ -8,6 +8,13 @@ process:
 
 # See plm.yaml for what each key does. The Preprocessor depends on the contract and
 # master-data feeds rather than the inventory ones.
+#
+# All four gate loaders already write des2 rows on O2, so with scope `destination`
+# the gate now reads their des2 ETLHealth rows and no longer looks at des1 at all:
+#   ccx_sync_contract -> Preprocessor.[ghx].CCXSyncContract
+#   contract_line     -> PLMPreprocessorShared.[infor].CONTRACTLINE
+#   manufacturer      -> PLMPreprocessorShared.[infor].MDM_MANUFACTURER_NAME
+#   supplier          -> PLMPreprocessorShared.[infor].MDM_SUPPLIER_NAME
 requires:
   loaders: [ccx_sync_contract, contract_line, manufacturer, supplier]
   scope: destination
@@ -15,9 +22,14 @@ requires:
 
 # One ETLHealth row (the verdict); the sub-procedures keep their own detail in the
 # Preprocessor process_log table, and this run's log file carries the traceback.
+#
+# CUT-OVER 2026-09-14: the Preprocessor moved to O2 and des1 is retired. Like the PLM
+# move this is a one-time cut-over, not a dual-run -- des1's [PRIME].[Preprocessor] is
+# frozen where its last batch left it, so re-enabling it would resume writing a copy
+# nothing reads. The des1 block is kept, disabled, as the record of where this came from.
 destinations:
   - name: des1
-    enabled: true
+    enabled: false          # retired 2026-09-14 -- Preprocessor migrated to des2/O2
     server: MISCPrdAdhocDB
     database: PRIME
     schema: Preprocessor
@@ -25,8 +37,41 @@ destinations:
       - name: run_preprocessor_batch
         exec: EXEC [Preprocessor].[usp_RunPreprocessor_Batch]
         timeout_seconds: 1800
+        verify_process_log: true
 
-  # des2 is not deployed yet -- see the commented block in plm.yaml for the shape.
+  # O2. What was one PRIME database on des1 is SPLIT across two databases here, which
+  # is why only the batch proc's own home is named below:
+  #   Preprocessor            -- the batch proc, its sub-procedures and process_log,
+  #                              plus the ghx.CCXSyncContract feed. This is the target.
+  #   PLMPreprocessorShared   -- the data. The sub-procs READ [infor].* (the loader
+  #                              tables, shared with PLM) and WRITE [Preprocessor].*
+  #                              (CCXSyncedContractLine, InforActiveCL*, CCXInforMatchedLink,
+  #                              InforCCXNotInSyncContracts, ...) by three-part name.
+  # They also read Contracts.dbo.ZZZ_STAGING_CCX_CONTRACTS_DETAILS_GHX_PROVIDED_DAILY.
+  # Schema, proc name and batch shape are unchanged from des1; only server/database move.
+  #
+  # Note O2 also carries a stale pre-migration copy at [PRIME].[Preprocessor] (last
+  # modified 2026-08-10); it is NOT this target.
+  #
+  # The PLMPreprocessorShared.[Preprocessor].* output tables are still empty as of the
+  # cut-over -- this batch is what first populates them, so the first des2 run does a
+  # full build rather than a delta. Hence the longer timeout, matching plm.yaml's des2.
+  #
+  # usp_RunPreprocessor_Batch catches each sub-procedure's error and continues (no
+  # THROW), so the EXEC returns cleanly even when sub-procedures failed. verify_process_log
+  # is what stops that reading as SUCCESS: after the EXEC the runner reads the rows this
+  # run wrote to Preprocessor.[Preprocessor].process_log and fails the step unless every
+  # one says 'Success'. The proc still runs all 13 steps; only the verdict changes.
+  - name: des2
+    enabled: true
+    server: YNBBSTVWP02\PROCDATASRVPROD
+    database: Preprocessor
+    schema: Preprocessor
+    steps:
+      - name: run_preprocessor_batch
+        exec: EXEC [Preprocessor].[usp_RunPreprocessor_Batch]
+        timeout_seconds: 3600
+        verify_process_log: true
 
 health_table:
   server: 'YNBBSTVWP02\PROCDATASRVPROD'

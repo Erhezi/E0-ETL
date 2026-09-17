@@ -86,6 +86,109 @@ REQUIREMENT_SCOPES = frozenset({"destination", "any"})
 # ── Config ───────────────────────────────────────────────────────
 
 
+#: Object a ``verify_process_log`` step reads, relative to its own destination's
+#: database and schema. Both batch procs log their sub-procedures to a table of
+#: exactly this shape, so the bare ``verify_process_log: true`` form needs no
+#: further configuration.
+DEFAULT_PROCESS_LOG_TABLE = "process_log"
+#: ``status`` values that count as a healthy sub-procedure (compared lower-cased).
+DEFAULT_PROCESS_LOG_OK = ("success",)
+#: ``status`` values that are NOT a failure but are worth surfacing: the step still
+#: passes and the destination still reads SUCCESS, but the row's message rides into
+#: the ETLHealth ``Error`` column so the daily report shows it. Added 2026-09-17 for
+#: ``sp_RefreshCCXContractLineDeduped``'s missing-LAST_UPDATE warning.
+DEFAULT_PROCESS_LOG_WARN = ("warning", "warn")
+
+
+@dataclass(frozen=True)
+class ProcessLogCheck:
+    """Post-EXEC verification of a batch proc's own sub-procedure log.
+
+    ``usp_RunPLM_Batch`` and ``usp_RunPreprocessor_Batch`` both wrap every
+    sub-procedure in ``BEGIN CATCH`` and carry on to the next one (the ``THROW`` is
+    deliberately commented out, so one bad step never costs the whole batch). The
+    EXEC therefore returns cleanly even when sub-procedures failed, and the
+    destination's single ETLHealth row said SUCCESS over a partly-failed batch --
+    seen 2026-09-14, when a PK violation in ``sp_RefreshCCXSyncedContractLine`` still
+    logged SUCCESS and only showed up by reading process_log by hand.
+
+    This closes that gap without touching the procs: after the EXEC the runner reads
+    the rows the batch just wrote and fails the step unless every one of them is a
+    success value. The proc keeps running all its steps; only the *verdict* changes.
+
+    The rows are scoped by a watermark read off the SERVER clock immediately before
+    the EXEC, so only this execution's rows are judged -- an earlier failure the same
+    day, or a re-run after a fix, never re-fails the current run.
+
+    Three buckets, not two: a status is OK, a WARNING, or a failure. A warning is a
+    sub-procedure reporting something the owner should see but that did not stop the
+    refresh -- it leaves the verdict at SUCCESS and carries its message into ETLHealth
+    instead. Anything that matches neither list is a failure, so an unrecognised status
+    still fails rather than passing unnoticed.
+    """
+
+    table: str = DEFAULT_PROCESS_LOG_TABLE
+    status_column: str = "status"
+    name_column: str = "process_name"
+    started_column: str = "exec_start"
+    error_column: str | None = "err_msg"
+    ok_values: tuple[str, ...] = DEFAULT_PROCESS_LOG_OK
+    warn_values: tuple[str, ...] = DEFAULT_PROCESS_LOG_WARN
+
+    @classmethod
+    def from_value(cls, value: Any, *, process: str, step: str) -> "ProcessLogCheck | None":
+        """``verify_process_log: true`` for the defaults, or a mapping of overrides.
+
+        Absent/false disables the check, which is the behaviour every step had before
+        this existed -- a step that drives a proc with no process_log of its own
+        simply leaves it off.
+        """
+        if value is None or value is False:
+            return None
+        if value is True:
+            return cls()
+        if not isinstance(value, dict):
+            raise ValueError(
+                f"{process}: step {step!r} verify_process_log must be true, false or a mapping."
+            )
+        ok_raw = value.get("ok_values") or value.get("ok_status")
+        if isinstance(ok_raw, str):
+            ok_raw = [ok_raw]
+        # `warn_values: []` deliberately disables warnings -- every non-ok status then
+        # fails -- so this reads the key rather than falling back on a falsy value.
+        warn_raw = value.get("warn_values", value.get("warn_status"))
+        if isinstance(warn_raw, str):
+            warn_raw = [warn_raw]
+        error_column = value.get("error_column", "err_msg")
+        return cls(
+            table=str(value.get("table") or DEFAULT_PROCESS_LOG_TABLE),
+            status_column=str(value.get("status_column") or "status"),
+            name_column=str(value.get("name_column") or "process_name"),
+            started_column=str(value.get("started_column") or "exec_start"),
+            error_column=str(error_column) if error_column else None,
+            ok_values=(
+                tuple(str(item).strip().lower() for item in ok_raw)
+                if ok_raw
+                else DEFAULT_PROCESS_LOG_OK
+            ),
+            warn_values=(
+                DEFAULT_PROCESS_LOG_WARN
+                if warn_raw is None
+                else tuple(str(item).strip().lower() for item in warn_raw)
+            ),
+        )
+
+    def accepts(self, status: Any) -> bool:
+        return str(status or "").strip().lower() in self.ok_values
+
+    def warns(self, status: Any) -> bool:
+        return str(status or "").strip().lower() in self.warn_values
+
+
+class ProcessLogVerificationError(RuntimeError):
+    """A batch proc returned cleanly but its own process_log recorded failures."""
+
+
 @dataclass(frozen=True)
 class ProcessStep:
     """One unit of work inside a post-process: a T-SQL statement (``exec``) or a
@@ -94,6 +197,9 @@ class ProcessStep:
     ``target`` names the table or procedure this step drives, for the ETLHealth
     ``TargetTableName`` column. When omitted it is derived from the EXEC'd object
     name, which is right for the batch procs and keeps the config short.
+
+    ``verify_process_log`` makes an ``exec`` step's verdict depend on the rows the
+    proc logged rather than just on the EXEC returning -- see :class:`ProcessLogCheck`.
     """
 
     name: str
@@ -103,6 +209,7 @@ class ProcessStep:
     target: str | None = None
     options: dict[str, Any] = field(default_factory=dict)
     timeout_seconds: int | None = None
+    verify_process_log: ProcessLogCheck | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any], *, index: int, process: str) -> "ProcessStep":
@@ -118,6 +225,13 @@ class ProcessStep:
         if not name:
             raise ValueError(f"{process}: steps[{index}] requires a 'name'.")
         timeout = data.get("timeout_seconds")
+        verify = ProcessLogCheck.from_value(
+            data.get("verify_process_log"), process=process, step=str(name)
+        )
+        if verify is not None and not exec_sql:
+            raise ValueError(
+                f"{process}: step {name!r} sets verify_process_log but is not an 'exec' step."
+            )
         return cls(
             name=str(name),
             exec_sql=str(exec_sql) if exec_sql else None,
@@ -126,6 +240,7 @@ class ProcessStep:
             target=data.get("target"),
             options=dict(data.get("options") or {}),
             timeout_seconds=int(timeout) if timeout is not None else None,
+            verify_process_log=verify,
         )
 
     @property
@@ -507,6 +622,19 @@ def _resolve_python_step(reference: str) -> Callable[[StepContext], int | None]:
     return function
 
 
+@dataclass(frozen=True)
+class StepResult:
+    """What one step reports back: its row count, if it has one, and any warnings.
+
+    A warning is a non-fatal note the step wants on the destination's ETLHealth row --
+    today only ``verify_process_log`` produces them, from the batch proc's own
+    ``Warning`` rows.
+    """
+
+    row_count: int | None = None
+    warnings: tuple[str, ...] = ()
+
+
 def _run_step(
     step: ProcessStep,
     destination: ProcessDestination,
@@ -514,13 +642,18 @@ def _run_step(
     *,
     report_date: dt.date,
     logger: logging.Logger,
-) -> int | None:
-    """Execute one step and return its row count, if it reports one."""
+) -> StepResult:
+    """Execute one step and return its row count, if it reports one, plus warnings."""
     previous_timeout = getattr(cnxn, "timeout", 0)
     if step.timeout_seconds is not None:
         cnxn.timeout = step.timeout_seconds
     try:
         if step.exec_sql:
+            # Read before the EXEC so the verification below judges only the rows this
+            # execution writes. Taken from the server, not the workstation, because a
+            # few seconds of clock skew would drop this run's first sub-procedure or
+            # sweep in the tail of the previous one.
+            watermark = _server_now(cnxn) if step.verify_process_log else None
             cursor = cnxn.cursor()
             try:
                 logger.info("  exec: %s", step.exec_sql)
@@ -532,7 +665,23 @@ def _run_step(
                 cnxn.commit()
             finally:
                 cursor.close()
-            return None
+            warnings: tuple[str, ...] = ()
+            if step.verify_process_log is not None:
+                # Raises on a logged sub-procedure failure, which _run_destination
+                # records exactly like any other step error -> the destination's
+                # ETLHealth row reads FAILED instead of a hollow SUCCESS. Logged
+                # warnings come back instead of raising: the step still passes.
+                warnings = tuple(
+                    _verify_process_log(
+                        step.verify_process_log,
+                        destination,
+                        cnxn,
+                        step=step,
+                        watermark=watermark,
+                        logger=logger,
+                    )
+                )
+            return StepResult(warnings=warnings)
 
         function = _resolve_python_step(str(step.python))
         context = StepContext(
@@ -546,7 +695,12 @@ def _run_step(
         )
         logger.info("  python: %s", step.python)
         result = function(context)
-        return int(result) if isinstance(result, (int, float)) and not isinstance(result, bool) else None
+        rows = (
+            int(result)
+            if isinstance(result, (int, float)) and not isinstance(result, bool)
+            else None
+        )
+        return StepResult(row_count=rows)
     finally:
         try:
             cnxn.timeout = previous_timeout
@@ -564,6 +718,8 @@ class StepOutcome:
     row_count: int | None = None
     duration_seconds: int = 0
     error: str | None = None
+    #: Non-fatal notes this step wants on the ETLHealth row; the status stays SUCCESS.
+    warnings: tuple[str, ...] = ()
 
 
 @dataclass
@@ -575,6 +731,9 @@ class DestinationOutcome:
     error: str | None = None
     unmet: list[str] = field(default_factory=list)
     duration_seconds: int = 0
+    #: Every step's warnings, in order. Carried into the ETLHealth ``Error`` column of
+    #: a destination that otherwise succeeded -- see :func:`_health_error`.
+    warnings: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -780,7 +939,7 @@ class PostProcessRunner:
                 step_start = perf_counter()
                 logger.info("Step %s/%s: %s", index + 1, len(destination.steps), step.name)
                 try:
-                    step_rows = _run_step(
+                    step_result = _run_step(
                         step,
                         destination,
                         cnxn,
@@ -799,12 +958,14 @@ class PostProcessRunner:
                         )
                     )
                     continue
+                step_rows = step_result.row_count
                 step_duration = int(perf_counter() - step_start)
                 logger.info(
-                    "Step %s finished in %ss%s",
+                    "Step %s finished in %ss%s%s",
                     step.name,
                     step_duration,
                     "" if step_rows is None else f" (rows={step_rows})",
+                    f" ({len(step_result.warnings)} warning(s))" if step_result.warnings else "",
                 )
                 steps.append(
                     StepOutcome(
@@ -812,12 +973,14 @@ class PostProcessRunner:
                         status=STATUS_SUCCESS,
                         row_count=step_rows,
                         duration_seconds=step_duration,
+                        warnings=step_result.warnings,
                     )
                 )
         finally:
             cnxn.close()
 
         counts = [outcome.row_count for outcome in steps if outcome.row_count is not None]
+        warnings = [message for outcome in steps for message in outcome.warnings]
         _log_step_summary(steps, logger)
         return DestinationOutcome(
             destination=destination,
@@ -826,6 +989,7 @@ class PostProcessRunner:
             steps=steps,
             error=error,
             duration_seconds=int(perf_counter() - start_perf),
+            warnings=warnings,
         )
 
     def _check_gate(
@@ -1006,13 +1170,21 @@ def _health_error(outcome: DestinationOutcome, log_note: str | None) -> str | No
 
     A failure gets the classified code (the traceback is in the log file); a blocked
     destination names what it is waiting on, since that IS the actionable detail and
-    appears nowhere else; a success carries only the log-fallback note, if any.
+    appears nowhere else; a success carries its warnings and the log-fallback note, if
+    either exists.
+
+    The column is named Error but on a SUCCESS row it has always been a notes field --
+    this just gives it something worth reading. A warning's own text is used verbatim
+    (not classified) because the sub-procedure wrote it FOR this column.
     """
     if outcome.status == STATUS_FAILED:
         return classify_error(outcome.error)
     if outcome.status == STATUS_BLOCKED:
         return _fit("BLOCKED: requires " + "; ".join(outcome.unmet), _MAX_ERROR)
-    return log_note or None
+    notes = [*outcome.warnings]
+    if log_note:
+        notes.append(log_note)
+    return _fit("; ".join(notes), _MAX_ERROR) if notes else None
 
 
 def _process_type(destination: ProcessDestination) -> str:
@@ -1050,6 +1222,112 @@ def _log_step_summary(steps: list[StepOutcome], logger: logging.Logger) -> None:
         logger.info(
             "  %-8s %-28s %ss%s", outcome.status, outcome.step.name, outcome.duration_seconds, rows
         )
+        # Repeated under the step they belong to: the summary is the part of the log
+        # that gets read first, and a warning that only appears 200 lines up is missed.
+        for message in outcome.warnings:
+            logger.warning("  %-8s %-28s %s", "WARNING", "", message)
+
+
+def _server_now(cnxn: Any) -> Any:
+    """The SQL Server clock, used as the watermark for a process_log check."""
+    cursor = cnxn.cursor()
+    try:
+        cursor.execute("SELECT SYSDATETIME()")
+        return cursor.fetchone()[0]
+    finally:
+        cursor.close()
+
+
+def _verify_process_log(
+    check: ProcessLogCheck,
+    destination: ProcessDestination,
+    cnxn: Any,
+    *,
+    step: ProcessStep,
+    watermark: Any,
+    logger: logging.Logger,
+) -> list[str]:
+    """Fail the step when the batch proc logged a failed sub-procedure.
+
+    Returns the messages of any WARNING rows, which the caller carries into the
+    destination's ETLHealth ``Error`` column -- the step and the destination still
+    pass. A sub-procedure logs one of those when it worked around something the owner
+    should still see; ``sp_RefreshCCXContractLineDeduped`` does it when the GHX feed
+    arrives with no LAST_UPDATE and it falls back to today's date.
+
+    Every other row the proc wrote at or after ``watermark`` must carry a success
+    status. Within one run each sub-procedure logs exactly once, so "every row since
+    the watermark" and "the latest row per sub-procedure" are the same set -- they only
+    diverge when two batches overlap, and there the stricter reading is the one you
+    want: an overlap is itself the bug (it is what produced the 2026-09-14 PK
+    violation), so it should be reported, not averaged away.
+    """
+    table = _qualify_object(check.table, destination)
+    columns = [check.name_column, check.status_column]
+    if check.error_column:
+        columns.append(check.error_column)
+    select = ", ".join(bracket_identifier(column) for column in columns)
+    started = bracket_identifier(check.started_column)
+    sql = f"SELECT {select} FROM {table} WHERE {started} >= ? ORDER BY {started}"
+
+    cursor = cnxn.cursor()
+    try:
+        cursor.execute(sql, watermark)
+        rows = [tuple(row) for row in cursor.fetchall()]
+    finally:
+        cursor.close()
+
+    if not rows:
+        # Nothing to judge. Not a failure on its own -- a proc can legitimately log
+        # nothing -- but for the batch procs it means no sub-procedure ran at all,
+        # which is worth a line in the log.
+        logger.warning(
+            "  %s: %s recorded no sub-procedure rows for this run; nothing verified.",
+            step.name,
+            table,
+        )
+        return []
+
+    def detail(row: tuple) -> str:
+        if check.error_column and len(row) > 2 and row[2]:
+            return str(row[2])
+        return ""
+
+    warned = [row for row in rows if check.warns(row[1])]
+    failures = [row for row in rows if not check.accepts(row[1]) and not check.warns(row[1])]
+    logger.info(
+        "  %s: %s/%s sub-procedure(s) succeeded per %s%s",
+        step.name,
+        len(rows) - len(failures) - len(warned),
+        len(rows),
+        table,
+        f" ({len(warned)} warning(s))" if warned else "",
+    )
+
+    # A warning's own message is the whole point of it, so it goes to the log at
+    # WARNING level and is handed back for the ETLHealth row.
+    warnings: list[str] = []
+    for row in warned:
+        message = detail(row) or f"{row[0]} reported {row[1]}"
+        logger.warning("    %s -> %s: %s", row[0], row[1], message)
+        warnings.append(message)
+
+    if not failures:
+        return warnings
+
+    for row in failures:
+        text = detail(row)
+        logger.error("    %s -> %s%s", row[0], row[1], f": {text}" if text else "")
+
+    names = ", ".join(str(row[0]) for row in failures)
+    # The first failure's own message rides along so classify_error can bucket the
+    # ETLHealth Error column by the real cause (PK VIOLATION, TABLE NOT FOUND, ...)
+    # instead of the generic "See Log".
+    first_detail = next((detail(row) for row in failures if detail(row)), "")
+    raise ProcessLogVerificationError(
+        f"{len(failures)} of {len(rows)} sub-procedure(s) failed in {table}: {names}"
+        + (f" -- {first_detail}" if first_detail else "")
+    )
 
 
 def _drain_results(cursor: Any) -> None:

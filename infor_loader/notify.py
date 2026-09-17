@@ -510,14 +510,26 @@ def render_html(
             f'Did not run today: {", ".join(html.escape(n) for n in summary["not_run"])}</p>'
         )
 
-    # Issues-only table: successful loaders are collapsed away; show just the process
-    # groups with a failure or a skip. The whole group (des1/des2 × STG/PRD) is kept so
-    # a failure's context (what succeeded alongside it) is visible.
+    # Issues-only table: clean successes are collapsed away; show the process groups
+    # with a failure, a skip, or a warning. The whole group (des1/des2 × STG/PRD) is
+    # kept so a failure's context (what succeeded alongside it) is visible.
+    #
+    # A WARNING is a SUCCESS row that still wrote something to Error -- a post-process
+    # whose batch proc logged a 'Warning' sub-procedure row, or a run that fell back to
+    # a local log directory. It does not change any verdict (the run succeeded, the
+    # banner stays green, the exit code is 0), but it is the one thing that would
+    # otherwise be written to ETLHealth and never read by anyone.
     process_status = summary["process_status"]
+    warned_processes = {
+        str(row.get("ProcessName") or "")
+        for row in consolidated
+        if str(row.get("TaskStatus") or "") == _STATUS_SUCCESS and row.get("Error")
+    }
     issue_rows = [
         row
         for row in consolidated
         if process_status.get(str(row.get("ProcessName") or "")) != _STATUS_SUCCESS
+        or str(row.get("ProcessName") or "") in warned_processes
     ]
     if not issue_rows:
         parts.append(
@@ -531,7 +543,8 @@ def render_html(
 
     parts.append(
         '<p style="font-size:12px;color:#5f6368;margin:0 0 6px;">'
-        "Showing only loaders that failed or were skipped; successful loaders are omitted.</p>"
+        "Showing only loaders that failed, were skipped, or reported a warning; "
+        "clean successes are omitted.</p>"
     )
 
     # Status table.
@@ -557,8 +570,10 @@ def render_html(
     for row in ordered:
         status = str(row.get("TaskStatus") or "")
         status_bg, status_fg = _STATUS_COLORS.get(status, ("#f1f3f4", "#5f6368"))
+        # Shown on a SUCCESS row too: there it is a warning/note rather than an error,
+        # and suppressing it was what made a warning invisible end to end.
         error_text = ""
-        if status != _STATUS_SUCCESS and row.get("Error"):
+        if row.get("Error"):
             error_text = html.escape(_truncate(str(row.get("Error"))))
         conn_label = _label_connection(row.get("DBConnection"), db_labels)
         # O2 (des2) rows get a light-blue wash so the two DB targets read apart at a

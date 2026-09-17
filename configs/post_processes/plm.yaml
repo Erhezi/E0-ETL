@@ -37,6 +37,7 @@ destinations:
       - name: run_plm_batch
         exec: EXEC [PLM].[usp_RunPLM_Batch]
         timeout_seconds: 1800
+        verify_process_log: true
 
   # O2. The app moved to its OWN database (`PLM`), not into PLMPreprocessorShared --
   # that database holds the `infor` loader tables the PLM views read across
@@ -47,6 +48,10 @@ destinations:
   #
   # The requirement gate now checks the des2 rows of the same loaders, because scope
   # is `destination` and both land on this server.
+  # verify_process_log: usp_RunPLM_Batch catches each sub-procedure's error and carries
+  # on (no THROW), so the EXEC returning proves only that the batch ran to the end, not
+  # that it worked. After the EXEC the runner reads the rows this run wrote to
+  # PLM.[PLM].process_log and fails the step unless every one says 'Success'.
   - name: des2
     enabled: true
     server: YNBBSTVWP02\PROCDATASRVPROD
@@ -56,6 +61,7 @@ destinations:
       - name: run_plm_batch
         exec: EXEC [PLM].[usp_RunPLM_Batch]
         timeout_seconds: 3600
+        verify_process_log: true
 
 health_table:
   server: 'YNBBSTVWP02\PROCDATASRVPROD'

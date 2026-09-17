@@ -512,9 +512,83 @@ Each process writes exactly **one** ETLHealth row per destination — the top-le
 verdict, typed `TargetTableType: PROC`. The batch procs already log every
 sub-procedure to their own `process_log` tables, so that detail is not duplicated;
 per-step timings, row counts and the failing traceback go to the run's **log file**,
-which the daily email attaches on failure. A `BLOCKED` row's `Error` column names
-the unmet requirement, since that is the one detail the rolled-up row can't be read
-off at a glance.
+which the daily email attaches on failure.
+
+#### `verify_process_log`: making that verdict mean something
+
+`usp_RunPLM_Batch` and `usp_RunPreprocessor_Batch` wrap every sub-procedure in
+`BEGIN CATCH` and carry on to the next one — the `THROW` is deliberately commented
+out, so one bad sub-procedure never costs the whole batch. The consequence is that
+the `EXEC` returns cleanly no matter what, and the rolled-up row read `SUCCESS` over
+a batch that had partly failed. That bit on 2026-09-14: a PK violation in
+`sp_RefreshCCXSyncedContractLine` still logged `SUCCESS`, and only turned up by
+reading `process_log` by hand.
+
+Add `verify_process_log: true` to an `exec` step to close it:
+
+```yaml
+      - name: run_preprocessor_batch
+        exec: EXEC [Preprocessor].[usp_RunPreprocessor_Batch]
+        timeout_seconds: 3600
+        verify_process_log: true
+```
+
+After the `EXEC`, the runner reads the rows **this run** wrote to
+`<database>.<schema>.process_log` and fails the step unless every one says
+`Success`. The proc still runs all of its steps — only the verdict changes — and the
+failing sub-procedure names go to the log while the first failure's own message
+rides into ETLHealth's `Error` column, so it classifies as the real cause
+(`PK VIOLATION`, `TABLE NOT FOUND`, …) rather than a bare `See Log`.
+
+Rows are scoped by a watermark read off the **server** clock immediately before the
+`EXEC`, so an earlier failure the same day — or a re-run after a fix — never re-fails
+the current run. Within one run each sub-procedure logs exactly once, so "every row
+since the watermark" and "the latest row per sub-procedure" are the same set; they
+diverge only when two batches overlap, and there the stricter reading is what you
+want, since the overlap is itself the bug.
+
+Defaults assume the shape both batch procs use (`process_name`, `status`,
+`exec_start`, `err_msg`, success = `Success`, warning = `Warning`). A mapping
+overrides any of them:
+
+```yaml
+        verify_process_log:
+          table: '[PLM].[audit_log]'
+          ok_values: [Success, Skipped]
+          warn_values: []          # [] = every non-ok status fails, as before
+```
+
+A `BLOCKED` row's `Error` column names the unmet requirement, since that is the one
+detail the rolled-up row can't be read off at a glance.
+
+#### `Warning`: a third bucket, between pass and fail
+
+A sub-procedure that worked around something the owner should still see logs a
+`Warning` row instead of `Error`. The step passes, the destination reads `SUCCESS`,
+the exit code stays 0 — and the row's `err_msg` rides into that destination's
+ETLHealth `Error` column, which on a `SUCCESS` row has always been a notes field.
+The daily report shows any process carrying such a note even though nothing failed
+(the banner stays green); the intro line above the table says so.
+
+Anything matching neither `ok_values` nor `warn_values` is still a failure, so an
+unrecognised status fails rather than slipping through.
+
+The one producer today is `sp_RefreshCCXContractLineDeduped`, added 2026-09-17. The
+GHX feed behind `CCXContractLineDeduped` keeps arriving with `LAST_UPDATE`
+unpopulated — a known upstream problem with
+`Contracts.dbo.ZZZ_STAGING_CCX_CONTRACTS_DETAILS_GHX_PROVIDED_DAILY` that its owner
+is working through. That used to fail the whole Preprocessor batch, which is a lot of
+noise for one missing column. Now the proc defaults the missing stamp to today,
+refreshes normally, and logs:
+
+```
+UPDATE DATE MISSING (warning), check GHX_PROVIDED_DAILY -- 5,181,355 of 5,181,355
+staging row(s) have no LAST_UPDATE; defaulted to 2026-09-17 for the price-window filter.
+```
+
+A **stale** stamp (a real date more than `@MaxFeedAgeDays` old) is still a hard
+refusal — that means the feed stopped moving, which is a different problem. So is an
+empty feed. Only a *missing* stamp warns.
 
 ### Commands
 

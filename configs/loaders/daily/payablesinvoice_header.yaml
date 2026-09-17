@@ -188,3 +188,25 @@ field_config:
     - [VoucherNumberDisplay, VoucherNumber, string, varchar(40), source]
     - [create stamp, create stamp, datetime, datetime, source]
     - [update stamp, update stamp, datetime, datetime, source]
+    # ---- added 2026-09-16: the export grew these eight columns -------------
+    # Appended LAST, in export order, matching the ALTER order in
+    # sql/payablesinvoice_header/des1_PRIME_add_backbone_columns.sql and its des2
+    # twin. Both Update procs promote with a positional INSERT ... SELECT * (no
+    # column lists), so this tail order must stay identical to the tables'.
+    # Invoices last loaded before the ALTERs keep NULL here until they come back
+    # around in the rolling export window.
+    - [PayGroup, PayGroup, string, varchar(10), source]
+    - [BankTransactionCode, BankTransactionCode, string, varchar(20), source]
+    - [BankTransactionCode.Description, BankTransactionCodeDescription, string, varchar(100), source]
+    # The four amount-breakdown fields. The export ships them comma-grouped
+    # ("143,815.10"); `float` routes them through _to_float, which strips the
+    # separators -- do not type them `string` to dodge that. Blanks stay NULL.
+    - [MatchAmount, MatchAmount, float, money, source]
+    - [ServiceAmount, ServiceAmount, float, money, source]
+    - [AddOnChargeAmount, AddOnChargeAmount, float, money, source]
+    # Dropping the export's redundant "Field" suffix on the destination name.
+    - [DerivedTotalTaxAmountField, DerivedTotalTaxAmount, float, money, source]
+    # Status of the first payment applied to the invoice, blank until one is.
+    # A single composite string, e.g. "Issued- September 14, 2026" -- kept whole
+    # rather than split into status + date, which is how the export ships it.
+    - ['first PaymentsHaveBeenAppliedRel.PaymentStatus', FirstPaymentStatus, string, varchar(100), source]
