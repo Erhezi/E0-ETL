@@ -570,6 +570,43 @@ class FileLoader:
             for key, table in destination.prod_tables.items()
         ]
 
+    def read_and_prepare(
+        self, logger: logging.Logger
+    ) -> tuple[pd.DataFrame, list[str], str | None]:
+        """Read this loader's source file(s) and return the prepared primary frame,
+        the paths read, and any non-fatal source warning.
+
+        The file-facing half of a run -- rename, type conversion, drops, transforms,
+        destination-column selection and normalize -- with nothing DB-side attached.
+        Public so one-off tools (see :mod:`infor_loader.backfill`) can put a file
+        through exactly the preparation the daily loaders use.
+        """
+        dataframes, source_paths = self._read_sources(logger)
+        df, source_warning = self._prepare_dataframe(dataframes, logger)
+        return df, source_paths, source_warning
+
+    def stage_frame(
+        self,
+        cnxn: Any,
+        table: TableRef,
+        df: pd.DataFrame,
+        logger: logging.Logger,
+    ) -> tuple[int, str | None]:
+        """Align a prepared frame to ``table``, check its PK, clamp over-wide
+        strings and truncate/insert it, returning (rows, width warning).
+
+        The table-facing half of a staging load, without the overlap guard and
+        post_sql that :meth:`_load_staging` wraps around it. Public for the same
+        reason as :meth:`read_and_prepare`: a one-off tool lands its file in a table
+        through this single code path rather than a parallel copy of it.
+        """
+        output_df, insert_columns = self._align_for_destination(cnxn, df, table, logger)
+        self._validate_pk(output_df, logger)
+        output_df, width_warning = self._check_column_widths(cnxn, output_df, table, logger)
+        if self.config.stg_load_strategy != "truncate_insert":
+            raise ValueError(f"Unsupported stg_load strategy: {self.config.stg_load_strategy}")
+        return self._truncate_insert(cnxn, table, output_df, insert_columns), width_warning
+
     def _load_staging(
         self,
         destination: LoadDestination,
@@ -583,13 +620,7 @@ class FileLoader:
         staging_table = destination.staging
         cnxn = connect_sql_server(staging_table.server, staging_table.database)
         try:
-            output_df, insert_columns = self._align_for_destination(cnxn, df, staging_table, logger)
-            self._validate_pk(output_df, logger)
-            output_df, width_warning = self._check_column_widths(cnxn, output_df, staging_table, logger)
-            if self.config.stg_load_strategy == "truncate_insert":
-                row_count = self._truncate_insert(cnxn, staging_table, output_df, insert_columns)
-            else:
-                raise ValueError(f"Unsupported stg_load strategy: {self.config.stg_load_strategy}")
+            row_count, width_warning = self.stage_frame(cnxn, staging_table, df, logger)
 
             statements = [*self.config.post_sql, *destination.post_sql]
             if statements:

@@ -14,6 +14,8 @@ configs\
       ...
     on-demand\                     # run by hand only (never in --all)
       ghx_completed_invoice_by_date.yaml
+    backfill\                      # NOT loaders: one-time column backfills driven
+      payablesinvoice_header.yaml  # by backfill_helper (see "Column Backfill")
   post_processes\                  # run AFTER the loaders (see "Post-load processes")
     plm.yaml
     preprocessor.yaml
@@ -22,12 +24,18 @@ configs\
 ```
 
 Commands still take `--config configs` (the default): the loaders are discovered
-**recursively** under `configs\loaders\` (so both `daily\` and `on-demand\` are
-found), and the registry is found at the `configs\` root. The grouping is by
-`loaders\<group>\`; what actually gates a loader out of the daily batch is the
-`on-demand` **tag** (see "On-demand loaders" below), not the folder name.
-`post_processes\` is a **sibling** of `loaders\`, not under it, so its YAMLs are
-never swept into `--all`.
+**recursively** under `configs\loaders\` (so `daily\`, `on-demand\` and
+`backfill\` are all found), and the registry is found at the `configs\` root.
+The grouping is by `loaders\<group>\`; what actually gates a loader out of the
+daily batch is the `on-demand` **tag** (see "On-demand loaders" below), not the
+folder name. `post_processes\` is a **sibling** of `loaders\`, not under it, so
+its YAMLs are never swept into `--all`.
+
+Everything under `loaders\` must **parse** as a `LoaderConfig` — a malformed YAML
+there breaks discovery for every command. That is why the `backfill\` configs are
+loader-shaped even though they are not loaders: they carry `enabled: false` (so
+nothing in the loader CLI will run one) and an extra `backfill:` block that
+`LoaderConfig` ignores and `backfill_helper` reads.
 
 ### On-demand loaders
 
@@ -455,6 +463,142 @@ The bare config name also works in place of `--loader <name>`
 prints one status line per copied table, e.g.
 `COPIED  inventory_location  main  rows_truncated=120  rows_copied=120`;
 status is one of `COPIED`, `DRY_RUN`, `SKIPPED_NONEMPTY`, or `ABORTED`.
+
+## Column Backfill (`backfill_helper`)
+
+`backfill_helper` fills columns that were **added to an already-populated prod
+table**. When a table grows columns (an `ALTER TABLE ... ADD`), every row already
+in it keeps NULL there — the daily loader only refills a row when its key comes
+back around in the rolling export window, which for closed history is never. The
+gap is closed from a one-off export carrying the table's key plus the new
+columns, handed over in as many chunks as the reporting tool will produce.
+
+It is **not a loader**: it writes no ETLHealth row (a one-time backfill is not a
+scheduled process and would show on the daily health report as an unexplained
+extra job), and it reads no download gate.
+
+### Two phases
+
+1. **Stage** — the export chunk is truncate/inserted into a per-destination
+   `*_backfill` table through the **ordinary loader pipeline**: rename, type
+   conversion, source→destination mapping, PK duplicate check, varchar-width
+   clamp, batched `fast_executemany` insert. The table is created on first use
+   **from the target table's own column definitions**, so a staged value can
+   never be widened, narrowed or rounded on its way into the column it will be
+   written to.
+2. **Merge** — a generated `MERGE ... WHEN MATCHED THEN UPDATE` copies the
+   configured columns into the target, joined on the target's key.
+   `WHEN NOT MATCHED` is deliberately absent: a backfill fills columns on rows
+   the target already has, so a key the target does not carry is left alone
+   rather than inserted as a row with most columns NULL.
+
+Both phases run on one connection per destination, because a backfill config's
+`staging` and `prod` blocks are the same server and database — which is what lets
+a single MERGE see both.
+
+The merge runs in `batch_rows`-sized slices of the backfill table's
+`BackfillRowId` identity column, each its own transaction, so a half-million-row
+chunk is not one lock-holding, log-growing statement against live prod.
+
+### Config
+
+Backfill configs live in `configs\loaders\backfill\` and are ordinary
+`LoaderConfig` YAMLs with the two table roles reinterpreted — `staging:` is the
+backfill table, `prod:` is the table being filled — plus a `backfill:` block the
+loaders ignore. They carry `enabled: false` and the `backfill` + `on-demand`
+tags, so they are parsed and listed but the loader CLI will never run one
+(`--loader <name>` reports "No enabled loaders selected").
+
+```yaml
+backfill:
+  key: [Company, PayablesInvoice]          # the target's join key
+  columns: [PayGroup, BankTransactionCode] # the only columns written
+  update_when: 'tgt.[update stamp] <= src.[update stamp]'
+  set_mode: overwrite                      # overwrite | fill_null
+  batch_rows: 50000                        # 0 = one statement
+```
+
+Everything else in `field_config.mapping` (typically the version stamps) is
+staged into the backfill table for the gate and for traceability, and never
+written to the target. Every `key`/`columns` name is checked against the mapping
+*and* against the target table before anything is written.
+
+**`update_when` is the line that matters.** These exports are point-in-time
+snapshots while the daily loader keeps refreshing the same table, so without a
+gate a stale snapshot would move freshly-loaded rows backwards. When the target
+carries a version stamp that reaches both tables from the same export field
+(`update stamp` on the payables tables), compare it: apply the snapshot only
+where the target is not already ahead of it. That also makes the merge
+**re-runnable** — an interrupted run is restarted from the beginning and simply
+re-applies identical values.
+
+**`set_mode`** decides how a gated row is assigned: `overwrite` (`tgt.c = src.c`)
+is right *because of* the gate — a gated row is the same version the snapshot
+describes, so its values are the correct ones, including the legitimately blank
+ones. `fill_null` (`tgt.c = COALESCE(tgt.c, src.c)`) is the alternative for a
+target with no version stamp to gate on: only the holes are filled and a value
+already in the target is never touched.
+
+> ⚠️ The merge writes to **live prod** and has no undo. Every run prints its plan
+> and asks for an interactive `yes` first; `--yes` skips the prompt and
+> `--dry-run` reads and reports only. `sql\payablesinvoice_header\backfill_new_columns.sql`
+> carries the `SELECT ... INTO` rollback snapshot to take beforehand if you want one.
+
+### Commands
+
+Each chunk is one run — stage it, merge it, move on to the next:
+
+```powershell
+# Preview: prints the DDL and the MERGE, and (once the backfill table is loaded)
+# how many rows would be updated. Writes nothing.
+python -B backfill_helper.py --loader payablesinvoice_header_backfill `
+    --file "...\invoice_additional_cols_backfill_2026.csv" --dry-run
+
+# Stage + merge on every enabled destination, with one confirmation.
+python -B backfill_helper.py --loader payablesinvoice_header_backfill `
+    --file "...\invoice_additional_cols_backfill_2026.csv"
+```
+
+Split the phases to inspect the staged chunk before it touches prod — this is the
+recommended shape for the first chunk of a new backfill:
+
+```powershell
+# Load the chunk into the backfill table only; prod untouched.
+python -B backfill_helper.py --loader payablesinvoice_header_backfill `
+    --file "...\invoice_additional_cols_backfill_2026.csv" --stage-only
+
+# Report what the merge would do, off the data already staged (reads no file).
+python -B backfill_helper.py --loader payablesinvoice_header_backfill --merge-only --dry-run
+
+# Then merge it.
+python -B backfill_helper.py --loader payablesinvoice_header_backfill --merge-only
+```
+
+`--destination des1` narrows a run to one side; `--batch-rows` overrides the
+config's merge batch size (`0` merges in one statement); `--no-create` fails
+instead of creating a missing backfill table. The bare config name also works in
+place of `--loader <name>`.
+
+Each run prints, per destination, how many rows were staged, how many keys were
+**matched** in the target, how many passed the gate (**eligible**), and how many
+were **updated**. The gap between matched and eligible is the rows the daily
+loader has refreshed since the export was taken — it should be small, and those
+rows should already be filled.
+
+```
+MERGED  payablesinvoice_header_backfill  des1  staged=461687  matched=461687  eligible=449764  updated=449764
+```
+
+Status is one of `STAGED`, `MERGED`, `DRY_RUN`, `SKIPPED`, or `ABORTED`.
+
+### Backfilling a different table
+
+Copy `configs\loaders\backfill\payablesinvoice_header.yaml`, then change: the
+`name`, the two `destinations` blocks (`staging` = a new `<table>_backfill` name,
+`prod` = the table being filled), `field_config.mapping` to the new export's
+columns, and the `backfill:` block's `key`, `columns` and `update_when`. No code
+changes — the helper reads all of it from the config. Drop each backfill table on
+both servers once its last chunk is merged.
 
 ## Post-load processes
 

@@ -1,0 +1,209 @@
+name: payablesinvoice_header_backfill
+
+# NOT A LOADER. `enabled: false` + the 'backfill' / 'on-demand' tags keep this out
+# of every loader path -- it is never listed, never swept into --all, never
+# source-checked, and `run_daily_loaders.py --loader payablesinvoice_header_backfill`
+# refuses it. It is still a valid LoaderConfig so backfill_helper can reuse the
+# loader mapping/type pipeline verbatim:
+#   python -B backfill_helper.py --loader payablesinvoice_header_backfill --file <chunk.csv>
+# The shape is the ordinary one with the two table roles reinterpreted:
+#   staging: -> the BACKFILL table (scratch; truncated and reloaded per chunk)
+#   prod:    -> the TARGET table being filled
+# Both sit in the same database on each side, so one MERGE sees both.
+enabled: false
+tags: [backfill, on-demand, PayablesInvoiceHeader]
+
+process:
+  name: Payables Invoice Header Column Backfill
+  frequency: On Demand
+
+# ---------------------------------------------------------------------------
+# WHY THIS EXISTS
+# ---------------------------------------------------------------------------
+# The AP_invoices_backbone_DL export grew eight columns on 2026-09-16 (PayGroup
+# .. FirstPaymentStatus; see sql/payablesinvoice_header/des1_PRIME_add_backbone_
+# columns.sql). The ALTERs added them NULL-able to a populated table, so the
+# 2,033,613 invoices already in PAYABLESINVOICE_HEADER on 2026-09-17 hold NULL
+# there and only fill in as each invoice's own "update stamp" brings it back into
+# the daily rolling window -- which for closed 2023/2024 invoices is never.
+#
+# The fix is a set of one-off exports carrying just the PK + create/update stamp
+# + the eight new columns, handed over in chunks (they are too big for one file):
+#   invoice_additional_cols_backfill_2026.csv   461,687 rows, create stamp
+#                                               2025-12-31 .. 2026-09-15
+#   ... then 2025, then 2024 (with the 2023 tail), each by CREATE stamp,
+#   ... and finally one chunk by UPDATE stamp for the last 10 days, which
+#       catches invoices whose create stamp put them in an earlier chunk but
+#       which have been touched since that chunk was exported.
+# One run per chunk: stage it, merge it, move on to the next.
+# ---------------------------------------------------------------------------
+
+source:
+  multiple_input_files: false
+  files:
+    - alias: main
+      # The file is named on the command line (--file), because each chunk is a
+      # different export. This path is only the folder they are dropped in, and the
+      # glob is the fallback when --file is omitted for a --merge-only run.
+      path: 'C:\Users\dli2\OneDrive - Montefiore Medicine\Documents\INFOR_SC\backfill'
+      name: 'invoice_additional_cols_backfill_*.csv'
+      pick_latest: true
+      reader: csv
+      options:
+        dtype: str
+
+destinations:
+  - name: des1
+    enabled: true
+    server: MISCPrdAdhocDB
+    database: PRIME
+    schema: 'DM_MONTYNT\dli2'
+    staging:
+      # Created by backfill_helper on first use, from PAYABLESINVOICE_HEADER's own
+      # column definitions -- so the staged types cannot drift from the columns the
+      # values are written into. Scratch: TRUNCATEd at the start of each chunk.
+      table: payablesinvoice_header_backfill
+    prod:
+      table: PAYABLESINVOICE_HEADER
+      # No post_sql: the promotion here is the generated MERGE, not a proc. The
+      # daily loader's UpdatePayablesInvoiceHeader must NOT run off this table --
+      # it does a positional INSERT ... SELECT * and the backfill table holds only
+      # 12 of the 55 columns.
+
+  - name: des2
+    enabled: true
+    server: YNBBSTVWP02\PROCDATASRVPROD
+    database: PLMPreprocessorShared
+    schema: infor
+    staging:
+      table: payablesinvoice_header_backfill
+    prod:
+      table: PAYABLESINVOICE_HEADER
+
+# ---------------------------------------------------------------------------
+# What the MERGE does (read by infor_loader/backfill.py, ignored by LoaderConfig)
+# ---------------------------------------------------------------------------
+backfill:
+  # Join columns: the target's PK_PayablesInvoice, clustered on both sides
+  # (VERIFIED 2026-09-17), so the merge seeks rather than scans.
+  key: [Company, PayablesInvoice]
+
+  # The eight columns added 2026-09-16, and the only ones written. Everything
+  # else in the mapping below (the two stamps) is staged for the gate and for
+  # traceability, and never written to the target.
+  columns:
+    - PayGroup
+    - BankTransactionCode
+    - BankTransactionCodeDescription
+    - MatchAmount
+    - ServiceAmount
+    - AddOnChargeAmount
+    - DerivedTotalTaxAmount
+    - FirstPaymentStatus
+
+  # STAMP GUARD -- the important line in this file.
+  #
+  # These exports are point-in-time snapshots (the 2026 chunk was taken
+  # 2026-09-15 12:31), while the daily loader keeps refreshing the same table:
+  # on 2026-09-17 the target already held rows with an update stamp of
+  # 2026-09-16 21:50. Those rows were loaded AFTER the ALTERs, so the daily
+  # loader has already written the eight columns from a NEWER version of the
+  # invoice -- overwriting them with the snapshot would move the row backwards.
+  #
+  # `update stamp` is the invoice's own version stamp and comes from the same
+  # export field on both sides, so it compares exactly: apply the snapshot only
+  # where the target is not already ahead of it. Rows the daily loader has since
+  # refreshed are skipped (the run reports how many), and re-running a chunk
+  # re-applies identical values, so an interrupted merge is safe to restart.
+  update_when: 'tgt.[update stamp] <= src.[update stamp]'
+
+  # overwrite: tgt.c = src.c for every row that passes the gate above. Correct
+  # here BECAUSE of the gate -- a gated row is the same version the snapshot
+  # describes, so the snapshot's values for all eight columns are the right ones,
+  # including the legitimately blank ones (90,293 rows in the 2026 chunk have no
+  # payment status yet). `fill_null` (COALESCE) is the alternative for a target
+  # with no version stamp to gate on.
+  set_mode: overwrite
+
+  # Merge in slices of the backfill table's BackfillRowId, one transaction each,
+  # so a 461k-row chunk is not one long lock on a live prod table. 0 = one
+  # statement.
+  batch_rows: 50000
+
+health_table:
+  # Declared for config symmetry only -- backfill_helper writes NO ETLHealth row.
+  # A one-time backfill is not a scheduled process and would show on the daily
+  # health report as an unexplained extra job.
+  server: 'YNBBSTVWP02\PROCDATASRVPROD'
+  database: SCSFileIngestor
+  schema: InforLoader
+  table: ETLHealth
+
+logging:
+  # Local, not the DailyLoader share: this is an attended one-off, not a scheduled
+  # job whose logs anyone goes looking for. Lands in logs\<YYYYMMDD>\.
+  log_root: 'logs'
+  level: INFO
+  console: false
+  capture_streams: false
+
+# No archive: the chunks stay where they were dropped; they are not consumed
+# daily exports.
+
+stg_load:
+  strategy: truncate_insert   # each chunk replaces the last in the backfill table
+  batch_size: 50000
+
+# The backfill table carries the BackfillRowId IDENTITY column that slices the
+# merge into batches; it is not part of the data, so the staging insert skips it.
+skip_identity_columns: true
+
+# Align the prepared frame to the backfill table's own column order, which also
+# asserts every mapped column exists there (a stale table left over from an
+# earlier column list fails here, before anything is written).
+use_db_column_order: true
+
+# No overlap check: these chunks are deliberately non-contiguous history, not a
+# rolling window, and they are merged into existing rows rather than accumulated.
+
+# One row per invoice; a duplicate PK would make the MERGE ambiguous (SQL Server
+# raises "attempted to UPDATE the same row more than once"), so fail on it here,
+# before the target is touched. VERIFIED 0 duplicates in the 2026 chunk.
+fail_on_pk_duplicates: true
+
+transforms: []
+
+field_config:
+  # Same stamp format as the daily loader: 09/15/2026 12:31:38 PM. The backfill
+  # export ships the same fields from the same source.
+  date_format: '%m/%d/%Y'
+  datetime_format: '%m/%d/%Y %I:%M:%S %p'
+
+  pk_check: [Company, PayablesInvoice]
+
+  # Row format:
+  #   [source_or_computed, destination, type_to_convert_to_in_python, destination_datatype, origin]
+  # Destination names / types match PAYABLESINVOICE_HEADER (VERIFIED on both
+  # servers 2026-09-17); the backfill table is created FROM those definitions, so
+  # the destination_datatype column here is documentation, not the DDL source.
+  #
+  # The export's 12 columns, in file order:
+  mapping:
+    - [Company, Company, string, varchar(10), source]
+    - [PayablesInvoice, PayablesInvoice, string, varchar(40), source]
+    # Staged, never written. `create stamp` is what the chunks are cut on (so it
+    # is worth having next to the data when checking a chunk's coverage);
+    # `update stamp` is what the gate above compares.
+    - [create stamp, create stamp, datetime, datetime, source]
+    - [update stamp, update stamp, datetime, datetime, source]
+    # ---- the eight columns being backfilled, in target ordinal order 48-55 ----
+    - [PayGroup, PayGroup, string, varchar(10), source]
+    - [BankTransactionCode, BankTransactionCode, string, varchar(20), source]
+    - [BankTransactionCode.Description, BankTransactionCodeDescription, string, varchar(100), source]
+    # Comma-grouped in the export ("143,815.10"); `float` routes them through
+    # _to_float, which strips the separators. Do not type them `string`.
+    - [MatchAmount, MatchAmount, float, money, source]
+    - [ServiceAmount, ServiceAmount, float, money, source]
+    - [AddOnChargeAmount, AddOnChargeAmount, float, money, source]
+    - [DerivedTotalTaxAmountField, DerivedTotalTaxAmount, float, money, source]
+    - ['first PaymentsHaveBeenAppliedRel.PaymentStatus', FirstPaymentStatus, string, varchar(100), source]
