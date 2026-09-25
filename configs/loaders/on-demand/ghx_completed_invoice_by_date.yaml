@@ -61,9 +61,9 @@ destinations:
       table: COMPLETED_INVOICE_BY_DATE
       # VERIFIED 2026-08-05: ghx.UpdateCompletedInvoiceByDate exists on des2 and does
       # the declared pk_delete_insert (DELETE prod rows matching staging on CatalystID,
-      # then INSERT all staging rows). No 'sp_' prefix -- matches des1's naming.
+      # then INSERT all staging rows).
       post_sql:
-        - EXEC [ghx].[UpdateCompletedInvoiceByDate]
+        - EXEC [ghx].[sp_UpdateCompletedInvoiceByDate]
 
 health_table:
   server: 'YNBBSTVWP02\PROCDATASRVPROD'
