@@ -18,6 +18,7 @@ from __future__ import annotations
 import datetime as dt
 import html
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -279,28 +280,137 @@ def summarize(
     }
 
 
-def build_rerun_commands(
+# Rerun groups. Each is a set of processes that rerun with the SAME flags, so the
+# whole group goes into one command / one step.
+RERUN_LOADER_PRD = "loader_prd"
+RERUN_LOADER_FULL = "loader_full"
+RERUN_POST_PROCESS = "post_process"
+
+_RERUN_REASONS = {
+    RERUN_LOADER_PRD: "failed - prod promotion only",
+    RERUN_LOADER_FULL: "failed / skipped - full rerun",
+    RERUN_POST_PROCESS: "failed / blocked - rerun once the required loaders are SUCCESS",
+}
+
+_RERUN_LABELS = {
+    RERUN_LOADER_PRD: "loaders (prod promotion only)",
+    RERUN_LOADER_FULL: "loaders (full rerun)",
+    RERUN_POST_PROCESS: "post-load processes",
+}
+
+# The ``--stg-only`` / ``--prd-only`` phase each loader group reruns under; a
+# post-process group has no phase (None) -- it is not a file loader.
+_RERUN_PHASES = {
+    RERUN_LOADER_PRD: "prd",
+    RERUN_LOADER_FULL: "both",
+    RERUN_POST_PROCESS: None,
+}
+
+
+@dataclass(frozen=True)
+class RerunGroup:
+    """One batch of processes that rerun together under the same flags.
+
+    ``targets`` are config ``name``s (what a command/step passes), ``processes`` the
+    ETLHealth ``ProcessName``s they came from (what the report shows).
+    """
+
+    kind: str
+    targets: list[str]
+    processes: list[str]
+
+    @property
+    def reason(self) -> str:
+        return _RERUN_REASONS[self.kind]
+
+    @property
+    def label(self) -> str:
+        return _RERUN_LABELS[self.kind]
+
+    @property
+    def phase(self) -> str | None:
+        """``both`` / ``prd`` for a loader group, ``None`` for post-processes."""
+        return _RERUN_PHASES[self.kind]
+
+    @property
+    def is_post_process(self) -> bool:
+        return self.kind == RERUN_POST_PROCESS
+
+    @property
+    def command(self) -> str:
+        if self.kind == RERUN_LOADER_PRD:
+            return f"python -B run_daily_loaders.py --loader {' '.join(self.targets)} --prd-only --auto"
+        if self.kind == RERUN_LOADER_FULL:
+            return f"python -B run_daily_loaders.py --loader {' '.join(self.targets)} --auto"
+        return f"python -B run_daily_loaders.py post-run --process {' '.join(self.targets)} --auto"
+
+
+@dataclass(frozen=True)
+class RerunPlan:
+    """What a day's ETLHealth says still needs to be run, as ordered groups.
+
+    Built once and used twice: the email renders it as copy-pasteable commands, and
+    ``--rerun-failed`` executes the same groups in the same order, so the two can
+    never disagree about what a failed day owes.
+    """
+
+    groups: list[RerunGroup]
+    unmatched: list[str]
+
+    @property
+    def is_empty(self) -> bool:
+        return not self.groups and not self.unmatched
+
+    def group(self, kind: str) -> RerunGroup | None:
+        for group in self.groups:
+            if group.kind == kind:
+                return group
+        return None
+
+    def commands(self) -> list[dict[str, str]]:
+        """The plan rendered for the email: one copy-pasteable entry per group."""
+        entries = [
+            {
+                "command": group.command,
+                "processes": ", ".join(group.processes),
+                "reason": group.reason,
+            }
+            for group in self.groups
+        ]
+        entries.extend(
+            {
+                "command": f"# no config matched ProcessName '{name}'; rerun by hand",
+                "processes": name,
+                "reason": "unmatched",
+            }
+            for name in self.unmatched
+        )
+        return entries
+
+
+def build_rerun_plan(
     summary: dict[str, Any],
     process_map: dict[str, str],
     post_process_names: Iterable[str] = (),
-) -> list[dict[str, str]]:
-    """Consolidated rerun commands for the failed, skipped AND blocked processes.
+) -> RerunPlan:
+    """Route the failed, skipped AND blocked processes into their rerun groups.
 
-    Entries that share the same rerun flags are batched into ONE command -- both
-    ``--loader`` and ``post-run --process`` accept several names -- so a day with
-    several failures yields one copy-pasteable line per group instead of one per
-    process. Three groups:
+    Entries that share the same rerun flags land in ONE group -- both ``--loader``
+    and ``post-run --process`` accept several names -- so a day with several failures
+    yields one command (and one run step) per group instead of one per process.
+    Three groups, in the order they must run:
 
-      * ``--prd-only``: failed loaders whose only failed targets are ``PRD``
-        (staging already succeeded -- promote without re-reading the file).
       * full rerun (no phase flag): failed loaders with a staging/read failure,
         plus every skipped (FILE_NOT_FOUND) loader -- re-read the file once it lands.
-      * ``post-run --process``: failed or blocked post-load processes. A blocked one
-        needs no flag beyond this: rerunning it re-checks the gate, which clears by
-        itself once the required loader has been re-run successfully.
+      * ``--prd-only``: failed loaders whose only failed targets are ``PRD``
+        (staging already succeeded -- promote without re-reading the file).
+      * ``post-run --process``: failed or blocked post-load processes. These run
+        last because a blocked one needs no flag beyond this: its gate clears by
+        itself once the loader above has been re-run successfully.
 
-    A process with no matching config cannot be batched; it gets its own
-    ``# ... rerun by hand`` note. Uses the real config ``name`` from the configs.
+    A process with no matching config cannot be batched; it is returned in
+    ``unmatched`` for a ``# ... rerun by hand`` note. Uses the real config ``name``
+    from the configs.
     """
     post_names = set(post_process_names)
     prd_only_loaders: list[str] = []
@@ -309,18 +419,12 @@ def build_rerun_commands(
     full_processes: list[str] = []
     post_targets: list[str] = []
     post_processes: list[str] = []
-    unmatched: list[dict[str, str]] = []
+    unmatched: list[str] = []
 
     def route(process_name: str, *, prd_only: bool) -> None:
         target_name = process_map.get(process_name)
         if target_name is None:
-            unmatched.append(
-                {
-                    "command": f"# no config matched ProcessName '{process_name}'; rerun by hand",
-                    "processes": process_name,
-                    "reason": "unmatched",
-                }
-            )
+            unmatched.append(process_name)
         elif process_name in post_names:
             post_targets.append(target_name)
             post_processes.append(process_name)
@@ -343,42 +447,44 @@ def build_rerun_commands(
     for process_name in summary.get("blocked", []):
         route(process_name, prd_only=False)
 
-    commands: list[dict[str, str]] = []
-    if prd_only_loaders:
-        commands.append(
-            {
-                "command": (
-                    "python -B run_daily_loaders.py --loader "
-                    f"{' '.join(prd_only_loaders)} --prd-only --auto"
-                ),
-                "processes": ", ".join(prd_only_processes),
-                "reason": "failed — prod promotion only",
-            }
-        )
+    groups: list[RerunGroup] = []
     if full_loaders:
-        commands.append(
-            {
-                "command": (
-                    "python -B run_daily_loaders.py --loader "
-                    f"{' '.join(full_loaders)} --auto"
-                ),
-                "processes": ", ".join(full_processes),
-                "reason": "failed / skipped — full rerun",
-            }
-        )
+        groups.append(RerunGroup(RERUN_LOADER_FULL, full_loaders, full_processes))
+    if prd_only_loaders:
+        groups.append(RerunGroup(RERUN_LOADER_PRD, prd_only_loaders, prd_only_processes))
     if post_targets:
-        commands.append(
-            {
-                "command": (
-                    "python -B run_daily_loaders.py post-run --process "
-                    f"{' '.join(post_targets)} --auto"
-                ),
-                "processes": ", ".join(post_processes),
-                "reason": "failed / blocked — rerun once the required loaders are SUCCESS",
-            }
-        )
-    commands.extend(unmatched)
-    return commands
+        groups.append(RerunGroup(RERUN_POST_PROCESS, post_targets, post_processes))
+    return RerunPlan(groups, unmatched)
+
+
+def build_rerun_commands(
+    summary: dict[str, Any],
+    process_map: dict[str, str],
+    post_process_names: Iterable[str] = (),
+) -> list[dict[str, str]]:
+    """The rerun plan rendered as the email's copy-pasteable command list."""
+    return build_rerun_plan(summary, process_map, post_process_names).commands()
+
+
+def plan_reruns(
+    config_ref: str = "configs",
+    email_config_path: str = "configs/email.yaml",
+    *,
+    report_date: dt.date | None = None,
+) -> tuple[dict[str, Any], RerunPlan]:
+    """Read one day's ETLHealth and return ``(summary, plan)`` for it.
+
+    The read-only half of :func:`send_daily_report` -- the same process map, rows,
+    consolidation and summary -- exposed on its own so ``--rerun-failed`` can act on
+    exactly what the email would have reported, without sending anything.
+    """
+    report_date = report_date or dt.date.today()
+    health_table = _health_table_from_config(load_email_config(email_config_path))
+    process_map = _daily_process_map(config_ref)
+    post_process_names = _post_process_names(config_ref)
+    consolidated = consolidate(fetch_health_rows(health_table, report_date, process_map.keys()))
+    summary = summarize(consolidated, report_date, process_map)
+    return summary, build_rerun_plan(summary, process_map, post_process_names)
 
 
 def failed_log_paths(consolidated: list[dict[str, Any]]) -> list[str]:
@@ -539,6 +645,7 @@ def render_html(
         return _finish_html(
             parts, rerun_commands, attached_logs, skipped_attachments,
             mode=mode, recipients=recipients, generated_at=generated_at,
+            report_date=report_date,
         )
 
     parts.append(
@@ -615,6 +722,7 @@ def render_html(
     return _finish_html(
         parts, rerun_commands, attached_logs, skipped_attachments,
         mode=mode, recipients=recipients, generated_at=generated_at,
+        report_date=report_date,
     )
 
 
@@ -627,6 +735,7 @@ def _finish_html(
     mode: str,
     recipients: list[str],
     generated_at: dt.datetime,
+    report_date: dt.date | None = None,
 ) -> str:
     """Append the shared tail (rerun block, attachment notes, footer) and close out.
     Called from both the normal table path and the no-issues early return."""
@@ -635,6 +744,23 @@ def _finish_html(
         parts.append(
             '<h3 style="font-size:15px;margin:0 0 8px;">Rerun failed / skipped loaders</h3>'
         )
+        # The same groups in one command. Offered first because it is what most days
+        # want; the per-group lines below stay for reruns done one at a time.
+        if any(not entry["command"].startswith("#") for entry in rerun_commands):
+            date_flag = f" --rerun-date {report_date.isoformat()}" if report_date else ""
+            all_in_one = html.escape(
+                f"python -B run_daily_loaders.py --rerun-failed{date_flag} --auto"
+            )
+            parts.append(
+                '<p style="font-size:12px;color:#5f6368;margin:0 0 8px;">'
+                "All of it in one command (runs the groups below in order, "
+                "post-processes last):</p>"
+                '<pre style="background:#202124;color:#e8eaed;padding:12px 16px;'
+                'border-radius:6px;font-size:13px;overflow-x:auto;'
+                f'font-family:Consolas,monospace;white-space:pre-wrap;">{all_in_one}</pre>'
+                '<p style="font-size:12px;color:#5f6368;margin:0 0 8px;">'
+                "Or one group at a time:</p>"
+            )
         lines: list[str] = []
         for entry in rerun_commands:
             # Unmatched processes carry a self-describing ``#`` note as their command

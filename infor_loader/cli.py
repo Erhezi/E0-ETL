@@ -63,6 +63,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     _add_phase_flags(parser)
     _add_destination_flag(parser)
+    _add_rerun_flags(parser)
     _add_post_run_flags(parser)
     _add_notify_flags(parser)
 
@@ -93,6 +94,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     _add_phase_flags(run_parser)
     _add_destination_flag(run_parser)
+    _add_rerun_flags(run_parser)
     _add_post_run_flags(run_parser)
     _add_notify_flags(run_parser)
 
@@ -199,8 +201,24 @@ def main(argv: list[str] | None = None) -> int:
 
     if getattr(args, "all", False) and (args.loader or args.tag):
         parser.error("--all cannot be combined with --loader/--tag.")
+    # --rerun-failed picks its own targets out of ETLHealth, so naming any is a
+    # contradiction rather than a narrowing: fail instead of silently ignoring one.
+    if getattr(args, "rerun_failed", False):
+        if args.loader or args.tag or getattr(args, "all", False):
+            parser.error("--rerun-failed selects the failed loaders itself; do not combine it with --loader/--tag/--all.")
+        if _resolve_phase(args) != "both":
+            parser.error("--rerun-failed sets the phase per loader from ETLHealth; do not combine it with --stg-only/--prd-only.")
+        if getattr(args, "post_run", False):
+            # The plan already carries the failed/blocked post-processes as its last
+            # step; --post-run on top would run them a second time.
+            parser.error(
+                "--rerun-failed already reruns the failed/blocked post-processes; drop --post-run "
+                "(use `post-run --all` separately to run every process regardless of status)."
+            )
 
     if args.command is None:
+        if getattr(args, "rerun_failed", False):
+            return run_rerun_failed(args)
         if args.loader or args.tag or args.all:
             exit_code = run_interactive(
                 args.config,
@@ -273,6 +291,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "run":
+        if getattr(args, "rerun_failed", False):
+            return run_rerun_failed(args)
         selected = _daily_loaders(loaders) if args.all else select_loaders(loaders, names=args.loader, tags=args.tag)
         selected = [loader for loader in selected if loader.enabled]
         if not selected:
@@ -927,6 +947,27 @@ def _add_notify_flags(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_rerun_flags(parser: argparse.ArgumentParser) -> None:
+    """``--rerun-failed``: re-run whatever a day's ETLHealth says still owes a run.
+
+    The selection is the daily email's rerun block, so the flag is the one-command
+    alternative to copy-pasting the lines out of it -- the email stays the record of
+    WHAT failed either way.
+    """
+    parser.add_argument(
+        "--rerun-failed",
+        action="store_true",
+        help="Re-run everything a day's ETLHealth reports as failed / skipped / blocked "
+        "(the daily email's rerun block, run in dependency order). Exits 0 with a note "
+        "when nothing is owed. Cannot be combined with --loader/--tag/--all.",
+    )
+    parser.add_argument(
+        "--rerun-date",
+        default=None,
+        help="Which day's ETLHealth --rerun-failed reads, YYYY-MM-DD (default: today).",
+    )
+
+
 def _parse_report_date(value: str | None) -> dt.date | None:
     if not value:
         return None
@@ -1163,6 +1204,21 @@ def run_post_run(args: argparse.Namespace) -> int:
     return exit_code
 
 
+def _confirm_yes_no() -> bool:
+    """The shared "Proceed?" prompt. A closed stdin (EOFError) reads as no, so a
+    non-interactive run without --auto aborts rather than loading prod unattended."""
+    while True:
+        try:
+            answer = input("Proceed? Type 'yes' to run, 'no' to exit: ").strip().lower()
+        except EOFError:
+            return False
+        if answer in {"yes", "y"}:
+            return True
+        if answer in {"no", "n"}:
+            return False
+        print("Please type 'yes' or 'no'.")
+
+
 def print_process_summary(process: Any) -> None:
     print(f"Post-process: {process.name}")
     print(f"  enabled:  {process.enabled}")
@@ -1189,16 +1245,7 @@ def confirm_post_run(processes: list[Any]) -> bool:
     names = ", ".join(process.name for process in processes)
     print(f"About to run {len(processes)} post-process(es): {names}")
     print("This executes the batch procedures against the LIVE tables shown above.")
-    while True:
-        try:
-            answer = input("Proceed? Type 'yes' to run, 'no' to exit: ").strip().lower()
-        except EOFError:
-            return False
-        if answer in {"yes", "y"}:
-            return True
-        if answer in {"no", "n"}:
-            return False
-        print("Please type 'yes' or 'no'.")
+    return _confirm_yes_no()
 
 
 def print_post_results(results: list[Any]) -> None:
@@ -1258,6 +1305,190 @@ def _resolve_post_max_workers(args: argparse.Namespace) -> int:
         )
         return POST_PROCESS_MAX_WORKERS_CAP
     return max(1, requested)
+
+
+# -- Rerun what a day's ETLHealth says failed ---------------------
+
+
+def run_rerun_failed(args: argparse.Namespace) -> int:
+    """``--rerun-failed``: re-run exactly what a day's ETLHealth still owes.
+
+    Reads the same plan the daily email prints as copy-pasteable commands
+    (:func:`notify.build_rerun_plan`) and runs its groups in dependency order --
+    full loader reruns, then prod-only promotions, then the post-load processes --
+    so a loader fixed in the first step clears the requirement gate of a process
+    waiting on it in the last. Running those groups one by one out of the email is
+    still perfectly valid; this is the same work in one command.
+
+    A day with nothing owed is not an error: the headline is printed and the run
+    exits 0 without touching a table.
+    """
+    from . import notify as notify_module
+    from .post_process import (
+        filter_process_destinations,
+        load_post_process_configs,
+        run_post_processes,
+        select_processes,
+    )
+
+    try:
+        report_date = _parse_report_date(getattr(args, "rerun_date", None)) or dt.date.today()
+    except ValueError:
+        print(f"--rerun-date: expected YYYY-MM-DD, got {args.rerun_date!r}.", file=sys.stderr)
+        return 2
+    try:
+        summary, plan = notify_module.plan_reruns(
+            args.config,
+            getattr(args, "email_config", "configs/email.yaml"),
+            report_date=report_date,
+        )
+    except (OSError, ValueError, KeyError) as exc:
+        print(
+            f"--rerun-failed: could not read ETLHealth for {report_date.isoformat()}: {exc}",
+            file=sys.stderr,
+        )
+        return 2
+
+    print(f"ETLHealth {report_date.isoformat()}: {summary['headline']}")
+    if summary["not_run"]:
+        # Never attempted, so there is no failure to rerun -- but a day whose batch
+        # never started must not read as "nothing to do".
+        print(
+            f"No ETLHealth row at all for: {', '.join(summary['not_run'])}. "
+            "--rerun-failed only reruns what was recorded; run these by name.",
+            file=sys.stderr,
+        )
+    for process_name in plan.unmatched:
+        print(f"No config matched ProcessName {process_name!r}; rerun it by hand.", file=sys.stderr)
+
+    if not plan.groups:
+        print(f"Nothing to rerun for {report_date.isoformat()}; exiting.")
+        return 0
+
+    # Resolve every step up front: a name that no longer matches a config, or a
+    # --destination typo, should fail before the first table is touched.
+    loaders = load_loader_configs(args.config)
+    destinations = getattr(args, "destination", []) or []
+    steps: list[tuple[Any, list[Any]]] = []
+    for group in plan.groups:
+        try:
+            if group.is_post_process:
+                configured = [
+                    process for process in load_post_process_configs(args.config) if process.enabled
+                ]
+                selected = select_processes(configured, names=group.targets)
+                selected = filter_process_destinations(selected, destinations)
+            else:
+                selected = [
+                    loader for loader in select_loaders(loaders, names=group.targets) if loader.enabled
+                ]
+                selected = filter_destinations(selected, destinations)
+        except (OSError, ValueError) as exc:
+            print(f"--rerun-failed: {exc}", file=sys.stderr)
+            return 2
+        if not selected:
+            print(
+                f"--rerun-failed: nothing enabled left for {group.label}; skipping that step.",
+                file=sys.stderr,
+            )
+            continue
+        steps.append((group, selected))
+
+    if not steps:
+        print("--rerun-failed: every step was filtered away; nothing to run.", file=sys.stderr)
+        return 2
+
+    # The post-run gate reads the day the reruns LAND in, which is today: the
+    # loaders re-run above write today's ETLHealth rows, not the report date's.
+    gate_date = dt.date.today()
+    has_full_rerun = any(group.phase == "both" for group, _ in steps)
+    has_post_processes = any(group.is_post_process for group, _ in steps)
+
+    print()
+    print(f"Rerun plan for {report_date.isoformat()} ({len(steps)} step(s), in order):")
+    for index, (group, selected) in enumerate(steps, start=1):
+        names = ", ".join(item.name for item in selected)
+        print(f"  {index}. {group.label}: {names}")
+        print(f"     {group.reason}")
+    if destinations:
+        print(f"Destinations: {', '.join(destinations)} ONLY (each item's other destinations are skipped)")
+    if has_full_rerun:
+        if getattr(args, "ignore_download", False):
+            print("Download check: OFF (--ignore-download; loading the file already in place)")
+        else:
+            print(
+                "Download check: ON (a loader with no fresh export in Downloads skips again "
+                "as FILE_NOT_FOUND)"
+            )
+    if has_post_processes:
+        if getattr(args, "ignore_gate", False):
+            print("Requirement gate: OFF (--ignore-gate; upstream loader status is not checked)")
+        else:
+            # Gate date == today even when replaying an older day: the loaders above
+            # write TODAY's ETLHealth rows, so that is where their success shows up.
+            note = "" if gate_date == report_date else f" -- the day these reruns land in, not {report_date.isoformat()}"
+            print(
+                "Requirement gate: ON (required loaders must be SUCCESS in ETLHealth for "
+                f"{gate_date.isoformat()}{note})"
+            )
+    print()
+    for group, selected in steps:
+        for item in selected:
+            if group.is_post_process:
+                print_process_summary(item)
+            else:
+                print_loader_summary(item, phase=group.phase)
+            print()
+
+    total = sum(len(selected) for _, selected in steps)
+    if not getattr(args, "auto", False):
+        print(
+            f"About to rerun {total} item(s) across {len(steps)} step(s), "
+            f"from {report_date.isoformat()}."
+        )
+        print("This writes to the staging/prod tables shown above.")
+        if not _confirm_yes_no():
+            print("Aborted; nothing was run.")
+            return 1
+
+    exit_code = 0
+    for index, (group, selected) in enumerate(steps, start=1):
+        print()
+        print(f"--- Step {index}/{len(steps)}: {group.label} ---")
+        if group.is_post_process:
+            results = run_post_processes(
+                selected,
+                config_ref=args.config,
+                log_root=args.log_root,
+                report_date=gate_date,
+                ignore_gate=getattr(args, "ignore_gate", False),
+                destination_workers=_resolve_destination_workers(args),
+            )
+            print_post_results(results)
+            step_code = post_run_exit_code(results)
+        else:
+            results = run_loaders(
+                selected,
+                max_workers=_resolve_max_workers(args),
+                log_root=args.log_root,
+                phase=group.phase,
+                registry=_find_registry_for(args.config),
+                ignore_download=getattr(args, "ignore_download", False),
+            )
+            for result in results:
+                row_text = "" if result.row_count is None else f" rows={result.row_count}"
+                print(
+                    f"{result.status}\t{result.loader_name}\t{result.duration_seconds}s"
+                    f"{row_text}\t{result.log_file_path}"
+                )
+            # Same rule as a normal run: a FILE_NOT_FOUND skip is benign. A loader
+            # that skips again here still leaves anything gated on it BLOCKED, which
+            # the post-process step reports on its own.
+            step_code = 0 if all(r.status in {"SUCCESS", "FILE_NOT_FOUND"} for r in results) else 1
+        exit_code = exit_code or step_code
+
+    _maybe_notify(args)
+    return exit_code
 
 
 def run_interactive(
@@ -1370,16 +1601,7 @@ def confirm_proceed(loaders: list[LoaderConfig], *, phase: str = "both") -> bool
         print("This runs prod promotion using whatever is ALREADY in the staging tables.")
     else:
         print("This writes to the staging/prod tables shown above.")
-    while True:
-        try:
-            answer = input("Proceed? Type 'yes' to run, 'no' to exit: ").strip().lower()
-        except EOFError:
-            return False
-        if answer in {"yes", "y"}:
-            return True
-        if answer in {"no", "n"}:
-            return False
-        print("Please type 'yes' or 'no'.")
+    return _confirm_yes_no()
 
 
 def run_loaders(

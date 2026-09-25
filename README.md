@@ -810,8 +810,10 @@ success, or `X/Y` failed), a per-target status table (Process / Status / DB
 Connection / Target Type / Last Run / Error, with `des1`→**PRIME** and
 `des2`→**O2**), the log file(s) attached for any failure, and a consolidated
 copy‑pasteable rerun command for the failed/skipped/blocked entries (entries that
-share the same flags are batched into one invocation; `--prd-only` failures, full
-loader reruns, and `post-run --process a b` each get their own line).
+share the same flags are batched into one invocation; full loader reruns,
+`--prd-only` failures, and `post-run --process a b` each get their own line, and
+the block is headed by the single `--rerun-failed` command that runs all of them
+in order — see [Rerun what failed](#rerun-what-failed---rerun-failed)).
 
 `BLOCKED` counts with the skips, not the failures — a process that never ran
 because its loader failed is not a second alarm. The roster the percentages read
@@ -887,6 +889,54 @@ python -B run_daily_loaders.py notify --mode prd
 
 `--date` defaults to today; `--email-config` (default `configs/email.yaml`) and
 `--env` (default `.env`) override the config/secret locations.
+
+### Rerun what failed: `--rerun-failed`
+
+The daily email lists the failed / skipped / blocked entries and a command per
+group. `--rerun-failed` is those same groups in one command: it re-reads the day's
+**ETLHealth** (read-only), builds the identical plan, and runs it in dependency
+order — full loader reruns first, then the `--prd-only` promotions, then the
+post-load processes, so a loader fixed in the first step clears the requirement
+gate of the process waiting on it in the last.
+
+```powershell
+# What does today still owe? Prints the plan and asks yes/no before anything runs.
+python -B run_daily_loaders.py --rerun-failed
+
+# Unattended.
+python -B run_daily_loaders.py --rerun-failed --auto
+
+# Replay another day's failures (default: today).
+python -B run_daily_loaders.py --rerun-failed --rerun-date 2026-09-24 --auto
+
+# Rerun, then email a fresh report.
+python -B run_daily_loaders.py --rerun-failed --auto --notify
+```
+
+A day where everything succeeded is **not** an error: the headline is printed and
+the command exits `0` without touching a table — safe to wire into a scheduled
+retry. Running the groups one at a time out of the email still works exactly as
+before; this only saves the copy-pasting.
+
+The selection comes from ETLHealth, so the flag cannot be combined with
+`--loader` / `--tag` / `--all` (it picks its own targets), with `--stg-only` /
+`--prd-only` (the phase is per group), or with `--post-run` (the plan already ends
+with the failed/blocked processes). `--destination`, `--ignore-download`,
+`--ignore-gate`, `--max-workers` and `--destination-workers` all pass through to
+the steps they apply to. Exit code: `1` if any step failed, `2` if the plan could
+not be built (ETLHealth unreachable, a bad `--rerun-date`, a `--destination` typo).
+
+Three things it deliberately does **not** do:
+
+* **On-demand loaders** are outside the daily roster the report reads, so a failed
+  one never appears in the plan — rerun it by name, as always.
+* A process with **no ETLHealth row at all** (the batch never reached it) is not a
+  recorded failure, so it is reported on stderr and left out — run those by name.
+* The post-run requirement gate checks **today**, the day the reruns land in, not
+  the `--rerun-date` being replayed: the re-run loaders write today's rows. If a
+  required loader succeeded on the replayed day and is not itself part of the
+  plan, its dependent process reads as `BLOCKED` — rerun it with
+  `post-run --process <name> --ignore-gate` once you have checked it.
 
 ### Send automatically after the daily run
 
