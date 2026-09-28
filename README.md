@@ -625,6 +625,37 @@ des1's `MDM_VENDOR_INFOR` (the vendor loader lands that master under a different
 name per side). Its des2 staging proc is
 `sql\payablesinvoice_vendor_gl_index\des2_infor_create_make_stg_proc.sql`.
 
+### Inline SQL steps and `${report_date}`
+
+A step's `exec:` (or its alias `sql:`) is not limited to an `EXEC` — it is any T-SQL,
+run as one batch through `cursor.execute(...)`, with `params:` bound to its `?`
+placeholders. A multi-line `sql: |` block is therefore a first-class way to keep a
+statement in version control without deploying a stored procedure (`sql/` is
+gitignored, so a proc's definition would live outside the repo).
+
+Because the batch is one `execute` and `pyodbc` autocommit is off, the whole block is
+a single transaction that the framework commits once. Open it with `SET XACT_ABORT ON`
+so a mid-batch error rolls back the statements before it rather than leaving half the
+work applied.
+
+One `params` entry is resolved at run time: the literal string `${report_date}`
+becomes the run's report date, so a dated statement follows `--date` instead of
+hardcoding `GETDATE()`. Everything else is passed through as written.
+
+```yaml
+params:
+  - "${report_date}"    # -> the run's --date (default: today)
+  - 1
+sql: |
+  SET NOCOUNT ON;
+  SET XACT_ABORT ON;
+  DECLARE @ToDate date = ?, @Backfill int = ?;
+  ...
+```
+
+Also set `target:` explicitly on an inline-SQL step — omitted, it is derived by
+reading an object name off the statement, which only works for a single `EXEC`.
+
 ### The requirement gate
 
 A process declares the **loaders** it needs, by loader `name`:
@@ -794,12 +825,90 @@ python -B run_daily_loaders.py run --all --auto --post-run --notify
 
 Unlike `--notify`, this is real work against prod, so a `FAILED` process **does**
 make the run exit non-zero (a `BLOCKED` one does not). `--post-process <name>`
-limits which ones the flag runs. A run narrowed with `--destination` to a side no
+limits which ones the flag runs.
+
+A post-process tagged `on-demand` is kept out of this sweep and out of
+`post-run --all`, exactly as the same tag keeps a loader out of `--all`. It stays
+discoverable and runnable by name (`post-run --process <name>`). That is how the
+team publish below stays at the *end* of a run instead of landing in the middle of
+the post-process batch. A run narrowed with `--destination` to a side no
 process targets yet simply skips this step with a note.
 
 On a batch run, `--max-workers` sizes the **loader** batch only — the processes
 always run one at a time there. `--destination-workers` *is* honored, so the two
 servers still work in parallel inside each process.
+
+## Reporting to the team's ETL table
+
+The Procurement data team keeps a shared status table,
+`ETL.dbo.ETL_Health_Status` on O2, which feeds the team's Power BI dashboard. The
+`report_to_team_etl` post-process publishes our ETLHealth rows into it so our loaders
+appear there alongside everyone else's jobs, owned by `Dan Li`.
+
+```powershell
+# Publish at the end of a batch run (after --post-run, before --notify).
+python -B run_daily_loaders.py run --all --auto --post-run --report-to-team-etl --notify
+
+# Publish a given day on its own -- the repair tool.
+python -B run_daily_loaders.py report-to-team-etl --date 2026-09-22
+python -B run_daily_loaders.py report-to-team-etl --auto
+```
+
+### What it publishes
+
+The latest ETLHealth row per `ProcessName` / `DBConnection` / `TargetTableType`
+**per day**, over a trailing window, keyed in the team table as
+`"<ProcessName> | <TargetTableType> | <DBConnection>"` (their `PackageName` column).
+On-demand loaders are included — the snapshot is everything ETLHealth recorded, not
+just the daily roster the email scopes to.
+
+It excludes **itself**: the reporter's own row stays in our ETLHealth (and shows in
+the daily email) but never reaches the team table. Its row is written after the step
+returns, so it could not publish itself in the same run anyway.
+
+### Why delete+insert, and why the window
+
+The statement snapshots into a `#temp` table, deletes only the rows it is about to
+replace, and inserts — this framework's own `pk_delete_insert` strategy, in one
+transaction under `SET XACT_ABORT ON`. Two consequences worth knowing:
+
+* **It is idempotent.** Running it twice publishes the same thing, which is what lets
+  it run at the end of *every* run (including `--rerun-failed`, which republishes
+  after the reruns land) without duplicating rows or tripping the target's
+  `(PackageName, LastRunTime)` primary key — the bug that made the hand-run
+  `insert ... select` fail on a second execution.
+* **The delete is deliberately narrow.** It joins to the snapshot and matches
+  `Owner` exactly, so it can only ever touch rows it is replacing. The table is
+  shared with four other owners (plus some rows with no owner at all); a blanket
+  "delete today where Owner = me" would be one rename away from eating another
+  team's job.
+
+`params` sets a **1-day backfill**, so each publish covers today *and* yesterday.
+This matters more than it looks: the snapshot is per-day, so a day that never gets
+published is **lost**, not merely late — tomorrow's publish would not backfill it.
+The window means a manual run where you forgot the flag repairs itself on the next
+scheduled batch. Widen it in the YAML to cover a longer gap, or use
+`report-to-team-etl --date` for a specific day.
+
+### On-demand loaders
+
+On-demand loaders are published, but they are not part of the scheduled batch, so
+nothing publishes them automatically. Add `--report-to-team-etl` to an on-demand run
+if you want it on the dashboard the same day:
+
+```powershell
+python -B run_daily_loaders.py --loader ghx_completed_invoice_by_date --auto --report-to-team-etl
+```
+
+Forgetting it only delays the row to the next morning's batch (thanks to the
+backfill window) — it does not lose it.
+
+### Failure behavior
+
+A failed publish **does** make the run exit non-zero, unlike `--notify`. A publish
+that fails quietly means somebody else's dashboard goes stale without anyone
+noticing. It also writes its own ETLHealth row, so it appears in the daily email and
+in `--rerun-failed`'s plan like any other post-process.
 
 ## Daily email notification
 

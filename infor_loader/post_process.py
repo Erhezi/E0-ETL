@@ -635,6 +635,18 @@ class StepResult:
     warnings: tuple[str, ...] = ()
 
 
+# A ``params`` entry spelled exactly like this is replaced at run time with the
+# process's report date, so a date-driven statement written in YAML follows the run's
+# ``--date`` instead of hardcoding GETDATE() -- which is what makes a dated replay
+# (`report-to-team-etl --date 2026-09-22`) publish that day rather than today.
+REPORT_DATE_PARAM = "${report_date}"
+
+
+def _resolve_params(params: tuple[Any, ...], *, report_date: dt.date) -> tuple[Any, ...]:
+    """Substitute the run-time placeholders in an ``exec`` step's ``params``."""
+    return tuple(report_date if value == REPORT_DATE_PARAM else value for value in params)
+
+
 def _run_step(
     step: ProcessStep,
     destination: ProcessDestination,
@@ -654,10 +666,11 @@ def _run_step(
             # few seconds of clock skew would drop this run's first sub-procedure or
             # sweep in the tail of the previous one.
             watermark = _server_now(cnxn) if step.verify_process_log else None
+            params = _resolve_params(step.params, report_date=report_date)
             cursor = cnxn.cursor()
             try:
                 logger.info("  exec: %s", step.exec_sql)
-                cursor.execute(step.exec_sql, *step.params)
+                cursor.execute(step.exec_sql, *params)
                 # A batch proc that SELECTs or PRINTs leaves the connection busy;
                 # drain it so the commit below cannot fail on a result set nobody
                 # asked for. Row counts come from the proc's own process_log table.

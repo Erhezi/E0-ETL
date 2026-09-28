@@ -1,0 +1,147 @@
+name: report_to_team_etl
+# `on-demand` keeps this OUT of the `--post-run` / `post-run --all` sweep the way the
+# same tag keeps a loader out of `--all`: publishing belongs at the END of a run, not
+# in the middle of the post-process batch. It is still discoverable by name
+# (`post-run --process report_to_team_etl`), and the `--report-to-team-etl` flag /
+# `report-to-team-etl` subcommand are what normally drive it.
+#
+# It is NOT excluded from the daily email: unlike an on-demand loader (which
+# legitimately does not run most days), this runs with every scheduled batch, so a
+# missing row is news -- it shows as "did not run today".
+tags: [on-demand, post_process, reporting]
+enabled: true
+
+process:
+  # This string must match the @Self parameter below: the publish excludes its own
+  # ETLHealth row, so the reporter's status stays in our table and never reaches the
+  # team's. (Its row is written after this step returns anyway, so it could never
+  # publish itself in the same run.)
+  name: Report to Team ETL
+  frequency: Daily
+
+# Deliberately empty. A gated reporter would refuse to publish on exactly the days
+# the dashboard matters most -- the whole point is to publish failures too.
+requires:
+  loaders: []
+
+destinations:
+  # The team table lives only on O2, in its own `ETL` database on the SAME instance
+  # as our ETLHealth -- which is what lets this be one server-side statement instead
+  # of shuttling rows through Python. Both tables are named in full below, so the
+  # database this connects to does not actually matter.
+  - name: des2
+    enabled: true
+    server: YNBBSTVWP02\PROCDATASRVPROD
+    database: ETL
+    schema: dbo
+    steps:
+      - name: publish_snapshot
+        target: ETL_Health_Status
+        timeout_seconds: 300
+        # @ToDate follows the run's --date (see post_process.REPORT_DATE_PARAM);
+        # everything else is fixed here.
+        #   1 = @Backfill: publish today AND yesterday. The snapshot is per-DAY, so a
+        #       day that never gets published is lost rather than merely late -- the
+        #       trailing window means a forgotten flag after an on-demand run repairs
+        #       itself on the next morning's batch. Same idiom as bullard's
+        #       backfill_days. Widen it to cover a longer gap.
+        params:
+          - "${report_date}"
+          - 1
+          - Dan Li
+          - Report to Team ETL
+        # Delete+insert rather than MERGE: it is this framework's own
+        # `pk_delete_insert` promotion strategy, and it makes the publish idempotent
+        # -- which is what lets it run at the end of EVERY run (including
+        # --rerun-failed) without duplicating anything.
+        #
+        # XACT_ABORT is what makes it safe: the whole batch is one transaction
+        # (pyodbc autocommit is off and the framework commits once), so an error
+        # after the DELETE rolls the DELETE back. Without it a mid-batch failure
+        # would leave the team dashboard showing NOTHING for us that day, which is
+        # worse than showing something stale.
+        #
+        # Column names below are the TEAM table's real ones -- `PackageName` (not
+        # ProcessName) and `Row_Count` (not [RowCount]). The hand-run query that
+        # this replaces used `insert ... select *`, so its column aliases were
+        # cosmetic and the values landed positionally.
+        #
+        # STGTableName is varchar(max) here and varchar(255) there, so it is the one
+        # column that needs a length guard (longest in practice: 120).
+        sql: |
+          SET NOCOUNT ON;
+          SET XACT_ABORT ON;
+
+          DECLARE @ToDate   date         = ?,
+                  @Backfill int          = ?,
+                  @Owner    varchar(100) = ?,
+                  @Self     varchar(100) = ?;
+          DECLARE @FromDate date = DATEADD(day, -@Backfill, @ToDate);
+
+          IF OBJECT_ID('tempdb..#pub') IS NOT NULL DROP TABLE #pub;
+
+          -- The snapshot: latest ETLHealth row per process/connection/target-type
+          -- PER DAY. The date in the PARTITION BY is what makes a multi-day window
+          -- correct -- without it the window would collapse to the newest day only.
+          SELECT
+              PackageName      = CONCAT(h.ProcessName, ' | ', h.TargetTableType, ' | ', h.DBConnection),
+              DataFlowTaskName = h.ProcessType,
+              h.SourceFilePath,
+              h.LastRunTime,
+              h.TargetTableName,
+              h.TaskStatus,
+              Row_Count        = h.[RowCount],
+              h.PackagePath,
+              h.LogFilePath,
+              STGTableName     = LEFT(h.STGTableName, 255),
+              h.ProcessFrequency,
+              h.Error,
+              Owner            = @Owner
+          INTO #pub
+          FROM (
+              SELECT *,
+                     ROW_NUMBER() OVER (
+                         PARTITION BY ProcessName, DBConnection, TargetTableType, CAST(LastRunTime AS date)
+                         ORDER BY LastRunTime DESC) AS rk
+              FROM SCSFileIngestor.InforLoader.ETLHealth
+              WHERE LastRunTime >= @FromDate
+                AND LastRunTime <  DATEADD(day, 1, @ToDate)
+                AND ProcessName <> @Self
+          ) AS h
+          WHERE h.rk = 1;
+
+          -- Delete ONLY the rows this publish is about to replace. The table is
+          -- shared with four other owners (plus some rows with no owner at all), so
+          -- a blanket "delete today where Owner = me" would be one rename away from
+          -- eating somebody else's job. Joining to the snapshot and matching Owner
+          -- exactly means it can only ever touch rows it is replacing.
+          DELETE t
+          FROM ETL.dbo.ETL_Health_Status AS t
+          INNER JOIN #pub AS p
+                  ON  t.PackageName = p.PackageName
+                  AND CAST(t.LastRunTime AS date) = CAST(p.LastRunTime AS date)
+          WHERE t.Owner = @Owner;
+
+          INSERT INTO ETL.dbo.ETL_Health_Status
+              (PackageName, DataFlowTaskName, SourceFilePath, LastRunTime,
+               TargetTableName, TaskStatus, Row_Count, PackagePath, LogFilePath,
+               STGTableName, ProcessFrequency, Error, Owner)
+          SELECT
+               PackageName, DataFlowTaskName, SourceFilePath, LastRunTime,
+               TargetTableName, TaskStatus, Row_Count, PackagePath, LogFilePath,
+               STGTableName, ProcessFrequency, Error, Owner
+          FROM #pub;
+
+          DROP TABLE #pub;
+
+health_table:
+  server: 'YNBBSTVWP02\PROCDATASRVPROD'
+  database: SCSFileIngestor
+  schema: InforLoader
+  table: ETLHealth
+
+logging:
+  log_root: '\\montefiore.org\centralfiles\data\Procurement PMO\dli2\DailyLoader\<loader name>\logs'
+  level: INFO
+  console: true
+  capture_streams: true

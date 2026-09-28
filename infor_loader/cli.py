@@ -31,6 +31,11 @@ from .utilities import build_column_mapping_template, inspect_table, write_mappi
 # Upper bound on concurrent loaders so a full run cannot swamp the SQL Server.
 MAX_WORKERS_CAP = 4
 
+# The post-process that publishes our ETLHealth rows to the team's shared table.
+# Driven by --report-to-team-etl / the report-to-team-etl subcommand rather than the
+# ordinary post-run sweep, which its `on-demand` tag keeps it out of.
+TEAM_REPORT_PROCESS = "report_to_team_etl"
+
 # ON_DEMAND_TAG (imported from file_folder) gates on-demand loaders: they are
 # discovered (so name selection and `list` work) but excluded from the `--all`
 # batch and the `move-files --check` source scan -- run them explicitly by name
@@ -64,6 +69,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_phase_flags(parser)
     _add_destination_flag(parser)
     _add_rerun_flags(parser)
+    _add_team_report_flag(parser)
     _add_post_run_flags(parser)
     _add_notify_flags(parser)
 
@@ -95,6 +101,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_phase_flags(run_parser)
     _add_destination_flag(run_parser)
     _add_rerun_flags(run_parser)
+    _add_team_report_flag(run_parser)
     _add_post_run_flags(run_parser)
     _add_notify_flags(run_parser)
 
@@ -174,6 +181,19 @@ def main(argv: list[str] | None = None) -> int:
     _add_destination_flag(post_parser)
     _add_notify_flags(post_parser)
 
+    team_parser = subparsers.add_parser(
+        "report-to-team-etl",
+        help="Publish a day's ETLHealth rows to the team's shared ETL_Health_Status table.",
+    )
+    team_parser.add_argument(
+        "--date",
+        default=None,
+        help="Which day to publish, YYYY-MM-DD (default: today). The config's backfill "
+        "window is applied on top, so this also republishes the days just before it.",
+    )
+    team_parser.add_argument("--auto", action="store_true", help="Skip the confirmation prompt.")
+    team_parser.add_argument("--log-root", default=None, help="Override the process's YAML logging.log_root.")
+
     notify_parser = subparsers.add_parser(
         "notify",
         help="Email the daily ETLHealth report (read-only; builds a summary + status table).",
@@ -233,10 +253,12 @@ def main(argv: list[str] | None = None) -> int:
                 destinations=args.destination,
             )
             # Post-load processes run BEFORE the email so one report covers the
-            # loaders and everything downstream of them.
+            # loaders and everything downstream of them; the team publish sits
+            # between the two so the email reports whether it worked.
             post_code = _maybe_post_run(args)
+            team_code = _maybe_report_to_team(args)
             _maybe_notify(args)
-            return exit_code or post_code
+            return exit_code or post_code or team_code
         parser.print_help(sys.stderr)
         return 2
 
@@ -261,6 +283,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "post-run":
         return run_post_run(args)
+
+    if args.command == "report-to-team-etl":
+        return run_team_report(args)
 
     if args.command == "move-files":
         return run_move_files(
@@ -321,8 +346,9 @@ def main(argv: list[str] | None = None) -> int:
         # not a failure: it must not turn the whole run's exit code non-zero.
         exit_code = 0 if all(result.status in {"SUCCESS", "FILE_NOT_FOUND"} for result in results) else 1
         post_code = _maybe_post_run(args)
+        team_code = _maybe_report_to_team(args)
         _maybe_notify(args)
-        return exit_code or post_code
+        return exit_code or post_code or team_code
 
     raise ValueError(f"Unknown command: {args.command}")
 
@@ -968,6 +994,22 @@ def _add_rerun_flags(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_team_report_flag(parser: argparse.ArgumentParser) -> None:
+    """``--report-to-team-etl``: publish the day's ETLHealth to the team's table.
+
+    Opt-in rather than automatic: an exploratory ``--stg-only`` run has no business
+    writing to another team's table. Forgetting it is cheap -- the publish covers a
+    trailing window, so the next scheduled batch picks up what a manual run missed.
+    """
+    parser.add_argument(
+        "--report-to-team-etl",
+        action="store_true",
+        help="After the run, publish the day's ETLHealth rows to the team's shared "
+        "ETL_Health_Status table (idempotent; safe to repeat). Runs after --post-run "
+        "and before --notify.",
+    )
+
+
 def _parse_report_date(value: str | None) -> dt.date | None:
     if not value:
         return None
@@ -1038,6 +1080,96 @@ def _add_post_run_flags(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _daily_processes(processes: list[Any]) -> list[Any]:
+    """The post-processes a batch sweep runs: every one EXCEPT the on-demand ones.
+
+    Mirrors :func:`_daily_loaders`. An on-demand post-process is still discoverable
+    and runnable by name -- it is only kept out of ``--post-run`` / ``post-run --all``,
+    which is how the team publish stays at the END of a run instead of landing in the
+    middle of the post-process batch.
+    """
+    return [process for process in processes if ON_DEMAND_TAG not in process.tags]
+
+
+def _maybe_report_to_team(args: argparse.Namespace) -> int:
+    """Publish the day's ETLHealth to the team's table when ``--report-to-team-etl``
+    was passed. Returns this step's exit-code contribution.
+
+    Unlike the email step this is real work against a shared table, so a failure does
+    surface in the exit code: a publish that fails silently means somebody else's
+    dashboard goes stale without anyone noticing.
+
+    ``--destination`` is deliberately NOT applied. Narrowing a *load* to one side says
+    nothing about the publish, which is a whole-day snapshot of both sides either way.
+    """
+    if not getattr(args, "report_to_team_etl", False):
+        return 0
+
+    from .post_process import load_post_process_configs, run_post_processes, select_processes
+
+    try:
+        configured = [p for p in load_post_process_configs(args.config) if p.enabled]
+        processes = select_processes(configured, names=[TEAM_REPORT_PROCESS])
+    except (OSError, ValueError) as exc:
+        print(f"--report-to-team-etl: {exc}", file=sys.stderr)
+        return 1
+
+    print()
+    print(f"Publishing today's ETLHealth to the team table ({TEAM_REPORT_PROCESS})")
+    results = run_post_processes(
+        processes,
+        config_ref=args.config,
+        log_root=getattr(args, "log_root", None),
+        report_date=None,  # the run just happened -> today
+    )
+    print_post_results(results)
+    return post_run_exit_code(results)
+
+
+def run_team_report(args: argparse.Namespace) -> int:
+    """The ``report-to-team-etl`` subcommand: publish one day on its own.
+
+    The repair tool for anything the trailing window did not cover -- an on-demand
+    loader run on a day nobody published, or a gap left by a batch that died before
+    its publish step. Equivalent to ``post-run --process report_to_team_etl --date X``,
+    named so it can be found without knowing it is a post-process.
+    """
+    from .post_process import load_post_process_configs, run_post_processes, select_processes
+
+    try:
+        configured = [p for p in load_post_process_configs(args.config) if p.enabled]
+        processes = select_processes(configured, names=[TEAM_REPORT_PROCESS])
+    except (OSError, ValueError) as exc:
+        print(f"report-to-team-etl: {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        report_date = _parse_report_date(args.date) or dt.date.today()
+    except ValueError:
+        print(f"--date: expected YYYY-MM-DD, got {args.date!r}.", file=sys.stderr)
+        return 2
+
+    print(f"Publishing ETLHealth for {report_date.isoformat()} (plus the config's backfill window)")
+    print("to the team's shared ETL_Health_Status table. This replaces only our own rows.")
+    print()
+    for process in processes:
+        print_process_summary(process)
+        print()
+
+    if not args.auto and not _confirm_yes_no():
+        print("Aborted; nothing was published.")
+        return 1
+
+    results = run_post_processes(
+        processes,
+        config_ref=args.config,
+        log_root=args.log_root,
+        report_date=report_date,
+    )
+    print_post_results(results)
+    return post_run_exit_code(results)
+
+
 def _maybe_post_run(args: argparse.Namespace) -> int:
     """Run the post-load processes after a batch run when ``--post-run`` was passed.
 
@@ -1060,6 +1192,8 @@ def _maybe_post_run(args: argparse.Namespace) -> int:
         names = getattr(args, "post_process", []) or []
         if names:
             processes = select_processes(processes, names=names)
+        else:
+            processes = _daily_processes(processes)
         requested = getattr(args, "destination", []) or []
         if requested:
             # Narrow to the destinations the processes actually declare. A batch run
@@ -1151,7 +1285,7 @@ def run_post_run(args: argparse.Namespace) -> int:
         return 2
 
     try:
-        selected = processes if args.all else select_processes(processes, names=args.process, tags=args.tag)
+        selected = _daily_processes(processes) if args.all else select_processes(processes, names=args.process, tags=args.tag)
         selected = [process for process in selected if process.enabled]
         selected = filter_process_destinations(selected, args.destination)
     except ValueError as exc:
@@ -1219,6 +1353,21 @@ def _confirm_yes_no() -> bool:
         print("Please type 'yes' or 'no'.")
 
 
+def _step_description(step: Any) -> str:
+    """One line describing what a step runs.
+
+    An ``exec`` step is usually a one-line EXEC, but it may also be an inline
+    statement block (the team publish is ~40 lines) -- summarize those instead of
+    dumping the whole thing into the confirmation summary.
+    """
+    if not step.exec_sql:
+        return f"python:{step.python}"
+    lines = [line.strip() for line in step.exec_sql.splitlines() if line.strip()]
+    if len(lines) <= 1:
+        return step.exec_sql
+    return f"{lines[0]}  ... ({len(lines) - 1} more lines of SQL)"
+
+
 def print_process_summary(process: Any) -> None:
     print(f"Post-process: {process.name}")
     print(f"  enabled:  {process.enabled}")
@@ -1236,7 +1385,7 @@ def print_process_summary(process: Any) -> None:
         state = "" if destination.enabled else "   (disabled)"
         print(f"    - {destination.display_name()}{state}")
         for step in destination.steps:
-            what = step.exec_sql or f"python:{step.python}"
+            what = _step_description(step)
             print(f"        {step.name}: {what}")
     print(f"  logs:     {process.log_root}")
 
@@ -1487,6 +1636,8 @@ def run_rerun_failed(args: argparse.Namespace) -> int:
             step_code = 0 if all(r.status in {"SUCCESS", "FILE_NOT_FOUND"} for r in results) else 1
         exit_code = exit_code or step_code
 
+    # The reruns above changed today's ETLHealth, so republish before the email.
+    exit_code = exit_code or _maybe_report_to_team(args)
     _maybe_notify(args)
     return exit_code
 

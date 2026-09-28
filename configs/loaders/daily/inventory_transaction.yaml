@@ -183,3 +183,5 @@ field_config:
     - InventoryTransaction.DefaultDistributionAccount
     - ItemLocation.AvailableQuantity
     - ItemLocation.AllocatedQuantity
+    - InventoryTransactionLine.WarehouseShipment.WarehouseDemand.DemandDocument # parked, it can be used to link back to requisition, may add later to data and do backfill separately
+    
