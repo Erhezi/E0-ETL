@@ -17,7 +17,7 @@ process:
   # team's. (Its row is written after this step returns anyway, so it could never
   # publish itself in the same run.)
   name: Report to Team ETL
-  frequency: Daily
+  frequency: Workdays
 
 # Deliberately empty. A gated reporter would refuse to publish on exactly the days
 # the dashboard matters most -- the whole point is to publish failures too.
@@ -83,6 +83,15 @@ destinations:
           -- The snapshot: latest ETLHealth row per process/connection/target-type
           -- PER DAY. The date in the PARTITION BY is what makes a multi-day window
           -- correct -- without it the window would collapse to the newest day only.
+          --
+          -- A FILE_NOT_FOUND row is dropped from the ranking when the SAME target
+          -- already has a SUCCESS row that day (the `hit_ok` flag below). That
+          -- pairing means the file was consumed and archived by the earlier
+          -- successful run, so a re-run of the WHOLE batch -- what people do to fix
+          -- one loader -- finds nothing fresh in Downloads and skips. Publishing
+          -- that skip would show the team a dozen healthy loaders as "no file
+          -- received". A target whose only rows that day are FILE_NOT_FOUND keeps
+          -- it: there the file really never arrived. Mirrors notify.consolidate.
           SELECT
               PackageName      = CONCAT(h.ProcessName, ' | ', h.TargetTableType, ' | ', h.DBConnection),
               DataFlowTaskName = h.ProcessType,
@@ -103,10 +112,16 @@ destinations:
                      ROW_NUMBER() OVER (
                          PARTITION BY ProcessName, DBConnection, TargetTableType, CAST(LastRunTime AS date)
                          ORDER BY LastRunTime DESC) AS rk
-              FROM SCSFileIngestor.InforLoader.ETLHealth
-              WHERE LastRunTime >= @FromDate
-                AND LastRunTime <  DATEADD(day, 1, @ToDate)
-                AND ProcessName <> @Self
+              FROM (
+                  SELECT *,
+                         hit_ok = MAX(CASE WHEN TaskStatus = 'SUCCESS' THEN 1 ELSE 0 END) OVER (
+                             PARTITION BY ProcessName, DBConnection, TargetTableType, CAST(LastRunTime AS date))
+                  FROM SCSFileIngestor.InforLoader.ETLHealth
+                  WHERE LastRunTime >= @FromDate
+                    AND LastRunTime <  DATEADD(day, 1, @ToDate)
+                    AND ProcessName <> @Self
+              ) AS e
+              WHERE e.hit_ok = 0 OR ISNULL(e.TaskStatus, '') <> 'FILE_NOT_FOUND'
           ) AS h
           WHERE h.rk = 1;
 

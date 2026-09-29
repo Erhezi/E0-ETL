@@ -21,6 +21,8 @@ configs\
     preprocessor.yaml
     bullard_burn_down.yaml
     payablesinvoice_vendor_gl_index.yaml
+    report_to_team_etl\           # publishing, not a data job -- own folder so it
+      report_to_team_etl.yaml     # does not read as a fifth nightly process
 ```
 
 Commands still take `--config configs` (the default): the loaders are discovered
@@ -29,7 +31,9 @@ Commands still take `--config configs` (the default): the loaders are discovered
 The grouping is by `loaders\<group>\`; what actually gates a loader out of the
 daily batch is the `on-demand` **tag** (see "On-demand loaders" below), not the
 folder name. `post_processes\` is a **sibling** of `loaders\`, not under it, so
-its YAMLs are never swept into `--all`.
+its YAMLs are never swept into `--all`. It is searched recursively too, on the
+same terms: a subfolder there groups for the eye only -- what keeps the team
+publish out of the `--post-run` sweep is its `on-demand` tag, not its folder.
 
 Everything under `loaders\` must **parse** as a `LoaderConfig` — a malformed YAML
 there breaks discovery for every command. That is why the `backfill\` configs are
@@ -843,7 +847,10 @@ servers still work in parallel inside each process.
 The Procurement data team keeps a shared status table,
 `ETL.dbo.ETL_Health_Status` on O2, which feeds the team's Power BI dashboard. The
 `report_to_team_etl` post-process publishes our ETLHealth rows into it so our loaders
-appear there alongside everyone else's jobs, owned by `Dan Li`.
+appear there alongside everyone else's jobs, owned by `Dan Li`. It is configured at
+`configs\post_processes\report_to_team_etl\report_to_team_etl.yaml` -- kept in its
+own folder because it publishes a report rather than moving data, so it does not read
+as a fifth nightly process.
 
 ```powershell
 # Publish at the end of a batch run (after --post-run, before --notify).

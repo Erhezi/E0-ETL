@@ -199,10 +199,26 @@ def consolidate(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
     A loader re-run on the same day writes a fresh set of rows; the newest
     LastRunTime supersedes earlier attempts for that target.
+
+    One exception: a FILE_NOT_FOUND row is ignored when the SAME target already
+    has a SUCCESS row for the day. That pairing is not a missing file -- it is the
+    file having already been consumed and archived by the earlier successful run,
+    so a re-run of the whole batch (rather than just the one loader that needed
+    it) finds nothing fresh in Downloads and skips. Letting that skip win would
+    report a dozen healthy loaders as "no file received" on any day somebody
+    re-ran everything to fix one loader. A target whose ONLY rows today are
+    FILE_NOT_FOUND keeps it -- there the file genuinely never arrived.
     """
+    succeeded: set[tuple[str, str, str]] = {
+        _group_key(row)
+        for row in rows
+        if str(row.get("TaskStatus") or "") == _STATUS_SUCCESS
+    }
     latest: dict[tuple[str, str, str], dict[str, Any]] = {}
     for row in rows:
         key = _group_key(row)
+        if str(row.get("TaskStatus") or "") == _STATUS_SKIPPED and key in succeeded:
+            continue
         current = latest.get(key)
         if current is None or _run_sort_value(row) >= _run_sort_value(current):
             latest[key] = row

@@ -2,9 +2,10 @@
 
 Four of them run after the daily batch -- PLM, Preprocessor, BullardBurnDown and
 PayablesInvoiceVendorGLIndex -- none depending on each other, each depending on specific loaders having landed
-cleanly. Each is declared in ``configs/post_processes/<name>.yaml`` as an ordered
-list of steps against one or more destinations, and each writes exactly ONE
-ETLHealth row per destination carrying the top-level status. Per-step detail (which
+cleanly. Each is declared in ``configs/post_processes/<name>.yaml`` -- or in a
+grouping subfolder of it, as the reporting publish uses -- as an ordered list of
+steps against one or more destinations, and each writes exactly ONE ETLHealth row
+per destination carrying the top-level status. Per-step detail (which
 sub-procedure failed, how long each took) stays in the run's log file, which the
 daily report attaches on failure -- that is the whole point of the rollup: the two
 batch procs already log every sub-procedure to their own process_log tables, so
@@ -399,6 +400,11 @@ def load_post_process_configs(config_ref: str = "configs") -> list[PostProcessCo
     the sibling ``loaders/``); a single ``.yaml`` path loads just that file, so one
     process can be validated on its own. A missing folder is not an error -- it just
     means nothing is configured to run after the loaders.
+
+    The folder is searched RECURSIVELY, so processes may be grouped into subfolders
+    exactly as the loaders group into ``daily/`` and ``on-demand/``. The grouping is
+    presentational only: a subfolder name is not a tag and selects nothing -- what a
+    process is and how it is picked still comes from its own ``name`` and ``tags``.
     """
     import yaml
 
@@ -409,7 +415,7 @@ def load_post_process_configs(config_ref: str = "configs") -> list[PostProcessCo
         process_dir = config_path / POST_PROCESS_DIRNAME
         if not process_dir.is_dir():
             return []
-        paths = sorted([*process_dir.glob("*.yaml"), *process_dir.glob("*.yml")])
+        paths = sorted([*process_dir.rglob("*.yaml"), *process_dir.rglob("*.yml")])
 
     configs: list[PostProcessConfig] = []
     for path in paths:
