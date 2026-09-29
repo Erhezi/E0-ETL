@@ -112,7 +112,7 @@ field_config:
   mapping:
     - [CommodityCode, CommodityCode, string, varchar(20), source]
     - [CommodityCode_Level, CommodityCodeLevel, string, varchar(2), source]
-    - [Description, Description, string, varchar(max), source]
+    - [Description, Description, string, varchar(255), source]
     - [MMAHSIssueAccount, IssueAccount, string, varchar(20), source]
     - [MMAHSIssueAccount.GeneralLedgerChartAccount.AccountDescription, GLText, string, varchar(255), source]
     - [Active, Active, string, varchar(10), source]
