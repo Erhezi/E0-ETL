@@ -71,6 +71,8 @@ DEFAULT_BATCH_ROWS = 50_000
 #:   fill_null - tgt.c = COALESCE(tgt.c, src.c): only the holes are filled and a
 #:               value already in the target is never touched. For targets with no
 #:               version stamp to gate on.
+#: A column listed in ``set_expressions`` ignores the mode and is assigned its own
+#: SQL expression instead.
 SET_MODES = frozenset({"overwrite", "fill_null"})
 
 
@@ -95,6 +97,11 @@ class BackfillSpec:
     #: keeps a stale snapshot from overwriting a row the daily loader refreshed.
     update_when: str | None = None
     set_mode: str = "overwrite"
+    #: Per-column SQL assignment overriding ``set_mode``, written against the same
+    #: ``tgt`` / ``src`` aliases as ``update_when`` -- for a value that also depends
+    #: on target columns the export does not carry. See the purchaseorder_line_index
+    #: config, whose Index rule reads the target row's InventoryFD1.
+    set_expressions: dict[str, str] = field(default_factory=dict)
     batch_rows: int = DEFAULT_BATCH_ROWS
     #: Per-destination backfill table name, keyed by destination name. Normally
     #: empty: the table is the destination's `staging` block, and this only exists
@@ -123,11 +130,25 @@ class BackfillSpec:
         if batch_rows < 0:
             raise ValueError(f"backfill.batch_rows must be >= 0 (0 = one statement); got {batch_rows}.")
         update_when = data.get("update_when")
+        set_expressions = {
+            str(column): str(expression or "").strip()
+            for column, expression in (data.get("set_expressions") or {}).items()
+        }
+        unknown = sorted(set(set_expressions) - set(columns))
+        if unknown:
+            raise ValueError(
+                f"backfill.set_expressions names {unknown}, which are not in backfill.columns; "
+                f"only a column being written can have an expression."
+            )
+        empty = sorted(column for column, expression in set_expressions.items() if not expression)
+        if empty:
+            raise ValueError(f"backfill.set_expressions has an empty expression for {empty}.")
         return cls(
             key=key,
             columns=columns,
             update_when=str(update_when).strip() if update_when else None,
             set_mode=set_mode,
+            set_expressions=set_expressions,
             batch_rows=batch_rows,
             table_overrides={
                 str(name): str(table) for name, table in (data.get("tables") or {}).items()
@@ -370,6 +391,16 @@ def _source_select(backfill_table: TableRef, columns: list[str], *, batched: boo
     return f"        SELECT {column_sql}\n        FROM {backfill_table.qualified_name()}{where}"
 
 
+def _assigned_value(spec: BackfillSpec, column: str) -> str:
+    """The SQL a matched target column is set to: its ``set_expressions`` entry if it
+    has one, else what ``set_mode`` prescribes."""
+    if column in spec.set_expressions:
+        return f"({spec.set_expressions[column]})"
+    if spec.set_mode == "fill_null":
+        return f"COALESCE(tgt.{bracket_identifier(column)}, src.{bracket_identifier(column)})"
+    return f"src.{bracket_identifier(column)}"
+
+
 def build_merge_sql(
     target_table: TableRef,
     backfill_table: TableRef,
@@ -388,17 +419,10 @@ def build_merge_sql(
     ``NOCOUNT`` is on so the trailing ``SELECT @@ROWCOUNT`` is the batch's only
     result set, and reports exactly the rows the MERGE updated.
     """
-    if spec.set_mode == "fill_null":
-        assignments = [
-            f"    tgt.{bracket_identifier(column)} = "
-            f"COALESCE(tgt.{bracket_identifier(column)}, src.{bracket_identifier(column)})"
-            for column in spec.columns
-        ]
-    else:
-        assignments = [
-            f"    tgt.{bracket_identifier(column)} = src.{bracket_identifier(column)}"
-            for column in spec.columns
-        ]
+    assignments = [
+        f"    tgt.{bracket_identifier(column)} = {_assigned_value(spec, column)}"
+        for column in spec.columns
+    ]
     matched_when = f" AND ({spec.update_when})" if spec.update_when else ""
     return (
         "SET NOCOUNT ON;\n"
@@ -723,6 +747,8 @@ def _print_plan(
     if carried:
         out(f"  Staged but not written: {', '.join(carried)}")
     out(f"  Set mode: {spec.set_mode}")
+    for column, expression in spec.set_expressions.items():
+        out(f"  Set {column} = {expression}")
     out(f"  Update gate: {spec.update_when or '(none -- every matched row is updated)'}")
     out(f"  Merge batch: {spec.batch_rows or 'one statement'}")
     for destination in destinations:

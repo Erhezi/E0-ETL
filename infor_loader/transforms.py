@@ -320,13 +320,16 @@ def purchase_order_line(
 
     fd3_m = dataframes["fd3"][["FinanceDimension3", "Description"]].copy()
     fd3_m.columns = ["FD3", "FD3Text"]
-    fd5_m = dataframes["fd5"][["FinanceDimension5", "Description"]].copy()
-    fd5_m.columns = ["FD5", "FD5Text"]
-    df = df.merge(fd3_m, on=["FD3"], how="left").merge(fd5_m, on=["FD5"], how="left")
+    df = df.merge(fd3_m, on=["FD3"], how="left").merge(_fd5_descriptions(dataframes), on=["FD5"], how="left")
 
-    inventory_index = df[~df["InventoryFD1"].isnull()].index
-    df.loc[inventory_index, "FD5"] = "INVENTORY - " + df.loc[inventory_index, "TransientInventoryLocation"].fillna("")
-    df.loc[inventory_index, "FD5Text"] = df.loc[inventory_index, "FD5"]
+    # An inventory line with NO distribution Index of its own is labelled
+    # 'INVENTORY - <TransientInventoryLocation>'. The label only fills that gap: a
+    # line that ships an FD5 keeps it even when InventoryFD1 is set (until
+    # 2026-10-06 every InventoryFD1 line was relabelled, overwriting real Indexes;
+    # configs/loaders/backfill/purchaseorder_line_index.yaml repairs the history).
+    inventory_mask = _is_blank(df["FD5"]) & ~_is_blank(df["InventoryFD1"])
+    df.loc[inventory_mask, "FD5"] = "INVENTORY - " + df.loc[inventory_mask, "TransientInventoryLocation"].fillna("")
+    df.loc[inventory_mask, "FD5Text"] = df.loc[inventory_mask, "FD5"]
     df["FD5Text"] = df["FD5Text"].fillna(df["FD1Text"])
 
     df["PurchaseOrder.Reference1"] = df["PurchaseOrder.Reference1"].apply(lambda x: _remove_leading_zeros(str(x).strip()))
@@ -364,6 +367,43 @@ def purchase_order_line(
     df["YearMonth"] = df["PurchaseOrder.MMAHSPOReleaseDate"].apply(lambda x: str(x)[:7])
     df["Quarter"] = df["YearMonth"].apply(add_quarter)
     return df
+
+
+@register("purchase_order_line_index_backfill")
+def purchase_order_line_index_backfill(
+    df: pd.DataFrame,
+    loader_config: Any,
+    dataframes: dict[str, pd.DataFrame],
+    logger: logging.Logger,
+) -> pd.DataFrame:
+    """Describe each exported FD5 from FD5.csv for the one-off Index/IndexText
+    backfill (configs/loaders/backfill/purchaseorder_line_index.yaml).
+
+    Only the FD5 half of purchase_order_line's Index rule can run here: the
+    backfill export carries no InventoryFD1 / TransientInventoryLocation / FD1Text.
+    The inventory label and the FD1Text fallback are applied by the MERGE from
+    the target row's own columns (that config's set_expressions).
+    """
+    if "fd5" not in dataframes:
+        raise ValueError(
+            f"purchase_order_line_index_backfill requires a source file with alias 'fd5'; "
+            f"got {sorted(dataframes)}"
+        )
+    return df.merge(_fd5_descriptions(dataframes), on=["FD5"], how="left")
+
+
+def _fd5_descriptions(dataframes: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """FD5.csv as an (FD5, FD5Text) lookup. A blank key is dropped so a line with
+    no FD5 can never pick up a description by matching NaN to NaN."""
+    fd5_m = dataframes["fd5"][["FinanceDimension5", "Description"]].dropna(subset=["FinanceDimension5"])
+    fd5_m.columns = ["FD5", "FD5Text"]
+    return fd5_m
+
+
+def _is_blank(series: pd.Series) -> pd.Series:
+    """True where a string column is missing or whitespace-only -- the values
+    normalize_for_db will land as ''."""
+    return series.fillna("").astype(str).str.strip() == ""
 
 
 @register("requisition_line_basecost_uom")

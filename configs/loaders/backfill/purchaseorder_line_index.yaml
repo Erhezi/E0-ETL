@@ -1,0 +1,156 @@
+name: purchaseorder_line_index_backfill
+
+# NOT A LOADER. `enabled: false` + the 'backfill' / 'on-demand' tags keep this out
+# of every loader path (see payablesinvoice_header.yaml in this folder for the
+# full explanation). Run it with backfill_helper:
+#   python -B backfill_helper.py --loader purchaseorder_line_index_backfill --file <export.csv> --dry-run
+#   staging: -> the BACKFILL table (scratch; truncated and reloaded per run)
+#   prod:    -> PURCHASEORDER_LINE, the table being repaired
+enabled: false
+tags: [backfill, on-demand, PurchaseOrderLine]
+
+process:
+  name: Purchase Order Line Index Backfill
+  frequency: On Demand
+
+# ---------------------------------------------------------------------------
+# WHY THIS EXISTS
+# ---------------------------------------------------------------------------
+# Until 2026-10-06 the purchase_order_line transform relabelled EVERY line with an
+# InventoryFD1 as Index = IndexText = 'INVENTORY - <TransientInventoryLocation>',
+# overwriting the FD5 the line actually shipped. On 2026-10-06 that was 818,425 of
+# 2,625,582 rows on each side -- every InventoryFD1 line, with or without an FD5.
+# The transform now only labels a line whose FD5 is blank; this repairs the
+# history from a one-off export (poline_fd5backfill.csv, 2,628,559 rows, taken
+# 2026-10-06 ~21:00) of every PO line's key, stamps and FD5.
+# ---------------------------------------------------------------------------
+
+source:
+  multiple_input_files: true
+  files:
+    - alias: main
+      # The export is named on the command line (--file); this is only where it
+      # was dropped, and the fallback for a --merge-only run.
+      path: 'C:\Users\dli2\Downloads'
+      name: 'poline_fd5backfill*.csv'
+      pick_latest: true
+      reader: csv
+      options:
+        dtype: str
+    # The same FD5 descriptions the daily loader merges in (central registry).
+    - alias: fd5
+      input: fd5
+      reader: csv
+      options:
+        dtype: str
+
+destinations:
+  - name: des1
+    enabled: true
+    server: MISCPrdAdhocDB
+    database: PRIME
+    schema: 'DM_MONTYNT\dli2'
+    staging:
+      # Created by backfill_helper on first use from PURCHASEORDER_LINE's own
+      # column definitions. DROP it once the merge is verified.
+      table: purchaseorder_line_index_backfill
+    prod:
+      table: PURCHASEORDER_LINE
+      # No post_sql: the promotion is the generated MERGE. UpdatePurchaseOrderLine
+      # must NOT run off this table -- it does a positional INSERT ... SELECT *.
+
+  - name: des2
+    enabled: true
+    server: YNBBSTVWP02\PROCDATASRVPROD
+    database: PLMPreprocessorShared
+    schema: infor
+    staging:
+      table: purchaseorder_line_index_backfill
+    prod:
+      table: PURCHASEORDER_LINE
+
+backfill:
+  # Joined on PurchaseOrderLine, NOT the PK's POLine (LineNumber): the two differ
+  # on 1,109 lines of the export, and PurchaseOrderLine is the line's identity.
+  # (PO, PurchaseOrderLine) is unique in both targets (VERIFIED 2026-10-06) and
+  # indexed there as IX_PO_PurchaseOrderLine.
+  key: [PO, PurchaseOrderLine]
+
+  columns: [Index, IndexText]
+
+  # Same rule as the fixed purchase_order_line transform, evaluated per row. The
+  # export carries only the FD5 half (src.Index, and src.IndexText from FD5.csv);
+  # the inventory label and the FD1Text (= CostCenterText) fallback come from the
+  # target row's own columns, which the daily loader landed from the same line.
+  #   FD5 shipped                -> Index = FD5, IndexText = FD5.csv description,
+  #                                 else CostCenterText
+  #   no FD5, InventoryFD1 set   -> both = 'INVENTORY - <TrasientInventoryLocation>'
+  #   no FD5, no InventoryFD1    -> Index = '', IndexText = CostCenterText
+  # RTRIM mirrors normalize_for_db's strip of 'INVENTORY - ' + a blank location.
+  set_expressions:
+    Index: >-
+      CASE WHEN src.[Index] <> '' THEN src.[Index]
+      WHEN tgt.[InventoryFD1] <> '' THEN RTRIM('INVENTORY - ' + ISNULL(tgt.[TrasientInventoryLocation], ''))
+      ELSE '' END
+    IndexText: >-
+      CASE WHEN src.[Index] <> '' THEN COALESCE(NULLIF(src.[IndexText], ''), tgt.[CostCenterText], '')
+      WHEN tgt.[InventoryFD1] <> '' THEN RTRIM('INVENTORY - ' + ISNULL(tgt.[TrasientInventoryLocation], ''))
+      ELSE ISNULL(tgt.[CostCenterText], '') END
+
+  # The export is a snapshot; skip any line the daily loader has since reloaded
+  # from a newer version (the fixed transform already wrote it correctly).
+  update_when: 'tgt.[update stamp] <= src.[update stamp]'
+
+  batch_rows: 50000
+
+health_table:
+  # Config symmetry only -- backfill_helper writes NO ETLHealth row.
+  server: 'YNBBSTVWP02\PROCDATASRVPROD'
+  database: SCSFileIngestor
+  schema: InforLoader
+  table: ETLHealth
+
+logging:
+  log_root: 'logs'
+  level: INFO
+  console: false
+  capture_streams: false
+
+stg_load:
+  strategy: truncate_insert
+  batch_size: 50000
+
+skip_identity_columns: true
+use_db_column_order: true
+
+# One row per (PO, PurchaseOrderLine); a duplicate would make the MERGE ambiguous.
+# VERIFIED 0 duplicates in the 2026-10-06 export.
+fail_on_pk_duplicates: true
+
+transforms:
+  - purchase_order_line_index_backfill
+
+field_config:
+  datetime_format: '%m/%d/%Y %I:%M:%S %p'
+
+  rename_columns:
+    MMAHSPurchaseOrderLineDistributionFinanceDimension5: FD5
+
+  pk_check: [PO, PurchaseOrderLine]
+
+  # Destination names / types match PURCHASEORDER_LINE (VERIFIED on both servers
+  # 2026-10-06); the backfill table is created from those definitions.
+  mapping:
+    - [PurchaseOrder, PO, string, varchar(20), source]
+    - [PurchaseOrderLine, PurchaseOrderLine, string, varchar(10), source]
+    # Staged, never written: kept beside the key to trace the lines where it
+    # differs from PurchaseOrderLine.
+    - [LineNumber, POLine, string, varchar(10), source]
+    - [FD5, Index, string, varchar(40), source]
+    - [FD5Text, IndexText, string, varchar(255), computed]   # purchase_order_line_index_backfill: FD5.csv merge
+    # Staged, never written: `update stamp` is what the gate compares.
+    - [create stamp, create stamp, datetime, datetime, source]
+    - [update stamp, update stamp, datetime, datetime, source]
+
+  extra:
+    - Company   # PO numbers already carry the company prefix

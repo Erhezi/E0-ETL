@@ -140,8 +140,8 @@ validation:
 
 use_db_column_order: false
 
-# Merges the company/FD3/FD5 mapping files in (see source.files above), rewrites
-# Index/IndexText for inventory lines, strips leading zeros from
+# Merges the company/FD3/FD5 mapping files in (see source.files above), labels
+# Index/IndexText for inventory lines that ship no FD5, strips leading zeros from
 # PurchaseOrder.Reference1, derives System/Year/YearMonth/Quarter, and sets
 # EXC_FLAG:
 #   'Remove - legacy PO transferred'   -- PurchaseOrder.Reference1 is non-empty
@@ -233,8 +233,9 @@ field_config:
     - [EarlyDeliveryDate, EarlyDeliveryDate, date, date, source]
     - [PurchaseOrderLineLifeCycleState, POLineStatus, string, varchar(40), source]
     - [LineReleased, POLineReleased, string, varchar(10), source]
-    # FD5 is read from the file but the transform overwrites it for inventory
-    # lines ('INVENTORY - <TransientInventoryLocation>').
+    # FD5 is read from the file; only when it is blank AND InventoryFD1 is set does
+    # the transform fill it with 'INVENTORY - <TransientInventoryLocation>'. A
+    # shipped FD5 is never overwritten (it was until 2026-10-06).
     - [FD5, Index, string, varchar(40), source]
     - [FD5Text, IndexText, string, varchar(255), computed]             # purchase_order_line: FD5.csv merge, FD1Text fallback
     - [Project, Project, string, varchar(40), source]
