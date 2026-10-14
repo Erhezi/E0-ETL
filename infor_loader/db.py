@@ -2,35 +2,75 @@ from __future__ import annotations
 
 import datetime as dt
 import math
+import sys
+import time
 from typing import Any, Iterable, Iterator
-from urllib.parse import quote_plus
 
 import pandas as pd
 
 from .config import DEFAULT_DRIVER, TableRef, bracket_identifier
 
+# Login timeout per attempt (the ODBC driver default is 15s).
+LOGIN_TIMEOUT_SECONDS = 30
+# Pause before each retry of a transient connect failure; len + 1 attempts in all.
+CONNECT_RETRY_DELAYS_SECONDS = (10, 30, 60)
+# SQLSTATEs that mean "the server did not answer in time", not "you may not log in":
+# 08001 unable to connect / login timeout, 08S01 link failure, HYT00/HYT01 timeouts.
+# On 2026-10-14 YNBBSTVWP02\PROCDATASRVPROD stalled new logins for ~75s right after
+# usp_RunPLM_Batch finished (08001, TCP Provider: Timeout error [258]); with no retry
+# that one stall lost PLM's ETLHealth row and failed Preprocessor and report_to_team_etl.
+# Bad credentials (28000) raise InterfaceError and are never retried.
+_TRANSIENT_SQLSTATES = frozenset({"08001", "08S01", "HYT00", "HYT01"})
 
-def connect_sql_server(server: str, database: str, *, driver: str = DEFAULT_DRIVER):
+
+def _is_transient_connect_error(exc: Exception) -> bool:
     import pyodbc
 
-    return pyodbc.connect(
-        driver="{" + driver + "}",
-        server=server,
-        database=database,
-        trusted_connection="yes",
-    )
+    if not isinstance(exc, pyodbc.OperationalError):
+        return False
+    sqlstate = exc.args[0] if exc.args else None
+    return isinstance(sqlstate, str) and sqlstate in _TRANSIENT_SQLSTATES
+
+
+def connect_sql_server(server: str, database: str, *, driver: str = DEFAULT_DRIVER):
+    """Open a trusted pyodbc connection, retrying transient login timeouts.
+
+    Retries print a WARNING to stderr, which ``capture_streams`` copies into the
+    run's log file, so a recovered stall still leaves a trace.
+    """
+    import pyodbc
+
+    attempts = len(CONNECT_RETRY_DELAYS_SECONDS) + 1
+    for attempt in range(1, attempts + 1):
+        try:
+            return pyodbc.connect(
+                driver="{" + driver + "}",
+                server=server,
+                database=database,
+                trusted_connection="yes",
+                timeout=LOGIN_TIMEOUT_SECONDS,
+            )
+        except pyodbc.Error as exc:
+            if attempt == attempts or not _is_transient_connect_error(exc):
+                raise
+            delay = CONNECT_RETRY_DELAYS_SECONDS[attempt - 1]
+            print(
+                f"WARNING: connect to {server}/{database} failed on attempt {attempt}/{attempts} "
+                f"({exc.args[0]}); retrying in {delay}s.",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+    raise AssertionError("unreachable")
 
 
 def create_sqlalchemy_engine(server: str, database: str, *, driver: str = DEFAULT_DRIVER):
     from sqlalchemy import create_engine
 
-    odbc_connect = (
-        f"DRIVER={{{driver}}};"
-        f"SERVER={server};"
-        f"DATABASE={database};"
-        "Trusted_Connection=yes;"
+    # Pooled connections come from connect_sql_server so they share its retry.
+    return create_engine(
+        "mssql+pyodbc://",
+        creator=lambda: connect_sql_server(server, database, driver=driver),
     )
-    return create_engine(f"mssql+pyodbc:///?odbc_connect={quote_plus(odbc_connect)}")
 
 
 def get_table_columns(cnxn: Any, table: TableRef) -> list[dict[str, Any]]:
