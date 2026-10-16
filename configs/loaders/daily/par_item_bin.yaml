@@ -27,7 +27,7 @@ source:
 # [DM_MONTYNT\dli2] -- that is where the notebook always loaded it.
 destinations:
   - name: des1
-    enabled: true
+    enabled: false # Disable des1 destination since the preprocessor tables are droped from the PRIME database 2026-10-16
     server: MISCPrdAdhocDB
     database: PRIME
     schema: PLM

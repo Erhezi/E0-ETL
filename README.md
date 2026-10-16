@@ -60,6 +60,226 @@ Downloads before its loader runs. The loader's own run-time download gate stages
 it when you run the loader; you can also relocate it by hand with
 `move-files --input <key>` (or `move-files --tag on-demand`).
 
+## Which command do I need? (scenario guide)
+
+A quick lookup for the usual situations. Each entry gives the command and what it
+will do; the sections further down have the full details.
+
+> ⚠️ Every loader run writes to the **real** staging/prod tables and ETLHealth —
+> there is no dry-run for loaders. Leave off `--auto` and the command prints a
+> summary and asks `yes`/`no` before it touches anything. Use that whenever you
+> are not sure.
+
+| Situation | Command (short form) |
+| --- | --- |
+| [The full nightly batch](#the-full-nightly-batch) | `run --all --auto --post-run --report-to-team-etl --notify` |
+| [Retry what failed in today's daily job](#retry-what-failed-in-todays-daily-job) | `--rerun-failed` |
+| [Retry another day's failures](#retry-another-days-failures) | `--rerun-failed --rerun-date YYYY-MM-DD` |
+| [A loader skipped because the file wasn't downloaded](#a-loader-skipped-because-the-file-wasnt-downloaded) | download it, then `--loader <name>` |
+| [Reload from the file already in its folder](#reload-from-the-file-already-in-its-folder) | `--loader <name> --ignore-download` |
+| [Run a single loader on demand](#run-a-single-loader-on-demand) | `--loader <name>` |
+| [Staging loaded but the prod promotion failed](#staging-loaded-but-the-prod-promotion-failed) | `--loader <name> --prd-only` |
+| [Check staging before it reaches prod](#check-staging-before-it-reaches-prod) | `--stg-only`, then `--prd-only` |
+| [One server failed or was down](#one-server-failed-or-was-down) | `--loader <name> --destination des2` |
+| [A post-process was BLOCKED or failed](#a-post-process-was-blocked-or-failed) | `post-run --process <name>` |
+| [Retry the report to the team ETL table](#retry-the-report-to-the-team-etl-table) | `report-to-team-etl` |
+| [Resend or preview the daily email](#resend-or-preview-the-daily-email) | `notify` |
+| [Move downloaded files without loading](#move-downloaded-files-without-loading) | `move-files` |
+
+All commands are run from this folder as `python -B run_daily_loaders.py ...`.
+
+### The full nightly batch
+
+```powershell
+python -B run_daily_loaders.py run --all --auto --post-run --report-to-team-etl --notify
+```
+
+- Runs every **daily** loader (on-demand ones are left out), up to 4 at a time.
+  A loader with no fresh export in Downloads is skipped as `FILE_NOT_FOUND` and
+  prod keeps its current data.
+- Then runs the post-load processes (PLM, Preprocessor, Bullard, GL Index). One
+  whose required loaders did not succeed today is recorded `BLOCKED` and does
+  nothing.
+- Then publishes ETLHealth to the team's `ETL_Health_Status` table, then emails
+  the report (`--notify-mode` defaults to `test`; add `--notify-mode prd` for the
+  real list).
+
+### Retry what failed in today's daily job
+
+```powershell
+# Show the plan and ask yes/no first.
+python -B run_daily_loaders.py --rerun-failed
+
+# Unattended, then republish to the team table and email a new report.
+python -B run_daily_loaders.py --rerun-failed --auto --report-to-team-etl --notify
+```
+
+- Reads today's ETLHealth and reruns only what is `FAILED`, skipped or `BLOCKED`,
+  in order: full loader reruns, then the prod-only promotions, then the
+  post-processes. A loader fixed in the first step lets its post-process run in
+  the last.
+- If everything already succeeded, it says so and exits `0` without running
+  anything.
+- It does **not** rerun on-demand loaders, or processes that never wrote an
+  ETLHealth row. Run those by name.
+- A loader skipped for a missing download skips again unless the file is now in
+  Downloads. Download it first, or add `--ignore-download` to use the file already
+  in its folder.
+
+### Retry another day's failures
+
+```powershell
+python -B run_daily_loaders.py --rerun-failed --rerun-date 2026-09-24
+```
+
+- Builds the plan from **that day's** ETLHealth, but the reruns load whatever file
+  is there now and write **today's** ETLHealth rows.
+- The post-process gate checks today. A process whose loader succeeded on the old
+  day (and isn't being rerun) will show `BLOCKED`. Check it, then run it with
+  `post-run --process <name> --ignore-gate`.
+
+### A loader skipped because the file wasn't downloaded
+
+```powershell
+# After downloading the export into Downloads:
+python -B run_daily_loaders.py --loader inventory_location --auto
+```
+
+- The loader finds the new file in Downloads, moves it to its folder with the
+  standard name, loads staging, promotes to prod and archives a dated copy.
+- Running a loader on its own does **not** run its post-process or publish to the
+  team table. Add them if you need them:
+  `--post-run --post-process plm --report-to-team-etl`.
+
+### Reload from the file already in its folder
+
+```powershell
+python -B run_daily_loaders.py --loader inventory_location --ignore-download
+```
+
+- Skips the Downloads check and loads the file already in the loader's folder.
+  Use this to reprocess the same file (for example after a mapping fix), or when
+  you placed the file there by hand.
+- Make sure that file is the one you want. Without the Downloads check, nothing
+  stops it from loading an old copy over prod.
+
+### Run a single loader on demand
+
+```powershell
+# Ask before running.
+python -B run_daily_loaders.py --loader ghx_completed_invoice_by_date
+
+# Run right away and get it on the team dashboard today.
+python -B run_daily_loaders.py --loader ghx_completed_invoice_by_date --auto --report-to-team-etl
+```
+
+- Works the same for daily and on-demand loaders. Several names can go after one
+  `--loader`, or use `--tag <tag>` for a group.
+- On-demand loaders are not in the nightly batch or in `--rerun-failed`. If one
+  fails, rerun it by name.
+- Without `--report-to-team-etl`, the row still reaches the team table with the
+  next morning's batch (the publish covers yesterday too).
+
+### Staging loaded but the prod promotion failed
+
+```powershell
+python -B run_daily_loaders.py --loader inventory_location --prd-only
+```
+
+- Reads no file and doesn't touch staging. It only reruns the prod promotion
+  (`prod.post_sql`) using the staging data that is already loaded.
+- `--rerun-failed` picks this mode on its own when ETLHealth shows the staging row
+  passed and the prod row failed.
+
+### Check staging before it reaches prod
+
+```powershell
+python -B run_daily_loaders.py --loader inventory_location --stg-only
+# ...check the _stg table...
+python -B run_daily_loaders.py --loader inventory_location --prd-only
+```
+
+- `--stg-only` loads the file into staging and stops. Prod is untouched and the
+  source file stays where it is.
+- `--prd-only` then promotes it.
+
+### One server failed or was down
+
+```powershell
+# Reload only the O2 (des2) side.
+python -B run_daily_loaders.py --loader contract_line_error --destination des2
+
+# Or only redo des2's promotion.
+python -B run_daily_loaders.py --loader contract_line_error --destination des2 --prd-only
+```
+
+- The other destination is skipped completely: no load, no promotion, no
+  ETLHealth row. Its data stays as it is.
+- `--destination` also works with `--tag`, `--rerun-failed` and `post-run`.
+
+### A post-process was BLOCKED or failed
+
+```powershell
+# After the loader it depends on has succeeded:
+python -B run_daily_loaders.py post-run --process plm --auto
+
+# Run it anyway, even if its gate isn't met (you have checked the data):
+python -B run_daily_loaders.py post-run --process plm --auto --ignore-gate
+```
+
+- Before running, the process checks today's ETLHealth for its required loaders
+  (PLM and Bullard need `inventory_location` and `inventory_transaction`;
+  Preprocessor needs `ccx_sync_contract`, `contract_line`, `manufacturer` and
+  `supplier`; GL Index needs `payablesinvoice_header` and
+  `payablesinvoice_distribution`). Once those succeed, the gate passes with no
+  extra flag.
+- `post-run --all` runs every daily post-process. `post-run --list` shows them and
+  what each one needs.
+
+### Retry the report to the team ETL table
+
+```powershell
+# Republish today (and yesterday).
+python -B run_daily_loaders.py report-to-team-etl --auto
+
+# Republish a specific day that was missed (plus the day before).
+python -B run_daily_loaders.py report-to-team-etl --date 2026-09-22 --auto
+```
+
+- Replaces only our own rows for those days in `ETL.dbo.ETL_Health_Status`, so
+  running it twice is safe.
+- A day that is never published is **lost**: later publishes only cover today and
+  yesterday. For a gap longer than a day, run it once per missing day with
+  `--date`.
+- It writes its own ETLHealth row, and a failure makes the exit code non-zero.
+
+### Resend or preview the daily email
+
+```powershell
+# Build the report and save the HTML; send nothing.
+python -B run_daily_loaders.py notify --dry-run --save-html out.html
+
+# Send today's report (or --date YYYY-MM-DD) to the test list, or to prd.
+python -B run_daily_loaders.py notify --mode test
+python -B run_daily_loaders.py notify --mode prd
+```
+
+- Only reads ETLHealth and never writes to the database. Each loader shows its
+  latest run of the day, so a successful rerun replaces the earlier failure in the
+  report.
+
+### Move downloaded files without loading
+
+```powershell
+python -B run_daily_loaders.py move-files --dry-run   # show what would move
+python -B run_daily_loaders.py move-files --check     # move, then check every loader's file is there
+```
+
+- Only moves files (Downloads → each input's folder, renamed to its standard
+  name). No database access and no prompt.
+- On-demand inputs are left in Downloads unless you name them
+  (`--input <key>` or `--tag on-demand`).
+
 ## Run Commands
 
 List configured YAML loaders:

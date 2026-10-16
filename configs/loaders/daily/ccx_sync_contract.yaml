@@ -35,7 +35,7 @@ source:
 #   des2  Preprocessor.[ghx].CCXSyncContract             (YNBBSTVWP02\PROCDATASRVPROD)
 destinations:
   - name: des1
-    enabled: true
+    enabled: false # Disable des1 destination since the preprocessor tables are droped from the PRIME database 2026-10-16
     server: MISCPrdAdhocDB
     database: PRIME
     schema: Preprocessor
