@@ -313,6 +313,14 @@ class FileLoader:
 
         source_warning = self._validate_expected_source_columns(df, logger)
 
+        # A header-only export (2026-10-19: ContractLineSimple_full shipped 0 lines)
+        # loads cleanly and truncates both sides to nothing, so flag it on the
+        # ETLHealth staging row instead of letting it pass as a plain SUCCESS.
+        if df.empty:
+            empty_warning = "0 LINES (warning): source file has no data rows; loaded 0 rows, ETL continued."
+            logger.warning(empty_warning)
+            source_warning = "; ".join(note for note in (empty_warning, source_warning) if note)
+
         df = apply_type_changes(
             df,
             self.config.type_changes,
