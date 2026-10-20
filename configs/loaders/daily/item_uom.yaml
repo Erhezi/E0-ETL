@@ -123,7 +123,9 @@ field_config:
     - [PackingVolume, PackingVolume, float, "numeric(18, 4)", source]
     - [Item.Active, Item.Active, string, varchar(5), source]
     - [Item.DerivedItemDescription, ItemDescription, string, varchar(255), source]
-    - [Item.OnContractDisplay, Item.OnContract, string, varchar(20), source]
+    # Widened 20 -> 30 on both destinations 2026-10-20: the export started
+    # shipping "On Contract- Available" / "On Contract- Not Available" (26 chars).
+    - [Item.OnContractDisplay, Item.OnContract, string, varchar(30), source]
     - [Item.UNSPSCCode, Item.UNSPSCCode, string, varchar(20), source]
     - [Item.IssueAccount, Item.IssueAccount, string, varchar(10), source]
     - [create stamp, create stamp, datetime, datetime, source]

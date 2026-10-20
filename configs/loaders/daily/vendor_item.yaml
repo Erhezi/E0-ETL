@@ -165,7 +165,9 @@ field_config:
     - [Active, Active, string, varchar(10), source]
     - [Item.MajorPPEClass, MajorPPEClass, string, varchar(20), source]
     - [Item.MajorInventoryClass, MajorInventoryClass, string, varchar(20), source]
-    - [Item.OnContractDisplay, OnContractDisplay, string, varchar(20), source]
+    # Widened 20 -> 30 on both destinations 2026-10-20: the export started
+    # shipping "On Contract- Available" / "On Contract- Not Available" (26 chars).
+    - [Item.OnContractDisplay, OnContractDisplay, string, varchar(30), source]
     - [first ContractLineVenItemRel.Contract, ContractRef1, string, varchar(10), source]
     - [last ContractLineVenItemRel.Contract, ContractRef2, string, varchar(10), source]
     - [create stamp, create stamp, datetime, datetime, source]
