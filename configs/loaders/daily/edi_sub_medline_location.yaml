@@ -1,0 +1,120 @@
+name: edi_sub_medline_location
+enabled: true
+# 'daily' opts this loader into the scheduled workday run; 'mdm' additionally
+# lets it be rerun on demand (--tag mdm) after a fresh Infor export lands in the
+# misc mdm folder (EDI_Sub_Locations.csv refreshes alongside the other mdm exports).
+tags: [daily, mdm, EDISubMedlineLocation]
+
+process:
+  name: MDM EDI Sub Medline Location
+  frequency: Workdays
+
+source:
+  multiple_input_files: false
+  files:
+    - alias: main
+      input: edi_sub_medline_location   # path + filename: see configs\file_folder_loader_config.yaml
+      reader: csv
+      options:
+        dtype: str
+
+# DIRECT LOAD: master data has no staging table -- the single destination table
+# is truncate+inserted in place (see vendor_item.yaml for the full pattern
+# description). Sibling of edi_sub_uom: same Infor EDIDataSubstitutionTable
+# export shape, but the Medline location lists (MEDLINE_O_SHIPTO and
+# MEDLINE_O_N104_REQLOC) instead of the UOM list.
+#
+# O2 (DES2) ONLY, by request -- there is no PRIME (des1) counterpart, so only
+# des2 is configured (see general_rules.md "Loaders land BOTH destinations
+# unless there is a documented reason not to"). The table is created by
+# sql\edi_sub_medline_location\des2_infor_create_mdm_edi_sub_medline_location.sql.
+destinations:
+  - name: des2
+    enabled: true
+    server: YNBBSTVWP02\PROCDATASRVPROD
+    database: PLMPreprocessorShared
+    schema: infor
+    table: MDM_EDI_SUB_MEDLINE_LOCATION
+
+health_table:
+  server: 'YNBBSTVWP02\PROCDATASRVPROD'
+  database: SCSFileIngestor
+  schema: InforLoader
+  table: ETLHealth
+
+logging:
+  # <loader name> is substituted with this loader's name (edi_sub_medline_location).
+  log_root: '\\montefiore.org\centralfiles\data\Procurement PMO\dli2\DailyLoader\<loader name>\logs'
+  level: INFO
+  console: true          # echo run logs to the console (stderr) for Task Scheduler output
+  capture_streams: true  # capture stdout/stderr (prints, warnings, tracebacks) into the log file
+
+# After a successful load the source file is copied here with a _YYYYMMDD stamp
+# appended (original extension kept), e.g. EDI_Sub_Locations_20261102.csv.
+# <loader name> is substituted with this loader's name. Set enabled: false to skip.
+archive:
+  path: '\\montefiore.org\centralfiles\data\Procurement PMO\dli2\DailyLoader\<loader name>\archived'
+
+# direct_load: the final table is loaded in place (no staging step). Column
+# validation and pk_check run first, then TRUNCATE, then the batched insert --
+# a hard failure aborts before the table is touched.
+direct_load:
+  strategy: truncate_insert
+  batch_size: 50000
+
+# Delta-overlap guard: skip. The export is a full point-in-time snapshot of the
+# Medline location substitution lists (3,510 rows in the 2026-11-02 sample), not
+# a delta window, so there is no gap between runs to guard against.
+validation:
+  overlap_check:
+    mode: skip
+    source_column: null
+    db_column: null
+    baseline: prod                  # which already-in-DB table to read MAX from: prod | staging
+    skip_if_db_empty: true          # first-ever load has nothing to overlap -> skip instead of fail
+
+# Registered in infor_loader/transforms.py. Only stamps ReportDate (->
+# LastUpdateDate). Unlike edi_sub_uom there is NO 'NA' blank fill: that was a
+# match for legacy notebook-loaded rows in MDM_EDI_SUB_UOM, and this table is new,
+# so blanks follow the '' string convention (general_rules.md). The sample has
+# no blanks in any column.
+transforms:
+  - edi_sub_medline_location
+
+# The destination keys on the full row (EDIListName, LawsonValue, ExternalValue)
+# -- a ship-to/requesting location can map to several Medline accounts, so
+# LawsonValue alone repeats (21 times in the 2026-11-02 sample); the full key has
+# 0 duplicates. A duplicate would be an export defect that the PK rejects
+# mid-insert AFTER the truncate -- fail fast here, BEFORE the truncate+insert
+# touches the table.
+fail_on_pk_duplicates: true
+
+field_config:
+  # No date/datetime *source* columns ship in this export (LastUpdateDate is
+  # computed by the transform, already ISO-formatted), so no
+  # date_format/datetime_format is needed.
+
+  # PK check runs after mapping/data conversion, so these are destination column
+  # names (matches PK_MDM_EDI_SUB_MEDLINE_LOCATION).
+  pk_check: [EDIListName, LawsonValue, ExternalValue]
+
+  # Loaded columns, ordered like the destination table. Row format:
+  #   [source_or_computed, destination, type_to_convert_to_in_python, destination_datatype, origin]
+  # origin: source   = a required column read from the source file (hard-fail if missing)
+  #         computed = produced by a transform/loader, not present in the file
+  # type: string | date | datetime | float | int
+  # Destination names match infor.MDM_EDI_SUB_UOM (by request); widths are
+  # wider (see the DDL). Source columns carry the same 'EDIDataSubstitutionTable.'
+  # prefix as EDI+sub.csv and rename to the bare names (EdilistName ->
+  # EDIListName). The default whitespace trim matters here: one ExternalValue
+  # ships with a trailing non-breaking space ('2409690\xa0'), which SQL Server
+  # would NOT ignore in key comparisons the way it ignores trailing spaces.
+  mapping:
+    - [EDIDataSubstitutionTable.EdilistName, EDIListName, string, varchar(100), source]
+    - [EDIDataSubstitutionTable.LawsonValue, LawsonValue, string, varchar(100), source]
+    - [EDIDataSubstitutionTable.ExternalValue, ExternalValue, string, varchar(50), source]
+    # Load-date marker produced by the transform (today's date as 'YYYY-MM-DD');
+    # tells consumers when this snapshot was last reloaded.
+    - [ReportDate, LastUpdateDate, date, date, computed]
+
+  # Every source column is loaded; nothing extra ships in this export.

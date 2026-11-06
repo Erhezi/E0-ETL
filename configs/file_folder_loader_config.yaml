@@ -282,6 +282,17 @@ inputs:
         - 'EDI%2Bsub.csv'
         - 'EDI%2Bsub (*).csv'
 
+  # Same EDIDataSubstitutionTable export shape as edi_sub_uom, filtered to the
+  # Medline location lists; loaded to O2 only by edi_sub_medline_location.
+  edi_sub_medline_location:
+    folder: misc_mdm
+    name: 'EDI_Sub_Locations.csv'
+    tags: [daily, mdm]
+    download:
+      patterns:
+        - 'EDI_Sub_Locations.csv'
+        - 'EDI_Sub_Locations (*).csv'
+
   item:
     folder: misc_mdm
     name: 'Item.csv'

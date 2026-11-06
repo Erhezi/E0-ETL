@@ -469,6 +469,16 @@ def edi_sub(df: pd.DataFrame, loader_config: Any, dataframes: dict[str, pd.DataF
     return df
 
 
+@register("edi_sub_medline_location")
+def edi_sub_medline_location(df: pd.DataFrame, loader_config: Any, dataframes: dict[str, pd.DataFrame], logger: logging.Logger) -> pd.DataFrame:
+    # Column selection, source->destination renaming, and blank-filling are all
+    # handled by the mapping pipeline (see edi_sub_medline_location.yaml); unlike
+    # edi_sub there is no 'NA' fill (no legacy rows to match), so the transform
+    # only stamps the load-date marker (mapped to the LastUpdateDate date column).
+    df["ReportDate"] = datetime.now().strftime("%Y-%m-%d")
+    return df
+
+
 @register("item")
 def item(df: pd.DataFrame, loader_config: Any, dataframes: dict[str, pd.DataFrame], logger: logging.Logger) -> pd.DataFrame:
     # Column selection, int typing of the two multipliers, and blank-filling are
