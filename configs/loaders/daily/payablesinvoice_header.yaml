@@ -210,3 +210,11 @@ field_config:
     # A single composite string, e.g. "Issued- September 14, 2026" -- kept whole
     # rather than split into status + date, which is how the export ships it.
     - ['first PaymentsHaveBeenAppliedRel.PaymentStatus', FirstPaymentStatus, string, varchar(100), source]
+    # ---- TransientHoldCode: the export's 56th column -----------------------
+    # Appended LAST, matching sql/payablesinvoice_header/des1_PRIME_add_transient_
+    # hold_code.sql and its des2 twin; same positional SELECT * constraint as the
+    # eight above. Blank on almost every invoice (184 of 2,167,629 on 2026-11-05).
+    # Only as fresh as the invoice's last pass through the rolling window: a hold
+    # can move without `update stamp` moving (2200/100284 went blank -> MPAY at an
+    # unchanged stamp, seen 2026-11-06), so an old invoice can go stale here.
+    - [TransientHoldCode, TransientHoldCode, string, varchar(10), source]
