@@ -469,13 +469,85 @@ def edi_sub(df: pd.DataFrame, loader_config: Any, dataframes: dict[str, pd.DataF
     return df
 
 
+# How each Medline substitution list packs its key into LawsonValue: the
+# '+'-separated parts, in order. None marks a slot Infor always leaves blank (the
+# '++' in the ship-to key). A list's layout names only the parts it carries; the
+# rest stay ''.
+#   MEDLINE_O_SHIPTO       IHUTOR+1000931++3000  -> Location, Vendor, '', Company
+#   MEDLINE_O_N104_REQLOC  2010+RMNR03902        -> Company, Location (no Vendor)
+# Every row of the 2026-11-16 export (2,863 ship-to + 637 req-loc) fits.
+_MEDLINE_LOCATION_LAYOUTS: dict[str, tuple[str | None, ...]] = {
+    "MEDLINE_O_SHIPTO": ("Location", "Vendor", None, "Company"),
+    "MEDLINE_O_N104_REQLOC": ("Company", "Location"),
+}
+_MEDLINE_LOCATION_PARTS = ("Location", "Vendor", "Company")
+
+
+def _split_medline_lawson_value(list_name: Any, lawson_value: Any) -> tuple[str, ...] | None:
+    """Split one LawsonValue into (Location, Vendor, Company) per its list's layout.
+
+    Returns None when the list has no known layout, or the value does not fit it:
+    the wrong number of parts, a named part blank, or the always-blank slot filled.
+    The caller leaves all three columns '' for those rows rather than guessing.
+    """
+    layout = _MEDLINE_LOCATION_LAYOUTS.get(str(list_name).strip())
+    if layout is None or not isinstance(lawson_value, str):
+        return None
+    parts = [part.strip() for part in lawson_value.split("+")]
+    if len(parts) != len(layout):
+        return None
+    fields = dict.fromkeys(_MEDLINE_LOCATION_PARTS, "")
+    for slot, part in zip(layout, parts):
+        if slot is None:
+            if part:
+                return None
+        elif not part:
+            return None
+        else:
+            fields[slot] = part
+    return tuple(fields[name] for name in _MEDLINE_LOCATION_PARTS)
+
+
 @register("edi_sub_medline_location")
 def edi_sub_medline_location(df: pd.DataFrame, loader_config: Any, dataframes: dict[str, pd.DataFrame], logger: logging.Logger) -> pd.DataFrame:
     # Column selection, source->destination renaming, and blank-filling are all
     # handled by the mapping pipeline (see edi_sub_medline_location.yaml); unlike
-    # edi_sub there is no 'NA' fill (no legacy rows to match), so the transform
-    # only stamps the load-date marker (mapped to the LastUpdateDate date column).
+    # edi_sub there is no 'NA' fill (no legacy rows to match). The transform stamps
+    # the load-date marker (mapped to the LastUpdateDate date column) and splits
+    # LawsonValue into Location / Vendor / Company. LawsonValue itself is loaded
+    # unchanged, since it is part of the PK.
     df["ReportDate"] = datetime.now().strftime("%Y-%m-%d")
+
+    list_names = df["EDIDataSubstitutionTable.EdilistName"]
+    lawson_values = df["EDIDataSubstitutionTable.LawsonValue"]
+    split = [_split_medline_lawson_value(name, value) for name, value in zip(list_names, lawson_values)]
+    blank = ("",) * len(_MEDLINE_LOCATION_PARTS)
+    parts = pd.DataFrame(
+        [fields or blank for fields in split],
+        index=df.index,
+        columns=list(_MEDLINE_LOCATION_PARTS),
+    )
+    df[list(_MEDLINE_LOCATION_PARTS)] = parts
+
+    unsplit = [i for i, fields in enumerate(split) if fields is None]
+    if unsplit:
+        # The health row states the rule, not the data; the run log keeps the
+        # offending rows so the source export can be traced.
+        examples = ", ".join(
+            f"{list_names.iloc[i]}={lawson_values.iloc[i]!r}" for i in unsplit[:5]
+        )
+        logger.warning(
+            "%s LawsonValue(s) did not fit their list's layout %s; Location/Vendor/"
+            "Company left blank. e.g. %s",
+            len(unsplit),
+            {name: "+".join(slot or "" for slot in layout) for name, layout in _MEDLINE_LOCATION_LAYOUTS.items()},
+            examples,
+        )
+        record_transform_warning(
+            f"LAWSONVALUE NOT SPLIT (warning): {len(unsplit)} row(s) not in their "
+            f"list's layout (SHIPTO Location+Vendor++Company, N104_REQLOC "
+            f"Company+Location), Location/Vendor/Company left blank, ETL continued"
+        )
     return df
 
 
