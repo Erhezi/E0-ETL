@@ -60,14 +60,28 @@ pair only untrimmed. Don't hack around it in a transform.
 ## Scheduling / destinations
 
 - Daily transactional loaders: tag `daily`, `process.frequency: Workdays`.
-- Loaders land BOTH destinations unless there is a documented reason not to:
-  - `des1`: `MISCPrdAdhocDB` / `PRIME` / `DM_MONTYNT\dli2`
-  - `des2`: `YNBBSTVWP02\PROCDATASRVPROD` / `PLMPreprocessorShared` / `infor`
-  Name them `des1`/`des2` consistently: the run-time `--destination <name>` flag
+- **O2 (`des2`) is the destination. PRIME (`des1`) is being retired**, and
+  everything moves to O2 by the end of 2027 (README "Destinations"):
+  - `des2`: `YNBBSTVWP02\PROCDATASRVPROD` / `PLMPreprocessorShared` / `infor`.
+    Some feeds have their own O2 database instead: `Preprocessor`, `PLM`,
+    `PPE` and `PBI`.
+  - `des1`: `MISCPrdAdhocDB` / `PRIME` / `DM_MONTYNT\dli2`. As of 2026-11-17 it
+    is live only for `baxter_emergency_item` (PRIME only, with no O2 side yet),
+    `inventory_location` and `inventory_transaction`.
+  New loaders and post-processes land **des2 only**: don't add a des1 block.
+  `edi_sub_medline_location` is the pattern to copy. Name the O2 block `des2`
+  even when it is the only one. The run-time `--destination <name>` flag
   (one-off single-side run) and `data_fill_helper --from/--to` both address a
-  destination by name across loaders. To pause a side for good, set
-  `enabled: false` on its block -- `--destination` is for one run, not a config
-  change, and never re-enables a disabled destination.
+  destination by name across loaders, so `des2` must mean O2 everywhere.
+- To pause or retire a side for good, set `enabled: false` on its block.
+  `--destination` is for one run, not a config change, and it never re-enables a
+  disabled destination. When you retire a des1 block, keep it in the YAML with a
+  dated comment (`enabled: false  # PRIME tables dropped <date> -- des1 retired,
+  O2 (des2) only`) as the record of where the data came from. Never re-enable
+  a retired block, because its PRIME tables are gone. Follow the README's
+  "Retiring the next loader from PRIME" checklist. In particular, disable the
+  block BEFORE dropping anything: saving the YAML is the deploy, so a scheduled
+  run between the drop and the config change fails.
 - Verify a destination table before enabling it -- the CLI's read-only
   `table-info --server ... --database ... --schema ... --table ...` prints the
   live columns/nullability -- and note the verification date in the config.

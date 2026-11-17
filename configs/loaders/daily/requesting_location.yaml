@@ -26,7 +26,7 @@ source:
 # columns -> truncate MDM_REQUESTING_LOCATION -> positional insert.
 destinations:
   - name: des1
-    enabled: true
+    enabled: false  # PRIME tables dropped 2026-11-17 -- des1 retired, O2 (des2) only
     server: MISCPrdAdhocDB
     database: PRIME
     schema: 'DM_MONTYNT\dli2'

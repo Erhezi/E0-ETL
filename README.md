@@ -60,6 +60,88 @@ Downloads before its loader runs. The loader's own run-time download gate stages
 it when you run the loader; you can also relocate it by hand with
 `move-files --input <key>` (or `move-files --tag on-demand`).
 
+## Destinations: O2 now, PRIME being retired
+
+Every config names its destinations `des1` and `des2`:
+
+| Name | Server / database / schema | Status |
+| ---- | -------------------------- | ------ |
+| `des2` (**O2**) | `YNBBSTVWP02\PROCDATASRVPROD` / `PLMPreprocessorShared` / `infor`. Some feeds have their own O2 database: `Preprocessor`, `PLM`, `PPE`, `PBI` | **Primary.** Every loader and post-process lands here. |
+| `des1` (**PRIME**) | `MISCPrdAdhocDB` / `PRIME` / `DM_MONTYNT\dli2` | **Being retired.** Everything moves to O2 by the **end of 2027**. |
+
+As of 2026-11-17, PRIME is still live for only three loaders:
+
+| Loader | PRIME objects | O2 side |
+| ------ | ------------- | ------- |
+| `baxter_emergency_item` | `BAXTER_ITEM_AUDIT`, `baxter_item_audit_stg`, `UpdateBaxterItemAudit` | **none yet**: PRIME only, so the O2 tables must be built before it can move |
+| `inventory_location` | `INVENTORY_LOCATION`, `inventory_location_stg`, `UpdateItemLocation` | `infor.ITEM_LOCATION` (dual-landing) |
+| `inventory_transaction` | `INVENTORY_TRANSACTION`, `inventory_transaction_stg`, `UpdateInventoryTransaction` | `infor.INVENTORY_TRANSACTION` (dual-landing) |
+
+Every other loader and post-process has its des1 block set to `enabled: false`,
+with a dated comment. The retirement so far:
+
+| Date | Moved off PRIME |
+| ---- | --------------- |
+| 2026-09-08 | `plm` (the PLM app moved to O2 `PLM`) and `bullard_burn_down` (moved to O2 `PBI`) |
+| 2026-09-14 | `preprocessor` (moved to O2 `Preprocessor`) |
+| 2026-10-16 | The Preprocessor feeds: `ccx_sync_contract`, `contract_line_error`, `item_replenish_from`, `vendor_location`, `par_item_bin`. Their PRIME tables were dropped |
+| 2026-11-17 | 24 loaders (`commodity_gl`, `contract_line`, `edi_sub_uom`, `item`, `item_gtin`, `item_uom`, `manufacturer`, the 3 `payablesinvoice_*` loaders, the 3 `purchaseorder_*` loaders, `requester`, `requesting_location`, `requisition_line`, `supplier`, `vendor`, `vendor_item`, `ghx_completed_invoice_by_date` and the 4 `ppe_*` loaders), plus both backfill configs and the `payablesinvoice_vendor_gl_index` post-process. 106 PRIME objects were dropped, including every remaining object in the `BullardBurnDown`, `ItemFinder`, `PLM` and `Preprocessor` schemas. Those four schemas still exist but are empty |
+
+What a retired des1 block means in practice:
+
+- **Never re-enable it.** Its PRIME tables are gone, so the load would fail. The
+  block stays only as the record of where the data came from.
+- `--destination des1` on a retired loader drops that loader out of the run, with
+  a note on stderr.
+- `data_fill_helper` does **not** look at `enabled`, and it defaults to copying
+  the first destination into the second (des1 to des2). On a retired loader the
+  read of the dropped PRIME table fails before anything is written, so the O2
+  table is safe. Don't use it to copy PRIME data into O2 for these loaders: O2
+  already holds that history.
+- `requisition_line` no longer runs its PRIME-only step 3,
+  `dbo.e2eCO_P6_update_INFOR_REQUISITION_PO_LINE_UNRELEASED`.
+
+**PRIME objects knowingly broken on 2026-11-17.** These objects are not part of
+this repo. They read tables that were dropped, and the breakage was accepted:
+
+- the 15 `scm_stage.v_*` views
+- `dbo.e2eCO_P6_update_INFOR_REQUISITION_PO_LINE_UNRELEASED` and
+  `dbo.vw_INFOR_REQUISITION_PO_LINE_UNRELEASED`
+- `dbo.vw_AP_INDEX_GL_TABLEAU_RK`, `dbo.vw_MHS_AGING_SUMMARY` and
+  `dbo.vw_PREMIER_OB_REPLICA_ENRICHED`
+- `dbo.e2eCO_POHEnhanced_GHXPerfectOrder_Cross_SS`
+
+If one of them needs to come back, repoint it at the O2 equivalent; don't recreate
+the PRIME table.
+
+**Rollback reference.** `sql\prime_decommission_20261117\` holds one file per
+dropped object: the definition for views, procs and functions, and the
+`CREATE TABLE` DDL plus row count at drop time for tables. Alongside them are
+`_manifest.txt` and `_drop_log.txt`. `sql\` is gitignored, so this copy lives on
+the workstation only. The data itself is on O2: the `infor`/`ghx` tables in
+`PLMPreprocessorShared` had identical row counts at drop time. Two tables were
+never loaded into O2, `INVENTORY_TRANSACTION_PR1_BEFORE2025` and
+`PURCHASEORDER_LINE_WITH_PCAT`, and they survive only in O2's stale `[PRIME]`
+copy database.
+
+### Retiring the next loader from PRIME
+
+1. **Confirm O2 holds the same data.** Compare row counts, or key and date ranges,
+   of each prod table on des1 and des2.
+2. **Find what on PRIME still reads the objects.** Query
+   `sys.sql_expression_dependencies` on PRIME, and include three-part
+   `PRIME.<schema>.<object>` references from `dbo` and the other schemas. Each
+   hit is a consumer to repoint, or a breakage to accept knowingly. Also look for
+   any helper procs or aux staging tables that the YAML does not name.
+3. **Set the des1 block to `enabled: false` FIRST**, with the dated comment.
+   Saving the YAML deploys it to the scheduled task, so if you drop first, a
+   scheduled run in between fails.
+4. **Save each object's definition or DDL** to `sql\prime_decommission_<yyyymmdd>\`.
+5. **Drop the objects** in this order: views, then procs and functions, then
+   tables. Run with autocommit on, then re-check that nothing is left.
+6. **Update the "still live" table above** and the destinations rule in
+   `general_rules.md`.
+
 ## Which command do I need? (scenario guide)
 
 A quick lookup for the usual situations. Each entry gives the command and what it
@@ -343,13 +425,15 @@ source file stays in place for a later `--prd-only` or a re-run.
 
 ### Running one destination
 
-A loader normally lands **both** destinations (`des1` and `des2`) on every run.
+A loader lands every **enabled** destination on each run. Most loaders are now
+O2-only (`des2`). The three still on PRIME land both sides; see
+[Destinations](#destinations-o2-now-prime-being-retired).
 `--destination <name>` narrows a run to one side without editing config — useful
 when one server was down, or when only that side's promotion needs a re-run:
 
 ```powershell
-# Load only the PRIME (des1) side of Contract Line Error.
-python -B run_daily_loaders.py --loader contract_line_error --destination des1
+# Load only the PRIME (des1) side of Inventory Transaction (one of the three loaders still on PRIME).
+python -B run_daily_loaders.py --loader inventory_transaction --destination des1
 
 # Re-promote just des2 after its prod EXEC failed, off the staging data already there.
 python -B run_daily_loaders.py --loader contract_line_error --destination des2 --prd-only
@@ -604,7 +688,7 @@ extra:                 # in the file but not integrated yet; optional
 Inspect destination columns:
 
 ```powershell
-python -B run_daily_loaders.py table-info --server MISCPrdAdhocDB --database PRIME --schema "DM_MONTYNT\dli2" --table inventory_location_stg
+python -B run_daily_loaders.py table-info --server "YNBBSTVWP02\PROCDATASRVPROD" --database PLMPreprocessorShared --schema infor --table item_location_stg
 ```
 
 Generate a draft mapping from DB metadata and source headers:
@@ -632,8 +716,15 @@ the first destination in the YAML and the target is the second; override with
 This works for **direct-load** loaders too (e.g. the `ppe_*` reference tables):
 a direct-load destination has no separate prod table — its single configured
 table *is* the production table — so the tool uses that table (`prod or staging`)
-on each side. `python -B data_fill_helper.py --loader ppe_category` copies the
-des1 PPE table into the des2 PPE table.
+on each side. `python -B data_fill_helper.py --loader ppe_category` used to copy
+the des1 PPE table into the des2 PPE table. The PRIME PPE tables were dropped on
+2026-11-17, so that command now fails on the source read before writing anything.
+
+> **PRIME retirement:** the helper ignores `enabled: false` and defaults to copying
+> des1 into des2. For a loader whose des1 is retired, the source no longer exists.
+> Only the three loaders still on PRIME (see
+> [Destinations](#destinations-o2-now-prime-being-retired)) have two live sides to
+> copy between.
 
 **Loaders with several prod tables** (extra ones declared under `prod.aux`, see
 above) copy one table per run: `--table <name>` picks it — `main` (the default) is
@@ -798,7 +889,7 @@ python -B backfill_helper.py --loader payablesinvoice_header_backfill --merge-on
 python -B backfill_helper.py --loader payablesinvoice_header_backfill --merge-only
 ```
 
-`--destination des1` narrows a run to one side; `--batch-rows` overrides the
+`--destination des2` narrows a run to one side; `--batch-rows` overrides the
 config's merge batch size (`0` merges in one statement); `--no-create` fails
 instead of creating a missing backfill table. The bare config name also works in
 place of `--loader <name>`.
@@ -818,11 +909,14 @@ Status is one of `STAGED`, `MERGED`, `DRY_RUN`, `SKIPPED`, or `ABORTED`.
 ### Backfilling a different table
 
 Copy `configs\loaders\backfill\payablesinvoice_header.yaml`, then change: the
-`name`, the two `destinations` blocks (`staging` = a new `<table>_backfill` name,
+`name`, the `destinations` blocks (`staging` = a new `<table>_backfill` name,
 `prod` = the table being filled), `field_config.mapping` to the new export's
 columns, and the `backfill:` block's `key`, `columns` and `update_when`. No code
-changes — the helper reads all of it from the config. Drop each backfill table on
-both servers once its last chunk is merged.
+changes — the helper reads all of it from the config. Both shipped backfill
+configs have their des1 (PRIME) block retired, because their target tables were
+dropped on 2026-11-17. A new backfill for a table that is O2-only needs just the
+`des2` block. Drop each backfill table on every enabled destination once its last
+chunk is merged.
 
 ## Post-load processes
 
@@ -833,21 +927,29 @@ Four processes consume what the loaders land, and none depends on the others:
 | `plm` | `configs\post_processes\plm.yaml` | `EXEC [PLM].[usp_RunPLM_Batch]` |
 | `preprocessor` | `configs\post_processes\preprocessor.yaml` | `EXEC [Preprocessor].[usp_RunPreprocessor_Batch]` |
 | `bullard_burn_down` | `configs\post_processes\bullard_burn_down.yaml` | `sp_InsertDailyArchive` per date, then rebuild `SearchTerms` |
-| `payablesinvoice_vendor_gl_index` | `configs\post_processes\payablesinvoice_vendor_gl_index.yaml` | `MakePayablesInvoiceWithVendorGLIndexStg` (rebuild staging), then `UpdatePayablesInvoiceWithVendorGLIndex` (replace prod by invoice) |
+| `payablesinvoice_vendor_gl_index` | `configs\post_processes\payablesinvoice_vendor_gl_index.yaml` | `sp_MakePayablesInvoiceWithVendorGLIndexStg` (rebuild staging), then `sp_UpdatePayablesInvoiceWithVendorGLIndex` (replace prod by invoice) |
 
 `payablesinvoice_vendor_gl_index` was a monthly hand-run until it joined the daily
 batch; the trailing window its staging proc rebuilds was cut from 45 days to 5 to
 match the workday cadence, so a run missed for several days should be re-driven
 against a widened window rather than left to catch up on its own.
 
-`plm`, `preprocessor` and `bullard_burn_down` run on **des1** only
-(`MISCPrdAdhocDB` / `PRIME`); each carries a commented `des2` block to uncomment
-when that side is deployed. `payablesinvoice_vendor_gl_index` runs on **both** —
-des2 is `PLMPreprocessorShared` / schema `infor` on O2, where the same two procs
-carry O2's `sp_` prefix and the staging build joins `infor.MDM_VENDOR` in place of
-des1's `MDM_VENDOR_INFOR` (the vendor loader lands that master under a different
-name per side). Its des2 staging proc is
-`sql\payablesinvoice_vendor_gl_index\des2_infor_create_make_stg_proc.sql`.
+All four processes run on **des2 (O2) only**. Each keeps its des1 (PRIME) block,
+set to `enabled: false`, as the record of where it came from:
+
+| Process | Retired from PRIME | O2 home |
+| ------- | ------------------ | ------- |
+| `plm` | 2026-09-08 | `PLM` database, schema `PLM` |
+| `bullard_burn_down` | 2026-09-08 | `PBI` database, schema `BullardBurnDown` |
+| `preprocessor` | 2026-09-14 | `Preprocessor` database, schema `Preprocessor` (data in `PLMPreprocessorShared`) |
+| `payablesinvoice_vendor_gl_index` | 2026-11-17 | `PLMPreprocessorShared`, schema `infor` |
+
+Every PRIME object these processes used was dropped on 2026-11-17, including
+the procs that had stayed in the `PLM`, `Preprocessor` and `BullardBurnDown`
+schemas. On O2 the GL-index procs carry O2's `sp_` prefix, and the staging build
+joins `infor.MDM_VENDOR`, where PRIME used `MDM_VENDOR_INFOR`. Its staging
+proc is `sql\payablesinvoice_vendor_gl_index\des2_infor_create_make_stg_proc.sql`.
+The 5-day window now lives only in the O2 proc.
 
 ### Inline SQL steps and `${report_date}`
 
@@ -1025,6 +1127,11 @@ des1 (PRIME):   PLM ────► Preprocessor ────► Bullard ──�
 des2 (O2):      PLM ────► Preprocessor ────► Bullard ──►
                 wall clock = max(des1, des2), not the sum
 ```
+
+The diagram shows a process that runs on two destinations. Since the PRIME
+retirement, every post-process runs on des2 alone, so `--destination-workers`
+currently has nothing to overlap. It matters again only if a process gains a
+second live destination.
 
 Raising **both** is what stacks several procs onto one server. `post-run` prints
 the resolved product before it runs, so what you get is stated up front.
