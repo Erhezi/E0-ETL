@@ -4,7 +4,12 @@ enabled: true
 # Replaces the manual notebook flow (INFOR table update.ipynb "For Baxter Item
 # Emergency"): read ItemAudit_BaxterItem_All.csv -> type-convert -> select+rename
 # columns -> truncate+insert baxter_item_audit_stg. The staging->prod promotion
-# (which the notebook ran by hand) is EXEC [DM_MONTYNT\dli2].[UpdateBaxterItemAudit].
+# (which the notebook ran by hand) is EXEC [Baxter].[sp_UpdateBaxterItemAudit].
+#
+# History: PRIME only until 2026-11-18, when the tables were copied to O2
+# PPE.[Baxter] (verified identical), the PRIME objects were dropped, and the loader
+# was briefly retired as archive-only. Back on 2026-11-19, O2 only (the Baxter
+# crisis returned), starting from that day's export.
 tags: [daily, operational, BaxterItemAudit]
 
 process:
@@ -20,22 +25,26 @@ source:
       options:
         dtype: str
 
-# DES1 ONLY. This Baxter emergency audit lives entirely in PRIME
-# ([DM_MONTYNT\dli2]); there is no infor-side (des2) counterpart, so -- unlike the
-# usual des1+des2 loaders -- only des1 is configured (see general_rules.md
-# "Loaders land BOTH destinations unless there is a documented reason not to").
+# O2 ONLY (des2). Not in PLMPreprocessorShared/infor like most loaders: the Baxter
+# tables live in the PPE database under their own schema, [Baxter].
 #
 # prod.post_sql runs on the prod connection after the staging load succeeds, to
-# promote the just-loaded staging rows into prod. Object names VERIFIED via
-# table-info / sys.sql_modules on 2026-08-05:
-#   staging  PRIME.[DM_MONTYNT\dli2].baxter_item_audit_stg   (no PK constraint)
-#   prod     PRIME.[DM_MONTYNT\dli2].BAXTER_ITEM_AUDIT        (PK: Company, Location, Item, ItemLocationAudit)
-# UpdateBaxterItemAudit deletes prod rows whose PK matches staging, then
-# INSERTs every staging row (SELECT *). The stg and prod tables have identical
-# column layouts (verified), so the proc's SELECT * lines up.
+# promote the just-loaded staging rows into prod, and commits once at the end.
+# Object names VERIFIED via table-info / sys.sql_modules on 2026-11-19:
+#   staging  PPE.[Baxter].baxter_item_audit_stg   (no PK constraint)
+#   prod     PPE.[Baxter].BAXTER_ITEM_AUDIT        (PK: Company, Location, Item, ItemLocationAudit)
+# sp_UpdateBaxterItemAudit (sql\baxter_emergency_item\des2_Baxter_create_update_proc.sql)
+# deletes prod rows whose PK matches staging, then INSERTs every staging row
+# (SELECT *). The stg and prod tables have identical column layouts (copied from
+# PRIME's DDL), so the proc's SELECT * lines up.
+#
+# The same schema also holds the dormant hurricane daily report:
+# BAXTER_ITEM_DAILY_TRACKING, EMERGENCY_BAXTER_HURRICAN_ITEM and the
+# BAXTER_HURRICAN_DAILY_REPORT_EXTRACTOR proc. This loader does not run them.
 destinations:
+  # The des1 PRIME objects (including the proc UpdateBaxterItemAudit) were dropped on 2026-11-18.
   - name: des1
-    enabled: true
+    enabled: false  # PRIME tables dropped 2026-11-18 -- des1 retired, O2 (des2) only
     server: MISCPrdAdhocDB
     database: PRIME
     schema: 'DM_MONTYNT\dli2'
@@ -45,6 +54,18 @@ destinations:
       table: BAXTER_ITEM_AUDIT
       post_sql:
         - EXEC [DM_MONTYNT\dli2].[UpdateBaxterItemAudit]
+
+  - name: des2
+    enabled: true
+    server: YNBBSTVWP02\PROCDATASRVPROD
+    database: PPE
+    schema: Baxter
+    staging:
+      table: baxter_item_audit_stg
+    prod:
+      table: BAXTER_ITEM_AUDIT
+      post_sql:
+        - EXEC [Baxter].[sp_UpdateBaxterItemAudit]
 
 health_table:
   server: 'YNBBSTVWP02\PROCDATASRVPROD'
@@ -73,9 +94,9 @@ stg_load:
 # pk_delete_insert: prod rows whose PK matches staging are deleted, then every
 # staging row is inserted -- an upsert keyed on the prod PK
 # (Company, Location, Item, ItemLocationAudit). This is exactly what
-# UpdateBaxterItemAudit does.
+# sp_UpdateBaxterItemAudit does.
 # DECLARATIVE ONLY: the real promotion runs via prod.post_sql (EXEC
-# UpdateBaxterItemAudit); prd_load documents the strategy the proc implements.
+# [Baxter].[sp_UpdateBaxterItemAudit]); prd_load documents the strategy the proc implements.
 # Only `strategy` is read by the loader today; keep it in sync with the proc.
 prd_load:
   strategy: pk_delete_insert

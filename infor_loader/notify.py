@@ -97,9 +97,11 @@ def _daily_process_map(config_ref: str) -> dict[str, str]:
     rerun command needs the config ``name`` (e.g. ``requisition_line``). Loaded from
     the same configs the batch runs from, so the two never drift.
 
-    The roster is the daily (non-on-demand) file loaders PLUS the post-load
-    processes that follow them -- this map is also the report's filter, so a process
-    missing from it has its ETLHealth rows dropped from the report entirely.
+    The roster is the ENABLED daily (non-on-demand) file loaders PLUS the enabled
+    post-load processes that follow them -- this map is also the report's filter, so
+    a process missing from it has its ETLHealth rows dropped from the report entirely.
+    A disabled loader (e.g. a retired one kept as a record) never runs, so counting
+    it would flag "not run" in every report.
     """
     from .cli import load_loader_configs
     from .file_folder import ON_DEMAND_TAG
@@ -107,7 +109,7 @@ def _daily_process_map(config_ref: str) -> dict[str, str]:
 
     process_map: dict[str, str] = {}
     for loader in load_loader_configs(config_ref):
-        if ON_DEMAND_TAG in loader.tags:
+        if not loader.enabled or ON_DEMAND_TAG in loader.tags:
             continue
         process_map[loader.process_name] = loader.name
     for process in load_post_process_configs(config_ref):

@@ -69,11 +69,10 @@ Every config names its destinations `des1` and `des2`:
 | `des2` (**O2**) | `YNBBSTVWP02\PROCDATASRVPROD` / `PLMPreprocessorShared` / `infor`. Some feeds have their own O2 database: `Preprocessor`, `PLM`, `PPE`, `PBI` | **Primary.** Every loader and post-process lands here. |
 | `des1` (**PRIME**) | `MISCPrdAdhocDB` / `PRIME` / `DM_MONTYNT\dli2` | **Being retired.** Everything moves to O2 by the **end of 2027**. |
 
-As of 2026-11-17, PRIME is still live for only three loaders:
+As of 2026-11-18, PRIME is still live for only two loaders:
 
 | Loader | PRIME objects | O2 side |
 | ------ | ------------- | ------- |
-| `baxter_emergency_item` | `BAXTER_ITEM_AUDIT`, `baxter_item_audit_stg`, `UpdateBaxterItemAudit` | **none yet**: PRIME only, so the O2 tables must be built before it can move |
 | `inventory_location` | `INVENTORY_LOCATION`, `inventory_location_stg`, `UpdateItemLocation` | `infor.ITEM_LOCATION` (dual-landing) |
 | `inventory_transaction` | `INVENTORY_TRANSACTION`, `inventory_transaction_stg`, `UpdateInventoryTransaction` | `infor.INVENTORY_TRANSACTION` (dual-landing) |
 
@@ -86,6 +85,7 @@ with a dated comment. The retirement so far:
 | 2026-09-14 | `preprocessor` (moved to O2 `Preprocessor`) |
 | 2026-10-16 | The Preprocessor feeds: `ccx_sync_contract`, `contract_line_error`, `item_replenish_from`, `vendor_location`, `par_item_bin`. Their PRIME tables were dropped |
 | 2026-11-17 | 24 loaders (`commodity_gl`, `contract_line`, `edi_sub_uom`, `item`, `item_gtin`, `item_uom`, `manufacturer`, the 3 `payablesinvoice_*` loaders, the 3 `purchaseorder_*` loaders, `requester`, `requesting_location`, `requisition_line`, `supplier`, `vendor`, `vendor_item`, `ghx_completed_invoice_by_date` and the 4 `ppe_*` loaders), plus both backfill configs and the `payablesinvoice_vendor_gl_index` post-process. 106 PRIME objects were dropped, including every remaining object in the `BullardBurnDown`, `ItemFinder`, `PLM` and `Preprocessor` schemas. Those four schemas still exist but are empty |
+| 2026-11-18 | The Baxter series. `baxter_emergency_item` was PRIME only, so its tables were copied to O2 `PPE.[Baxter]`, verified, and dropped from PRIME. The loader was off for a day, and since 2026-11-19 it lands on des2 only. See [Baxter on O2](#baxter-on-o2-ppebaxter) |
 
 What a retired des1 block means in practice:
 
@@ -123,6 +123,47 @@ the workstation only. The data itself is on O2: the `infor`/`ghx` tables in
 never loaded into O2, `INVENTORY_TRANSACTION_PR1_BEFORE2025` and
 `PURCHASEORDER_LINE_WITH_PCAT`, and they survive only in O2's stale `[PRIME]`
 copy database.
+
+### Baxter on O2 (`PPE.[Baxter]`)
+
+On 2026-11-18 the Baxter series was copied once from PRIME `[DM_MONTYNT\dli2]` to
+O2 `YNBBSTVWP02\PROCDATASRVPROD` / `PPE` / schema **`Baxter`**. The PRIME originals
+were then dropped. On 2026-11-19 the Baxter crisis came back, so
+`baxter_emergency_item` was switched back on as a **des2-only** daily loader into
+this schema, starting with that day's export.
+
+| Object in `PPE.[Baxter]` | Rows at the move | What it is |
+| ------------------------ | ---------------: | ---------- |
+| `BAXTER_ITEM_AUDIT` | 1,397,565 | Baxter item-audit history from 2024-06-13 (PK Company, Location, Item, ItemLocationAudit). **Loaded daily** |
+| `baxter_item_audit_stg` | 19,699 | The loader's staging table, truncated and reloaded each run |
+| `sp_UpdateBaxterItemAudit` (proc) | | The loader's promote step (`prod.post_sql`). It deletes prod rows whose PK is in staging, then inserts all of staging |
+| `BAXTER_ITEM_DAILY_TRACKING` | 2,293,741 | The hurricane daily report, 15 locations, 2024-07-26 to 2026-07-28. **Not scheduled** |
+| `EMERGENCY_BAXTER_HURRICAN_ITEM` | 231 | The tracked item list the report runs over |
+| `BAXTER_HURRICAN_DAILY_REPORT_EXTRACTOR` (proc) | | Rebuilds one day and location of `BAXTER_ITEM_DAILY_TRACKING`. Run by hand |
+
+- **The loader.** The des1 block is kept, disabled with a dated comment, as the
+  record. des2 points at `PPE` / `Baxter`, not at `PLMPreprocessorShared` / `infor`.
+  `sp_UpdateBaxterItemAudit` is a straight port of PRIME's `UpdateBaxterItemAudit`,
+  with schema-qualified names and O2's `sp_` prefix. Its script is
+  `sql\baxter_emergency_item\des2_Baxter_create_update_proc.sql`. The 2026-11-19
+  file covered 2026-11-09 to 2026-11-18, which overlaps the copied history (it ended
+  2026-11-17 22:22), so no audit rows were missed in the switch.
+- **The copy was verified** on every table: row count, `CHECKSUM_AGG(BINARY_CHECKSUM(*))`,
+  and per-column sums and date ranges all matched PRIME. Column types,
+  nullability and the PK are identical.
+- **The extractor proc's code is unchanged except its object references.** Its own
+  tables now point at `[Baxter]`. PRIME's `INVENTORY_TRANSACTION` and
+  `INVENTORY_LOCATION` are replaced by O2's
+  `PLMPreprocessorShared.infor.INVENTORY_TRANSACTION` and `infor.ITEM_LOCATION`,
+  which carry every column it uses. It runs on O2: a rolled-back test on
+  2026-11-18 built 231 rows for IMDCSTRM. Run it by hand with
+  `EXEC [Baxter].[BAXTER_HURRICAN_DAILY_REPORT_EXTRACTOR] '<date>', '<location>'`.
+  Its last run on PRIME was 2026-07-28. To bring the daily report back on a
+  schedule, add it as a post-process that `requires` the
+  `inventory_transaction` and `inventory_location` loaders.
+- **Rollback reference:** `sql\prime_decommission_20261118\` (gitignored, so it
+  exists on this workstation only). It holds the PRIME definitions and DDL, the
+  `ppe_*.sql` scripts that were run on O2, `_manifest.txt` and `_drop_log.txt`.
 
 ### Retiring the next loader from PRIME
 
@@ -432,7 +473,7 @@ O2-only (`des2`). The three still on PRIME land both sides; see
 when one server was down, or when only that side's promotion needs a re-run:
 
 ```powershell
-# Load only the PRIME (des1) side of Inventory Transaction (one of the three loaders still on PRIME).
+# Load only the PRIME (des1) side of Inventory Transaction (one of the two loaders still on PRIME).
 python -B run_daily_loaders.py --loader inventory_transaction --destination des1
 
 # Re-promote just des2 after its prod EXEC failed, off the staging data already there.
@@ -722,9 +763,10 @@ the des1 PPE table into the des2 PPE table. The PRIME PPE tables were dropped on
 
 > **PRIME retirement:** the helper ignores `enabled: false` and defaults to copying
 > des1 into des2. For a loader whose des1 is retired, the source no longer exists.
-> Only the three loaders still on PRIME (see
-> [Destinations](#destinations-o2-now-prime-being-retired)) have two live sides to
-> copy between.
+> Only the two loaders still on PRIME, `inventory_location` and
+> `inventory_transaction` (see
+> [Destinations](#destinations-o2-now-prime-being-retired)), have two live sides
+> to copy between.
 
 **Loaders with several prod tables** (extra ones declared under `prod.aux`, see
 above) copy one table per run: `--table <name>` picks it — `main` (the default) is
@@ -1261,7 +1303,8 @@ in order — see [Rerun what failed](#rerun-what-failed---rerun-failed)).
 `BLOCKED` counts with the skips, not the failures — a process that never ran
 because its loader failed is not a second alarm. The roster the percentages read
 against (`X/Y`) includes the post-processes, so one that never ran shows under
-"did not run today".
+"did not run today". It counts only **enabled** loaders and processes, so a
+retired loader kept with `enabled: false` is not flagged as "not run" every day.
 Reading ETLHealth is **read-only** — it never writes to the database. When a loader
 ran more than once in the day, only its latest run is shown (and drives the
 summary).

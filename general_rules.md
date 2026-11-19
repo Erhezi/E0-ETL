@@ -65,9 +65,10 @@ pair only untrimmed. Don't hack around it in a transform.
   - `des2`: `YNBBSTVWP02\PROCDATASRVPROD` / `PLMPreprocessorShared` / `infor`.
     Some feeds have their own O2 database instead: `Preprocessor`, `PLM`,
     `PPE` and `PBI`.
-  - `des1`: `MISCPrdAdhocDB` / `PRIME` / `DM_MONTYNT\dli2`. As of 2026-11-17 it
-    is live only for `baxter_emergency_item` (PRIME only, with no O2 side yet),
-    `inventory_location` and `inventory_transaction`.
+  - `des1`: `MISCPrdAdhocDB` / `PRIME` / `DM_MONTYNT\dli2`. As of 2026-11-18 it
+    is live only for `inventory_location` and `inventory_transaction`.
+    `baxter_emergency_item` moved to O2 on that date. It lands des2-only in
+    `PPE` / `Baxter`.
   New loaders and post-processes land **des2 only**: don't add a des1 block.
   `edi_sub_medline_location` is the pattern to copy. Name the O2 block `des2`
   even when it is the only one. The run-time `--destination <name>` flag
@@ -82,6 +83,12 @@ pair only untrimmed. Don't hack around it in a transform.
   "Retiring the next loader from PRIME" checklist. In particular, disable the
   block BEFORE dropping anything: saving the YAML is the deploy, so a scheduled
   run between the drop and the config change fails.
+- To retire a whole loader (nothing lands anywhere any more), set `enabled: false`
+  at the **loader** level with a dated comment, and leave its destination blocks
+  as they are. Don't also disable its last destination: config validation rejects
+  a loader whose every destination is disabled, even when the loader itself is
+  off, and since every YAML is loaded on every run, that breaks every CLI command.
+  A disabled loader drops out of runs and out of the daily email's roster.
 - Verify a destination table before enabling it -- the CLI's read-only
   `table-info --server ... --database ... --schema ... --table ...` prints the
   live columns/nullability -- and note the verification date in the config.
