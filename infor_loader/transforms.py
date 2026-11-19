@@ -695,6 +695,24 @@ def requesting_location(df: pd.DataFrame, loader_config: Any, dataframes: dict[s
     return df
 
 
+@register("shipto_location")
+def shipto_location(df: pd.DataFrame, loader_config: Any, dataframes: dict[str, pd.DataFrame], logger: logging.Logger) -> pd.DataFrame:
+    # Renaming the PostalAddress.* parts, datetime typing of the two stamps, and
+    # blank-filling are all handled by the mapping pipeline (see
+    # shipto_location.yaml); the transform only stamps the load-date marker.
+    df["ReportDate"] = datetime.now().strftime("%Y-%m-%d")
+    return df
+
+
+@register("paygroup_name")
+def paygroup_name(df: pd.DataFrame, loader_config: Any, dataframes: dict[str, pd.DataFrame], logger: logging.Logger) -> pd.DataFrame:
+    # Datetime typing of the two stamps and blank-filling are handled by the
+    # mapping pipeline (see paygroup_name.yaml); the transform only stamps the
+    # load-date marker.
+    df["ReportDate"] = datetime.now().strftime("%Y-%m-%d")
+    return df
+
+
 @register("commodity_gl")
 def commodity_gl(df: pd.DataFrame, loader_config: Any, dataframes: dict[str, pd.DataFrame], logger: logging.Logger) -> pd.DataFrame:
     df.drop(columns=["ItemGroup"], inplace=True)

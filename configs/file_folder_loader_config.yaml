@@ -294,6 +294,27 @@ inputs:
         - 'EDI_Sub_Locations.csv'
         - 'EDI_Sub_Locations (*).csv'
 
+  # Infor ship-to locations (full snapshot); loaded to O2 only by shipto_location.
+  # One wildcard pattern covers the re-download variants ('ShipTo+Location (1).csv');
+  # pick_latest takes the newest by mtime.
+  shipto_location:
+    folder: misc_mdm
+    name: 'ShipTo+Location.csv'
+    tags: [daily, mdm]
+    download:
+      patterns:
+        - 'ShipTo+Location*.csv'
+
+  # Infor pay groups (full list); loaded to O2 only by paygroup_name.
+  paygroup_name:
+    folder: misc_mdm
+    name: 'PayGroupName.csv'
+    tags: [daily, mdm]
+    download:
+      patterns:
+        - 'PayGroupName.csv'
+        - 'PayGroupName (*).csv'
+
   item:
     folder: misc_mdm
     name: 'Item.csv'
